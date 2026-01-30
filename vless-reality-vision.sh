@@ -2096,7 +2096,21 @@ get_share_link() {
     source "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip="${SERVER_IPV4:-$SERVER_IP}"
-    get_vision_link "$ip" "$node_label"
+    local proto_type="${PROTOCOL_TYPE:-vision}"
+
+    # 根据协议类型返回对应的链接
+    if [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+        # XHTTP-only 节点
+        get_xhttp_link "$ip" "${node_label}_XHTTP"
+    elif [[ -n "${PORT:-}" ]]; then
+        # Vision 节点或 both 节点（优先显示 Vision）
+        get_vision_link "$ip" "$node_label"
+    elif [[ -n "${XHTTP_PORT:-}" ]]; then
+        # 后备：如果没有 Vision 端口，使用 XHTTP
+        get_xhttp_link "$ip" "${node_label}_XHTTP"
+    else
+        echo ""
+    fi
 }
 
 show_qrcode() {
