@@ -1901,7 +1901,7 @@ validate_xray_config() {
     fi
 
     # 检查 JSON 有效性
-    if ! jq empty "$XRAY_CONF" 2>/dev/null; then
+    if ! jq . "$XRAY_CONF" > /dev/null 2>&1; then
         log_error "Config file contains invalid JSON"
         return 1
     fi
