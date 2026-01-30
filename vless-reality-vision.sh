@@ -934,7 +934,17 @@ select_node() {
         local node_file
         node_file=$(get_node_file "$node")
         source "$node_file"
-        echo -e "  ${GREEN}$i.${NC} $node (Port: $PORT, SNI: $SNI)" >/dev/tty
+        # 根据协议类型显示对应的端口
+        local display_port=""
+        local proto="${PROTOCOL_TYPE:-vision}"
+        if [[ "$proto" == "xhttp" ]]; then
+            display_port="${XHTTP_PORT:-N/A}"
+        elif [[ "$proto" == "both" ]]; then
+            display_port="${PORT:-}/${XHTTP_PORT:-}"
+        else
+            display_port="${PORT:-N/A}"
+        fi
+        echo -e "  ${GREEN}$i.${NC} $node (Port: $display_port, SNI: $SNI)" >/dev/tty
         ((i++))
     done
 
