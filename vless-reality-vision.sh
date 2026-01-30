@@ -933,6 +933,8 @@ select_node() {
     for node in "${nodes[@]}"; do
         local node_file
         node_file=$(get_node_file "$node")
+        # 重置变量以避免上一个节点的值残留
+        unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH
         source "$node_file"
         # 根据协议类型显示对应的端口
         local display_port=""
@@ -2103,6 +2105,8 @@ get_xhttp_link() {
 get_share_link() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
+    # 重置变量以避免其他节点的值残留
+    unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH SERVER_IP SERVER_IPV4 SERVER_IPV6 PUBLIC_KEY SHORT_ID
     source "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip="${SERVER_IPV4:-$SERVER_IP}"
@@ -2144,6 +2148,8 @@ show_qrcode() {
 show_info() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
+    # 重置变量以避免其他节点的值残留
+    unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH SERVER_IP SERVER_IPV4 SERVER_IPV6 PUBLIC_KEY PRIVATE_KEY SHORT_ID
     source "$node_file"
 
     local hostname
@@ -2350,10 +2356,25 @@ cmd_list() {
     for node in "${nodes[@]}"; do
         local node_file
         node_file=$(get_node_file "$node")
+        # 重置变量以避免上一个节点的值残留
+        unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH
         source "$node_file"
+        # 根据协议类型显示对应的端口
+        local display_port=""
+        local proto="${PROTOCOL_TYPE:-vision}"
+        if [[ "$proto" == "xhttp" ]]; then
+            display_port="${XHTTP_PORT:-N/A}"
+        elif [[ "$proto" == "both" ]]; then
+            display_port="${PORT:-}/${XHTTP_PORT:-}"
+        else
+            display_port="${PORT:-N/A}"
+        fi
         echo -e "  ${GREEN}$i.${NC} ${BLUE}$node${NC}"
-        echo -e "     Port: $PORT | SNI: $SNI"
+        echo -e "     Port: $display_port | SNI: $SNI"
         echo -e "     UUID: ${UUID:0:8}..."
+        if [[ -n "$XHTTP_PORT" ]] && [[ "$proto" != "vision" ]]; then
+            echo -e "     XHTTP: $XHTTP_PORT"
+        fi
         echo ""
         ((i++))
     done
@@ -2516,20 +2537,44 @@ cmd_health() {
     # 3. 检查每个节点的端口和 SNI
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
-        local n_name n_port n_sni
+        local n_name n_port n_sni n_xhttp_port n_protocol_type
         n_name=$(basename "$node_file" .env)
         n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
         n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
+        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
+        n_protocol_type=$(grep "^PROTOCOL_TYPE=" "$node_file" | cut -d= -f2)
+
+        # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
+        if [[ -z "$n_protocol_type" ]]; then
+            if [[ -n "$n_port" ]] && [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="both"
+            elif [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="xhttp"
+            else
+                n_protocol_type="vision"
+            fi
+        fi
 
         echo ""
-        echo -e "  ${BLUE}Node: $n_name${NC}"
+        echo -e "  ${BLUE}Node: $n_name${NC} (${n_protocol_type})"
 
-        # 检查端口监听
-        if ss -lnt | grep -qE ":${n_port}\s"; then
-            echo -e "    ${GREEN}✓${NC} Port $n_port is listening"
-        else
-            echo -e "    ${RED}✗${NC} Port $n_port is not listening"
-            all_ok=false
+        # 根据协议类型检查端口
+        if [[ "$n_protocol_type" == "vision" || "$n_protocol_type" == "both" ]] && [[ -n "$n_port" ]]; then
+            if ss -lnt | grep -qE ":${n_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} Vision port $n_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} Vision port $n_port is not listening"
+                all_ok=false
+            fi
+        fi
+
+        if [[ "$n_protocol_type" == "xhttp" || "$n_protocol_type" == "both" ]] && [[ -n "$n_xhttp_port" ]]; then
+            if ss -lnt | grep -qE ":${n_xhttp_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} XHTTP port $n_xhttp_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} XHTTP port $n_xhttp_port is not listening"
+                all_ok=false
+            fi
         fi
 
         # 测试 SNI 连接
