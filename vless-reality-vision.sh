@@ -4,7 +4,7 @@ export LANG=en_US.UTF-8
 
 # =========================
 # VLESS TCP REALITY Vision 自动化脚本
-# 改进版：动态SNI选择 + 二维码展示 + 多语言支持
+# 增强版：XHTTP支持 + 双栈链接 + WARP分流 + 系统优化工具
 # =========================
 
 # Bash 版本检查 (需要 4.3+ 支持 nameref 和 wait -n)
@@ -14,11 +14,40 @@ if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); 
     exit 1
 fi
 
+# ============== 单实例锁机制 ==============
+LOCK_DIR="/tmp/reality_vision_lock"
+PID_FILE="$LOCK_DIR/pid"
+
+lock_acquire() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$PID_FILE"
+        return 0
+    fi
+    # 检查持有锁的进程是否还活着
+    if [[ -f "$PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+            # 进程已死，强制接管
+            rm -rf "$LOCK_DIR"
+            mkdir "$LOCK_DIR" 2>/dev/null || return 1
+            echo "$$" > "$PID_FILE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+lock_release() {
+    rm -rf "$LOCK_DIR" 2>/dev/null
+}
+
 # 配置目录（支持多节点）
 NODES_DIR="/root/reality_nodes"
 LANG_FILE="/root/reality_vision.lang"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_GEODATA_DIR="/usr/local/share/xray"
 SERVICE="xray"
 
 # 缓存配置（放在 /root 下更安全）
@@ -37,11 +66,17 @@ PKG_CHECK=""
 # 服务管理变量 (systemd 或 openrc)
 INIT_SYSTEM=""
 
+# WARP 配置
+WARP_SOCKS_PORT=40000
+
 PORT_MIN=10000
 PORT_MAX=65535
 
 # 语言设置 (zh/en)
 CURRENT_LANG="${CURRENT_LANG:-}"
+
+# Spinner 动画帧
+SPINNER_FRAMES=('|' '/' '-' '\')
 
 # SNI 域名列表（完整列表，用于延迟测试）
 SNI_LIST=(
@@ -177,12 +212,285 @@ NC='\033[0m' # No Color
 
 # 清理函数，确保脚本退出时清理后台进程和临时文件
 cleanup() {
+    # 恢复光标
+    tput cnorm 2>/dev/null || true
     # 终止所有后台作业
     jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
     # 清理可能残留的临时目录
     rm -rf /tmp/tmp.*/ 2>/dev/null || true
+    # 释放锁
+    lock_release
 }
 trap cleanup EXIT INT TERM
+
+# ============== Spinner 动画执行器 ==============
+
+# 带 spinner 动画的任务执行器
+# 用法: execute_task "命令" "描述" [max_retries]
+execute_task() {
+    local cmd="$1"
+    local desc="$2"
+    local max_retries="${3:-3}"
+    local log_file="/tmp/xray_task_$$.log"
+    local attempt=1
+    local i=0
+
+    while [[ $attempt -le $max_retries ]]; do
+        echo "" > "$log_file"
+
+        # 后台执行命令
+        bash -c "$cmd" > "$log_file" 2>&1 &
+        local pid=$!
+
+        # 隐藏光标
+        tput civis 2>/dev/null || true
+
+        # 显示 spinner
+        while kill -0 $pid 2>/dev/null; do
+            local frame="${SPINNER_FRAMES[$((i % 4))]}"
+            printf "\r  ${BLUE}[%s]${NC} %s..." "$frame" "$desc"
+            ((i++))
+            sleep 0.1
+        done
+
+        # 恢复光标
+        tput cnorm 2>/dev/null || true
+
+        wait $pid
+        local status=$?
+
+        # 清除当前行
+        printf "\r\033[K"
+
+        if [[ $status -eq 0 ]]; then
+            echo -e "  ${GREEN}[OK]${NC}   $desc"
+            rm -f "$log_file"
+            return 0
+        fi
+
+        echo -e "  ${RED}[ERR]${NC}  $desc (attempt $attempt/$max_retries)"
+
+        if [[ $attempt -ge $max_retries ]]; then
+            echo -e "  ${RED}Error log:${NC}"
+            tail -n 5 "$log_file" 2>/dev/null | sed 's/^/    /'
+            rm -f "$log_file"
+            return 1
+        fi
+
+        ((attempt++))
+        sleep 2
+    done
+
+    rm -f "$log_file"
+    return 1
+}
+
+# 简单的 spinner 显示（用于等待操作）
+show_spinner() {
+    local pid=$1
+    local msg="$2"
+    local i=0
+
+    tput civis 2>/dev/null || true
+    while kill -0 $pid 2>/dev/null; do
+        local frame="${SPINNER_FRAMES[$((i % 4))]}"
+        printf "\r  ${BLUE}[%s]${NC} %s..." "$frame" "$msg"
+        ((i++))
+        sleep 0.1
+    done
+    tput cnorm 2>/dev/null || true
+    printf "\r\033[K"
+}
+
+# ============== 超时输入函数 ==============
+
+# 交互超时设置
+UI_TIMEOUT_SHORT=30   # 简单询问
+UI_TIMEOUT_LONG=60    # 复杂操作
+
+# 核心：统一倒计时交互函数
+# 用法: read_with_timeout "提示语" "默认值" "超时时间"
+# 返回值存储在 USER_INPUT 变量中
+USER_INPUT=""
+
+read_with_timeout() {
+    local prompt="$1"
+    local default="$2"
+    local timeout="${3:-$UI_TIMEOUT_SHORT}"
+    local input_char=""
+
+    # 清空之前的输入残留 (防止幽灵回车导致秒过)
+    while read -r -t 0 2>/dev/null; do read -r -n 1 2>/dev/null; done
+
+    USER_INPUT=""
+
+    # 设定截止时间戳
+    local start_time end_time current_time remaining
+    start_time=$(date +%s)
+    end_time=$((start_time + timeout))
+
+    while true; do
+        current_time=$(date +%s)
+        remaining=$((end_time - current_time))
+
+        # 如果时间到了，退出循环
+        if [[ "$remaining" -le 0 ]]; then
+            break
+        fi
+
+        # 交互 UI： 提示语 [默认: X] [ 10s ] :
+        printf "\r${YELLOW}%s [默认: %s] [ ${RED}%ds${YELLOW} ] : ${NC}" "$prompt" "$default" "$remaining"
+
+        # -t 1 等待一秒，但我们只关心是否按键
+        if read -t 1 -n 1 input_char 2>/dev/null; then
+            # 用户按下了键
+            echo "" # 换行
+            if [[ -z "$input_char" ]]; then
+                USER_INPUT="$default"
+            else
+                USER_INPUT="$input_char"
+            fi
+            return 0
+        fi
+    done
+
+    # 超时处理
+    echo ""
+    echo -e "${BLUE}[INFO]${NC} 倒计时结束，使用默认值: ${default}"
+    USER_INPUT="$default"
+}
+
+# ============== 包管理器状态检查 ==============
+
+# 检查包管理器是否繁忙
+is_pkg_manager_busy() {
+    case "$PKG_MANAGER" in
+        apt)
+            pgrep -x apt >/dev/null 2>&1 || \
+            pgrep -x apt-get >/dev/null 2>&1 || \
+            pgrep -x dpkg >/dev/null 2>&1 || \
+            pgrep -f "unattended-upgr" >/dev/null 2>&1
+            ;;
+        dnf|yum)
+            pgrep -x dnf >/dev/null 2>&1 || \
+            pgrep -x yum >/dev/null 2>&1 || \
+            pgrep -x rpm >/dev/null 2>&1
+            ;;
+        apk)
+            pgrep -x apk >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 检查 dpkg/rpm 数据库状态
+check_pkg_db_status() {
+    case "$PKG_MANAGER" in
+        apt)
+            if ! dpkg --audit >/dev/null 2>&1; then
+                echo -e "${RED}[ERROR]${NC} 检测到 dpkg 数据库状态异常！"
+                echo -e "${YELLOW}建议执行: 'dpkg --configure -a' 修复系统。${NC}"
+                return 1
+            fi
+            ;;
+        dnf|yum)
+            if ! rpm --query --all >/dev/null 2>&1; then
+                echo -e "${RED}[ERROR]${NC} 检测到 RPM 数据库状态异常！"
+                echo -e "${YELLOW}建议执行: 'rpm --rebuilddb' 修复系统。${NC}"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 等待包管理器释放
+wait_for_pkg_manager() {
+    local max_wait=300  # 最长等待 5 分钟
+    local waited=0
+    local i=0
+
+    if ! is_pkg_manager_busy; then
+        return 0
+    fi
+
+    echo -e "${BLUE}[INFO]${NC} 检测到系统更新进程正在运行，正在等待释放..."
+    tput civis 2>/dev/null || true
+
+    while is_pkg_manager_busy; do
+        if [[ $waited -ge $max_wait ]]; then
+            tput cnorm 2>/dev/null || true
+            echo ""
+            echo -e "${YELLOW}[WARN]${NC} 等待超时！"
+            echo -n "是否强制终止占用进程? (y/n) [n]: "
+            read -r kill_choice
+            if [[ "$kill_choice" == "y" || "$kill_choice" == "Y" ]]; then
+                case "$PKG_MANAGER" in
+                    apt)
+                        killall apt apt-get dpkg 2>/dev/null || true
+                        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null
+                        ;;
+                    dnf|yum)
+                        killall dnf yum 2>/dev/null || true
+                        rm -f /var/run/yum.pid /var/run/dnf.pid 2>/dev/null
+                        ;;
+                esac
+                return 0
+            else
+                echo -e "${RED}[ERROR]${NC} 用户取消，安装终止。"
+                return 1
+            fi
+        fi
+
+        local frame="${SPINNER_FRAMES[$((i % 4))]}"
+        printf "\r  ${BLUE}[%s]${NC} 等待包管理器释放... (%ds)" "$frame" "$waited"
+        sleep 1
+        ((waited++))
+        ((i++))
+    done
+
+    tput cnorm 2>/dev/null || true
+    printf "\r\033[K"
+    echo -e "${GREEN}[OK]${NC} 包管理器已释放"
+    return 0
+}
+
+# ============== IPv6 SSH 保护 ==============
+
+# 检查当前 SSH 连接方式 (防自杀核心)
+check_ssh_connection() {
+    # 获取当前 SSH 连接的客户端 IP
+    local client_ip="${SSH_CLIENT%% *}"
+    if [[ -z "$client_ip" ]]; then
+        echo "unknown"
+    elif [[ "$client_ip" =~ : ]]; then
+        echo "v6" # 当前是 IPv6 连接
+    else
+        echo "v4" # 当前是 IPv4 连接
+    fi
+}
+
+# IPv6 操作前安全检查
+check_ipv6_ssh_safety() {
+    local action="$1"  # disable 或 其他操作
+
+    if [[ "$action" == "disable" ]]; then
+        if [[ "$(check_ssh_connection)" == "v6" ]]; then
+            echo -e "${RED}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${RED}                 [危险操作拦截]                        ${NC}"
+            echo -e "${RED}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}检测到您当前正在通过 IPv6 连接 SSH！${NC}"
+            echo -e "${YELLOW}若此时禁用 IPv6，您将立即断开连接且无法重连！${NC}"
+            echo -e "${RED}操作已取消。请切换到 IPv4 网络连接 SSH 后再试。${NC}"
+            echo ""
+            read -n 1 -s -r -p "按任意键返回..."
+            return 1
+        fi
+    fi
+    return 0
+}
 
 # ============== 包管理器检测 ==============
 
@@ -379,6 +687,34 @@ msg() {
             "sni_custom_ok") echo "Domain is reachable" ;;
             "sni_custom_unreachable") echo "Domain may be unreachable, but will use it anyway" ;;
             "sni_invalid_format") echo "Invalid domain format" ;;
+            # 新功能翻译
+            "menu_tools") echo "System Tools" ;;
+            "menu_warp") echo "WARP Routing" ;;
+            "menu_bbr") echo "BBR Management" ;;
+            "menu_swap") echo "Swap Management" ;;
+            "menu_fail2ban") echo "Fail2ban Management" ;;
+            "install_geodata") echo "Installing GeoIP/GeoSite databases..." ;;
+            "geodata_updated") echo "GeoData databases updated" ;;
+            "xhttp_port") echo "XHTTP Port" ;;
+            "vision_port") echo "Vision Port" ;;
+            "ipv4_links") echo "IPv4 Links" ;;
+            "ipv6_links") echo "IPv6 Links" ;;
+            "warp_status") echo "WARP Status" ;;
+            "warp_running") echo "Running" ;;
+            "warp_stopped") echo "Stopped" ;;
+            "warp_install") echo "Install WARP" ;;
+            "warp_uninstall") echo "Uninstall WARP" ;;
+            "warp_netflix") echo "Netflix Routing" ;;
+            "warp_ai") echo "AI Services Routing" ;;
+            "bbr_enabled") echo "BBR Enabled" ;;
+            "bbr_disabled") echo "BBR Disabled" ;;
+            "swap_size") echo "Swap Size" ;;
+            "fail2ban_status") echo "Fail2ban Status" ;;
+            "script_running") echo "Script is already running!" ;;
+            "enable_xhttp") echo "Enable XHTTP protocol? (y/n)" ;;
+            "xhttp_enabled") echo "XHTTP protocol enabled" ;;
+            "detecting_ip") echo "Detecting server IP..." ;;
+            "tools_menu") echo "System Optimization Tools" ;;
             *) echo "$key" ;;
         esac
     else
@@ -452,6 +788,34 @@ msg() {
             "sni_custom_ok") echo "域名可访问" ;;
             "sni_custom_unreachable") echo "域名可能无法访问，但仍会使用" ;;
             "sni_invalid_format") echo "域名格式无效" ;;
+            # 新功能翻译
+            "menu_tools") echo "系统工具" ;;
+            "menu_warp") echo "WARP 分流" ;;
+            "menu_bbr") echo "BBR 管理" ;;
+            "menu_swap") echo "Swap 管理" ;;
+            "menu_fail2ban") echo "Fail2ban 管理" ;;
+            "install_geodata") echo "安装 GeoIP/GeoSite 数据库..." ;;
+            "geodata_updated") echo "GeoData 数据库已更新" ;;
+            "xhttp_port") echo "XHTTP 端口" ;;
+            "vision_port") echo "Vision 端口" ;;
+            "ipv4_links") echo "IPv4 链接" ;;
+            "ipv6_links") echo "IPv6 链接" ;;
+            "warp_status") echo "WARP 状态" ;;
+            "warp_running") echo "运行中" ;;
+            "warp_stopped") echo "已停止" ;;
+            "warp_install") echo "安装 WARP" ;;
+            "warp_uninstall") echo "卸载 WARP" ;;
+            "warp_netflix") echo "Netflix 分流" ;;
+            "warp_ai") echo "AI 服务分流" ;;
+            "bbr_enabled") echo "BBR 已启用" ;;
+            "bbr_disabled") echo "BBR 未启用" ;;
+            "swap_size") echo "Swap 大小" ;;
+            "fail2ban_status") echo "Fail2ban 状态" ;;
+            "script_running") echo "脚本已在运行中！" ;;
+            "enable_xhttp") echo "是否启用 XHTTP 协议？(y/n)" ;;
+            "xhttp_enabled") echo "XHTTP 协议已启用" ;;
+            "detecting_ip") echo "检测服务器 IP..." ;;
+            "tools_menu") echo "系统优化工具" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -638,18 +1002,18 @@ install_deps() {
     local required_packages
     case "$PKG_MANAGER" in
         apt)
-            required_packages=(curl unzip openssl ca-certificates iproute2 qrencode)
+            required_packages=(curl unzip openssl ca-certificates iproute2 qrencode jq cron)
             ;;
         dnf|yum)
-            required_packages=(curl unzip openssl ca-certificates iproute qrencode)
+            required_packages=(curl unzip openssl ca-certificates iproute qrencode jq cronie)
             ;;
         apk)
             # Alpine Linux 特殊包名
             # libqrencode-tools 提供 qrencode 命令
-            required_packages=(curl unzip openssl ca-certificates iproute2 libqrencode-tools bash coreutils)
+            required_packages=(curl unzip openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq)
             ;;
         *)
-            required_packages=(curl unzip openssl ca-certificates iproute qrencode)
+            required_packages=(curl unzip openssl ca-certificates iproute qrencode jq)
             ;;
     esac
 
@@ -785,6 +1149,88 @@ OPENRC_SERVICE
     chmod 755 /etc/init.d/xray
 }
 
+# ============== GeoData 安装 ==============
+
+install_geodata() {
+    log_info "$(msg install_geodata)"
+
+    mkdir -p "$XRAY_GEODATA_DIR"
+
+    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+
+    # 下载 geoip.dat
+    if execute_task "curl -sL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
+        # 创建软链接到 /usr/local/bin (Xray 查找位置)
+        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
+    fi
+
+    # 下载 geosite.dat
+    if execute_task "curl -sL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
+        ln -sf "$XRAY_GEODATA_DIR/geosite.dat" /usr/local/bin/geosite.dat 2>/dev/null || true
+    fi
+
+    # 设置自动更新定时任务（每周日 4:00）
+    setup_geodata_cron
+
+    log_info "$(msg geodata_updated)"
+}
+
+setup_geodata_cron() {
+    local cron_cmd="curl -sL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl -sL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
+    local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
+
+    # 检查 crontab 命令是否存在
+    if ! command -v crontab &>/dev/null; then
+        return 0
+    fi
+
+    # 添加定时任务（先删除旧的）
+    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
+}
+
+# ============== XHTTP 支持 ==============
+
+# XHTTP 端口（可选功能）
+XHTTP_PORT=""
+XHTTP_PATH=""
+ENABLE_XHTTP="false"
+
+choose_xhttp_port() {
+    if [[ "$ENABLE_XHTTP" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${xhpt:-}" ]]; then
+        XHTTP_PORT="$xhpt"
+    else
+        while true; do
+            XHTTP_PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
+            if is_port_free "$XHTTP_PORT" && [[ "$XHTTP_PORT" != "$PORT" ]]; then
+                break
+            fi
+        done
+    fi
+
+    # 生成随机路径
+    XHTTP_PATH="/$(openssl rand -hex 4)"
+}
+
+prompt_enable_xhttp() {
+    {
+    echo ""
+    echo -e "${CYAN}$(msg enable_xhttp)${NC}"
+    echo -n "  [y/N]: "
+    } >/dev/tty
+
+    read -r xhttp_choice </dev/tty
+
+    if [[ "$xhttp_choice" =~ ^[yY]$ ]]; then
+        ENABLE_XHTTP="true"
+        log_info "$(msg xhttp_enabled)"
+    fi
+}
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -844,7 +1290,69 @@ is_valid_ipv4() {
     return 0
 }
 
-# 并行获取服务器 IP 地址
+# 验证 IPv6 地址格式
+is_valid_ipv6() {
+    local ip="$1"
+    # 简单验证：包含冒号且不包含非法字符
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
+}
+
+# 全局 IP 变量
+SERVER_IPV4=""
+SERVER_IPV6=""
+
+# 获取 IPv4 地址
+get_ipv4() {
+    local ip
+    ip=$(curl -s4 --max-time 3 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if is_valid_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+    ip=$(curl -s4 --max-time 3 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+    if is_valid_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+    echo ""
+}
+
+# 获取 IPv6 地址
+get_ipv6() {
+    local ip
+    ip=$(curl -s6 --max-time 3 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if is_valid_ipv6 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+    ip=$(curl -s6 --max-time 3 https://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+    if is_valid_ipv6 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+    echo ""
+}
+
+# 检测网络栈类型
+detect_network_stack() {
+    log_info "$(msg detecting_ip)"
+
+    SERVER_IPV4=$(get_ipv4)
+    SERVER_IPV6=$(get_ipv6)
+
+    if [[ -n "$SERVER_IPV4" ]] && [[ -n "$SERVER_IPV6" ]]; then
+        log_info "Dual-Stack detected: IPv4=$SERVER_IPV4, IPv6=$SERVER_IPV6"
+    elif [[ -n "$SERVER_IPV4" ]]; then
+        log_info "IPv4 Only: $SERVER_IPV4"
+    elif [[ -n "$SERVER_IPV6" ]]; then
+        log_info "IPv6 Only: $SERVER_IPV6"
+    else
+        log_warn "Could not detect server IP automatically"
+        SERVER_IPV4="YOUR_SERVER_IP"
+    fi
+}
+
+# 并行获取服务器 IP 地址 (向后兼容)
 get_server_ip_parallel() {
     local result_file pids=()
     result_file=$(mktemp)
@@ -1344,87 +1852,134 @@ prompt_custom_sni() {
 write_config() {
     mkdir -p /usr/local/etc/xray
 
-    # 生成包含所有节点的 inbounds 配置
-    local inbounds="["
-    local first=true
+    # 构建 inbounds 数组
+    local inbounds_json="[]"
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 
         # 读取节点配置
-        local n_port n_uuid n_sni n_private_key n_short_id
+        local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path
+        n_name=$(grep "^NODE_NAME=" "$node_file" | cut -d= -f2)
         n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
         n_uuid=$(grep "^UUID=" "$node_file" | cut -d= -f2)
         n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
         n_private_key=$(grep "^PRIVATE_KEY=" "$node_file" | cut -d= -f2)
         n_short_id=$(grep "^SHORT_ID=" "$node_file" | cut -d= -f2)
+        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
+        n_xhttp_path=$(grep "^XHTTP_PATH=" "$node_file" | cut -d= -f2)
 
         [[ -z "$n_port" || -z "$n_uuid" ]] && continue
 
-        if $first; then
-            first=false
-        else
-            inbounds+=","
-        fi
-
-        inbounds+=$(cat <<INBOUND
+        # 添加 Vision inbound
+        local vision_inbound
+        vision_inbound=$(cat <<EOF
 {
-    "listen": "0.0.0.0",
-    "port": $n_port,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "$n_uuid", "flow": "xtls-rprx-vision" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "dest": "$n_sni:443",
-        "serverNames": ["$n_sni"],
-        "privateKey": "$n_private_key",
-        "shortIds": ["$n_short_id"]
-      }
+  "tag": "${n_name}_vision",
+  "listen": "0.0.0.0",
+  "port": $n_port,
+  "protocol": "vless",
+  "settings": {
+    "clients": [{"id": "$n_uuid", "flow": "xtls-rprx-vision"}],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "dest": "$n_sni:443",
+      "serverNames": ["$n_sni"],
+      "privateKey": "$n_private_key",
+      "shortIds": ["$n_short_id"]
     }
-  }
-INBOUND
+  },
+  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+}
+EOF
 )
+        inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]')
+
+        # 添加 XHTTP inbound（如果启用）
+        if [[ -n "$n_xhttp_port" ]] && [[ -n "$n_xhttp_path" ]]; then
+            local xhttp_inbound
+            xhttp_inbound=$(cat <<EOF
+{
+  "tag": "${n_name}_xhttp",
+  "listen": "0.0.0.0",
+  "port": $n_xhttp_port,
+  "protocol": "vless",
+  "settings": {
+    "clients": [{"id": "$n_uuid", "flow": ""}],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "xhttp",
+    "security": "reality",
+    "xhttpSettings": {"path": "$n_xhttp_path"},
+    "realitySettings": {
+      "dest": "$n_sni:443",
+      "serverNames": ["$n_sni"],
+      "privateKey": "$n_private_key",
+      "shortIds": ["$n_short_id"]
+    }
+  },
+  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+}
+EOF
+)
+            inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$xhttp_inbound" '. += [$inbound]')
+        fi
     done
 
-    inbounds+="]"
+    # 构建 outbounds
+    local outbounds_json='[{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]'
 
-    # 如果没有节点，使用当前配置
-    if $first; then
-        inbounds=$(cat <<INBOUND
-[{
-    "listen": "0.0.0.0",
-    "port": $PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "dest": "$SNI:443",
-        "serverNames": ["$SNI"],
-        "privateKey": "$PRIVATE_KEY",
-        "shortIds": ["$SHORT_ID"]
-      }
-    }
-  }]
-INBOUND
-)
+    # 检查是否有 WARP 代理
+    if check_warp_running; then
+        local warp_outbound='{"tag": "warp_proxy", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": '$WARP_SOCKS_PORT'}]}}'
+        outbounds_json=$(echo "$outbounds_json" | jq --argjson outbound "$warp_outbound" '. += [$outbound]')
     fi
 
-    cat > "$XRAY_CONF" <<JSON
+    # 构建路由规则
+    local routing_json
+    routing_json=$(cat <<EOF
 {
-  "inbounds": $inbounds,
-  "outbounds": [{ "protocol": "freedom" }]
+  "domainStrategy": "IPIfNonMatch",
+  "rules": [
+    {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+    {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+  ]
 }
-JSON
+EOF
+)
+
+    # 检查并添加 WARP 分流规则
+    if [[ -f "/root/.warp_netflix" ]] && check_warp_running; then
+        routing_json=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:netflix"], "outboundTag": "warp_proxy"}] + .rules')
+    fi
+    if [[ -f "/root/.warp_ai" ]] && check_warp_running; then
+        routing_json=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:openai", "geosite:anthropic"], "outboundTag": "warp_proxy"}] + .rules')
+    fi
+
+    # 组装最终配置
+    local config_json
+    config_json=$(jq -n \
+        --argjson inbounds "$inbounds_json" \
+        --argjson outbounds "$outbounds_json" \
+        --argjson routing "$routing_json" \
+        '{
+            "log": {"loglevel": "warning"},
+            "inbounds": $inbounds,
+            "outbounds": $outbounds,
+            "routing": $routing
+        }')
+
+    echo "$config_json" > "$XRAY_CONF"
+}
+
+# 检查 WARP 是否运行
+check_warp_running() {
+    (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) 2>/dev/null
 }
 
 save_env() {
@@ -1435,27 +1990,66 @@ save_env() {
     local node_file
     node_file=$(get_node_file "$node_name")
 
+    # 使用检测到的 IP（优先使用 SERVER_IPV4，向后兼容 SERVER_IP）
+    local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
+    local save_ipv6="${SERVER_IPV6:-}"
+
     cat > "$node_file" <<ENV
 NODE_NAME=$node_name
-SERVER_IP=$SERVER_IP
+SERVER_IP=${save_ipv4:-YOUR_SERVER_IP}
+SERVER_IPV4=${save_ipv4:-}
+SERVER_IPV6=${save_ipv6:-}
 PORT=$PORT
 UUID=$UUID
 SNI=$SNI
 PUBLIC_KEY=$PUBLIC_KEY
 PRIVATE_KEY=$PRIVATE_KEY
 SHORT_ID=$SHORT_ID
+ENABLE_XHTTP=${ENABLE_XHTTP:-false}
+XHTTP_PORT=${XHTTP_PORT:-}
+XHTTP_PATH=${XHTTP_PATH:-}
 ENV
     chmod 600 "$node_file"
 
     CURRENT_NODE_NAME="$node_name"
 }
 
+# 生成 Vision 分享链接
+get_vision_link() {
+    local ip="$1"
+    local node_label="$2"
+    local ip_formatted="$ip"
+
+    # IPv6 需要方括号
+    if [[ "$ip" == *:* ]]; then
+        ip_formatted="[$ip]"
+    fi
+
+    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
+}
+
+# 生成 XHTTP 分享链接
+get_xhttp_link() {
+    local ip="$1"
+    local node_label="$2"
+    local ip_formatted="$ip"
+
+    # IPv6 需要方括号
+    if [[ "$ip" == *:* ]]; then
+        ip_formatted="[$ip]"
+    fi
+
+    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${XHTTP_PATH}#${node_label}"
+}
+
+# 向后兼容的获取分享链接函数
 get_share_link() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     source "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
-    echo "vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
+    local ip="${SERVER_IPV4:-$SERVER_IP}"
+    get_vision_link "$ip" "$node_label"
 }
 
 show_qrcode() {
@@ -1480,27 +2074,72 @@ show_info() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     source "$node_file"
-    local link
-    link=$(get_share_link)
+
+    local hostname
+    hostname=$(hostname 2>/dev/null || echo "server")
 
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}                     $(msg node_info)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${BLUE}Node Name:${NC}  ${NODE_NAME:-$CURRENT_NODE_NAME}"
-    echo -e "  ${BLUE}$(msg server_addr):${NC} $SERVER_IP"
-    echo -e "  ${BLUE}$(msg port):${NC}       $PORT"
-    echo -e "  ${BLUE}UUID:${NC}       $UUID"
-    echo -e "  ${BLUE}Flow:${NC}       xtls-rprx-vision"
-    echo -e "  ${BLUE}SNI:${NC}        $SNI"
-    echo -e "  ${BLUE}PublicKey:${NC}  $PUBLIC_KEY"
-    echo -e "  ${BLUE}ShortID:${NC}    $SHORT_ID"
-    echo -e "  ${BLUE}Fingerprint:${NC} chrome"
+    echo -e "  ${BLUE}Node Name:${NC}   ${NODE_NAME:-$CURRENT_NODE_NAME}"
+    if [[ -n "${SERVER_IPV4:-}" ]]; then
+        echo -e "  ${BLUE}IPv4:${NC}        $SERVER_IPV4"
+    fi
+    if [[ -n "${SERVER_IPV6:-}" ]]; then
+        echo -e "  ${BLUE}IPv6:${NC}        $SERVER_IPV6"
+    fi
+    if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]]; then
+        echo -e "  ${BLUE}$(msg server_addr):${NC} ${SERVER_IP:-N/A}"
+    fi
+    echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
+    if [[ -n "${XHTTP_PORT:-}" ]]; then
+        echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT"
+    fi
+    echo -e "  ${BLUE}UUID:${NC}        $UUID"
+    echo -e "  ${BLUE}SNI:${NC}         $SNI"
+    echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
+    echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
     echo ""
-    echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-    echo -e "${GREEN}$(msg share_link):${NC}"
-    echo -e "${YELLOW}$link${NC}"
+
+    # IPv4 链接
+    if [[ -n "${SERVER_IPV4:-}" ]]; then
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "${GREEN}$(msg ipv4_links):${NC}"
+        echo ""
+        echo -e "  ${YELLOW}Vision:${NC}"
+        echo -e "  $(get_vision_link "$SERVER_IPV4" "${hostname}_Vision_v4")"
+        if [[ -n "${XHTTP_PORT:-}" ]] && [[ -n "${XHTTP_PATH:-}" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}XHTTP:${NC}"
+            echo -e "  $(get_xhttp_link "$SERVER_IPV4" "${hostname}_XHTTP_v4")"
+        fi
+    fi
+
+    # IPv6 链接
+    if [[ -n "${SERVER_IPV6:-}" ]]; then
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "${GREEN}$(msg ipv6_links):${NC}"
+        echo ""
+        echo -e "  ${YELLOW}Vision:${NC}"
+        echo -e "  $(get_vision_link "$SERVER_IPV6" "${hostname}_Vision_v6")"
+        if [[ -n "${XHTTP_PORT:-}" ]] && [[ -n "${XHTTP_PATH:-}" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}XHTTP:${NC}"
+            echo -e "  $(get_xhttp_link "$SERVER_IPV6" "${hostname}_XHTTP_v6")"
+        fi
+    fi
+
+    # 向后兼容：如果没有 IPv4/IPv6，使用旧的 SERVER_IP
+    if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]] && [[ -n "${SERVER_IP:-}" ]]; then
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "${GREEN}$(msg share_link):${NC}"
+        echo -e "${YELLOW}$(get_vision_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}")${NC}"
+    fi
+
+    echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -1514,6 +2153,7 @@ cmd_install() {
 
     install_deps
     install_xray
+    install_geodata
 
     # 交互式输入节点名称（或使用环境变量 name=xxx）
     if [[ -n "${name:-}" ]]; then
@@ -1540,11 +2180,27 @@ cmd_install() {
         select_best_sni
     fi
 
+    # 询问是否启用 XHTTP（除非通过环境变量指定）
+    if [[ -n "${xhttp:-}" ]]; then
+        if [[ "$xhttp" == "true" ]] || [[ "$xhttp" == "1" ]] || [[ "$xhttp" == "y" ]]; then
+            ENABLE_XHTTP="true"
+        fi
+    else
+        prompt_enable_xhttp
+    fi
+
     gen_uuid
     choose_port
+
+    # 如果启用了 XHTTP，选择端口
+    if [[ "$ENABLE_XHTTP" == "true" ]]; then
+        choose_xhttp_port
+    fi
+
     gen_reality_keys
 
-    SERVER_IP="$(get_server_ip_parallel)"
+    # 检测双栈 IP
+    detect_network_stack
 
     save_env
     write_config
@@ -1556,6 +2212,7 @@ cmd_install() {
 
     show_info
 
+    # 显示主要链接的二维码
     local link
     link=$(get_share_link)
     show_qrcode "$link"
@@ -1800,6 +2457,979 @@ cmd_health() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+# ============== WARP 管理 ==============
+
+cmd_warp() {
+    while true; do
+        clear
+        local warp_status
+        if check_warp_running; then
+            warp_status="${GREEN}$(msg warp_running)${NC}"
+        else
+            warp_status="${RED}$(msg warp_stopped)${NC}"
+        fi
+
+        local netflix_status ai_status
+        if [[ -f "/root/.warp_netflix" ]]; then
+            netflix_status="${GREEN}ON${NC}"
+        else
+            netflix_status="${YELLOW}OFF${NC}"
+        fi
+        if [[ -f "/root/.warp_ai" ]]; then
+            ai_status="${GREEN}ON${NC}"
+        else
+            ai_status="${YELLOW}OFF${NC}"
+        fi
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg menu_warp)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg warp_status): $warp_status"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} $(msg warp_install)"
+        echo -e "  ${GREEN}2.${NC} $(msg warp_uninstall)"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}3.${NC} $(msg warp_netflix) [$netflix_status]"
+        echo -e "  ${GREEN}4.${NC} $(msg warp_ai) [$ai_status]"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-4]: "
+        read -r choice
+
+        case "$choice" in
+            1) warp_install ;;
+            2) warp_uninstall ;;
+            3) warp_toggle_netflix ;;
+            4) warp_toggle_ai ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+warp_install() {
+    echo ""
+    log_info "Installing WARP (Socks5 mode)..."
+    if wget -qN https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null; then
+        bash menu.sh c
+        rm -f menu.sh
+        if check_warp_running; then
+            log_info "WARP installed successfully"
+            write_config
+            service_restart xray
+        fi
+    else
+        log_error "Failed to download WARP installer"
+    fi
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+warp_uninstall() {
+    echo ""
+    log_info "Uninstalling WARP..."
+    if command -v warp &>/dev/null; then
+        warp u
+    elif [[ -f menu.sh ]]; then
+        bash menu.sh u
+    else
+        wget -qN https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null && bash menu.sh u
+        rm -f menu.sh
+    fi
+    rm -f /root/.warp_netflix /root/.warp_ai
+    write_config
+    service_restart xray
+    log_info "WARP uninstalled"
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+warp_toggle_netflix() {
+    if ! check_warp_running; then
+        log_warn "WARP is not running. Please install first."
+        sleep 2
+        return
+    fi
+    if [[ -f "/root/.warp_netflix" ]]; then
+        rm -f /root/.warp_netflix
+        log_info "Netflix routing disabled"
+    else
+        touch /root/.warp_netflix
+        log_info "Netflix routing enabled"
+    fi
+    write_config
+    service_restart xray
+    sleep 1
+}
+
+warp_toggle_ai() {
+    if ! check_warp_running; then
+        log_warn "WARP is not running. Please install first."
+        sleep 2
+        return
+    fi
+    if [[ -f "/root/.warp_ai" ]]; then
+        rm -f /root/.warp_ai
+        log_info "AI services routing disabled"
+    else
+        touch /root/.warp_ai
+        log_info "AI services routing enabled"
+    fi
+    write_config
+    service_restart xray
+    sleep 1
+}
+
+# ============== BBR 管理 ==============
+
+cmd_bbr() {
+    while true; do
+        clear
+        local bbr_status qdisc_status
+        local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+        if [[ "$cc" == "bbr" ]]; then
+            bbr_status="${GREEN}$(msg bbr_enabled)${NC} (BBR)"
+        else
+            bbr_status="${YELLOW}$(msg bbr_disabled)${NC} ($cc)"
+        fi
+        qdisc_status="$qd"
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg menu_bbr)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  Congestion Control: $bbr_status"
+        echo -e "  Queue Discipline: ${YELLOW}$qdisc_status${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ"
+        echo -e "  ${GREEN}2.${NC} Disable BBR (use CUBIC)"
+        echo -e "  ${GREEN}3.${NC} Apply TCP optimization"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-3]: "
+        read -r choice
+
+        case "$choice" in
+            1) bbr_enable ;;
+            2) bbr_disable ;;
+            3) bbr_optimize ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+bbr_enable() {
+    echo ""
+    log_info "Enabling BBR..."
+    cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    sysctl --system >/dev/null 2>&1
+    log_info "BBR enabled"
+    sleep 1
+}
+
+bbr_disable() {
+    echo ""
+    log_info "Disabling BBR..."
+    cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = cubic
+EOF
+    sysctl --system >/dev/null 2>&1
+    log_info "BBR disabled, using CUBIC"
+    sleep 1
+}
+
+bbr_optimize() {
+    echo ""
+    log_info "Applying TCP optimization..."
+    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc = $qd
+net.ipv4.tcp_congestion_control = $cc
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+EOF
+    sysctl --system >/dev/null 2>&1
+    log_info "TCP optimization applied"
+    sleep 1
+}
+
+# ============== Swap 管理 ==============
+
+cmd_swap() {
+    while true; do
+        clear
+        local swap_total swap_status swappiness
+        swap_total=$(free -m | grep Swap | awk '{print $2}')
+        swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+
+        if [[ "$swap_total" -eq 0 ]]; then
+            swap_status="${RED}Not enabled${NC}"
+        else
+            swap_status="${GREEN}${swap_total}MB${NC}"
+        fi
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg menu_swap)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg swap_size): $swap_status"
+        echo -e "  Swappiness: ${YELLOW}$swappiness${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Create/Resize Swap"
+        echo -e "  ${GREEN}2.${NC} Remove Swap"
+        echo -e "  ${GREEN}3.${NC} Change Swappiness"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-3]: "
+        read -r choice
+
+        case "$choice" in
+            1) swap_create ;;
+            2) swap_remove ;;
+            3) swap_swappiness ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+swap_create() {
+    echo ""
+    echo -n "  Enter swap size in MB [1024]: "
+    read -r size
+    size=${size:-1024}
+
+    log_info "Creating ${size}MB swap..."
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+
+    if ! fallocate -l ${size}M /swapfile 2>/dev/null; then
+        dd if=/dev/zero of=/swapfile bs=1M count=$size status=progress
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+
+    log_info "Swap created: ${size}MB"
+    sleep 1
+}
+
+swap_remove() {
+    echo ""
+    log_info "Removing swap..."
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null || true
+    log_info "Swap removed"
+    sleep 1
+}
+
+swap_swappiness() {
+    echo ""
+    local current=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+    echo -e "  Current swappiness: ${YELLOW}$current${NC}"
+    echo -n "  Enter new value [0-100]: "
+    read -r val
+    if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -ge 0 ]] && [[ "$val" -le 100 ]]; then
+        sysctl -w vm.swappiness=$val >/dev/null
+        sed -i '/vm.swappiness/d' /etc/sysctl.conf 2>/dev/null || true
+        echo "vm.swappiness = $val" >> /etc/sysctl.conf
+        log_info "Swappiness set to $val"
+    else
+        log_error "Invalid value"
+    fi
+    sleep 1
+}
+
+# ============== Fail2ban 管理 ==============
+
+cmd_fail2ban() {
+    # 检查是否是 Alpine (不支持 fail2ban)
+    if [[ "$PKG_MANAGER" == "apk" ]]; then
+        log_warn "Fail2ban is not available on Alpine Linux"
+        sleep 2
+        return
+    fi
+
+    while true; do
+        clear
+        local f2b_status banned_count
+
+        if systemctl is-active fail2ban &>/dev/null; then
+            f2b_status="${GREEN}Running${NC}"
+            banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | grep -o "[0-9]*" || echo "0")
+        else
+            f2b_status="${RED}Stopped${NC}"
+            banned_count="N/A"
+        fi
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg menu_fail2ban)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg fail2ban_status): $f2b_status"
+        echo -e "  Banned IPs: ${RED}$banned_count${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Install & Enable Fail2ban"
+        echo -e "  ${GREEN}2.${NC} Stop Fail2ban"
+        echo -e "  ${GREEN}3.${NC} View Banned IPs"
+        echo -e "  ${GREEN}4.${NC} Unban IP"
+        echo -e "  ${GREEN}5.${NC} View Logs"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-5]: "
+        read -r choice
+
+        case "$choice" in
+            1) fail2ban_install ;;
+            2) fail2ban_stop ;;
+            3) fail2ban_list ;;
+            4) fail2ban_unban ;;
+            5) fail2ban_logs ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+fail2ban_install() {
+    echo ""
+    log_info "Installing Fail2ban..."
+
+    if ! $PKG_CHECK fail2ban >/dev/null 2>&1; then
+        $PKG_UPDATE >/dev/null 2>&1 || true
+        $PKG_INSTALL fail2ban >/dev/null 2>&1
+    fi
+
+    # 获取当前 SSH 端口
+    local ssh_port
+    ssh_port=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
+    ssh_port=${ssh_port:-22}
+
+    # 配置 jail
+    cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+bantime = 1d
+bantime.increment = true
+bantime.factor = 1
+bantime.maxtime = 30d
+findtime = 7d
+maxretry = 3
+backend = auto
+
+[sshd]
+enabled = true
+port = $ssh_port,22
+mode = aggressive
+EOF
+
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban >/dev/null 2>&1
+    log_info "Fail2ban installed and configured"
+    sleep 1
+}
+
+fail2ban_stop() {
+    echo ""
+    systemctl stop fail2ban 2>/dev/null
+    systemctl disable fail2ban 2>/dev/null
+    log_info "Fail2ban stopped"
+    sleep 1
+}
+
+fail2ban_list() {
+    echo ""
+    echo -e "${CYAN}Banned IPs:${NC}"
+    fail2ban-client status sshd 2>/dev/null | grep "Banned IP" || echo "  None"
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+fail2ban_unban() {
+    echo ""
+    echo -n "  Enter IP to unban: "
+    read -r ip
+    if [[ -n "$ip" ]]; then
+        fail2ban-client set sshd unbanip "$ip" 2>/dev/null && log_info "Unbanned: $ip" || log_error "Failed to unban"
+    fi
+    sleep 1
+}
+
+fail2ban_logs() {
+    echo ""
+    echo -e "${CYAN}Recent Fail2ban logs:${NC}"
+    if [[ -f /var/log/fail2ban.log ]]; then
+        grep -E "(Ban|Unban)" /var/log/fail2ban.log 2>/dev/null | tail -20
+    else
+        echo "  No logs available"
+    fi
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+# ============== 端口管理 ==============
+
+# 验证端口号
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        echo -e "${RED}[ERROR]${NC} 端口必须是 1-65535 之间的数字！"
+        return 1
+    fi
+    return 0
+}
+
+# 检查端口运行状态
+check_port_status() {
+    local port="$1"
+    if ss -tlnp 2>/dev/null | grep -q ":${port} " || \
+       ss -ulnp 2>/dev/null | grep -q ":${port} "; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}未运行${NC}"
+    fi
+}
+
+# 开放端口 (跨系统支持)
+open_firewall_port() {
+    local port="$1"
+
+    # iptables (if available)
+    if command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+
+        # IPv6
+        if [[ -f /proc/net/if_inet6 ]] && command -v ip6tables &>/dev/null; then
+            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+
+        # 持久化 (如果有 netfilter-persistent)
+        if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save 2>/dev/null || true
+        fi
+    fi
+
+    # firewalld (if available)
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/tcp" 2>/dev/null || true
+        firewall-cmd --permanent --add-port="${port}/udp" 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    # ufw (if available)
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port" 2>/dev/null || true
+    fi
+}
+
+# 获取当前端口配置
+get_current_ports() {
+    local ssh_config="/etc/ssh/sshd_config"
+
+    # SSH 端口
+    CURRENT_SSH=$(grep "^Port" "$ssh_config" 2>/dev/null | head -n 1 | awk '{print $2}')
+    [[ -z "$CURRENT_SSH" ]] && CURRENT_SSH=22
+
+    # Xray 端口
+    if [[ -f "$XRAY_CONF" ]] && command -v jq &>/dev/null; then
+        CURRENT_VISION=$(jq -r '.inbounds[] | select(.tag=="vision_node" or .tag=="vless-reality-vision" or .settings.clients) | .port' "$XRAY_CONF" 2>/dev/null | head -1)
+        CURRENT_XHTTP=$(jq -r '.inbounds[] | select(.tag=="xhttp_node") | .port' "$XRAY_CONF" 2>/dev/null | head -1)
+    else
+        CURRENT_VISION="N/A"
+        CURRENT_XHTTP="N/A"
+    fi
+
+    [[ -z "$CURRENT_VISION" || "$CURRENT_VISION" == "null" ]] && CURRENT_VISION="N/A"
+    [[ -z "$CURRENT_XHTTP" || "$CURRENT_XHTTP" == "null" ]] && CURRENT_XHTTP="N/A"
+}
+
+# 修改 SSH 端口
+change_ssh_port() {
+    local ssh_config="/etc/ssh/sshd_config"
+
+    # 安全警告框
+    clear
+    echo -e "${RED}################################################################${NC}"
+    echo -e "${RED}#                    高风险操作警告 (WARNING)                  #${NC}"
+    echo -e "${RED}################################################################${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}#${NC}  1. 云服务器用户 (阿里云/腾讯云/AWS等)：                     ${RED}#${NC}"
+    echo -e "${RED}#${NC}     必须先在网页控制台的【安全组/防火墙】放行新端口！        ${RED}#${NC}"
+    echo -e "${RED}#${NC}     (脚本只能修改系统内部防火墙，无法修改云平台安全组)       ${RED}#${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}#${NC}  2. 修改后【绝对不要】关闭当前窗口！                         ${RED}#${NC}"
+    echo -e "${RED}#${NC}     请新开一个 SSH 窗口测试连接。如果失败，                  ${RED}#${NC}"
+    echo -e "${RED}#${NC}     请立即利用当前窗口改回原端口 ($CURRENT_SSH)。            ${RED}#${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}################################################################${NC}"
+    echo ""
+
+    read -p "我已知晓风险，确认继续修改? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}>>> 操作已取消。${NC}"
+        sleep 1
+        return
+    fi
+
+    echo ""
+    read -p "请输入新的 SSH 端口 [当前: $CURRENT_SSH]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 SSH 端口...${NC}"
+
+    # 修改配置文件
+    if grep -q "^Port" "$ssh_config"; then
+        sed -i "s/^Port.*/Port $new_port/" "$ssh_config"
+    else
+        echo "Port $new_port" >> "$ssh_config"
+    fi
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 SSH 服务
+    echo -e "${BLUE}[INFO]${NC} 重启 SSH 服务..."
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
+    else
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}修改成功！请务必新开窗口测试端口 $new_port 。${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 修改 Vision 端口
+change_vision_port() {
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        echo -e "${RED}[ERROR]${NC} Xray 配置文件不存在！"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    read -p "请输入新的 Vision 端口 [当前: $CURRENT_VISION]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 Vision 端口...${NC}"
+
+    # 使用 jq 修改端口
+    if command -v jq &>/dev/null; then
+        # 尝试多种 tag 名称
+        local tmp_file="${XRAY_CONF}.tmp"
+        jq --argjson port "$new_port" '
+            (.inbounds[] | select(.tag=="vision_node" or .tag=="vless-reality-vision" or (.settings.clients and .streamSettings.realitySettings)) | .port) |= $port
+        ' "$XRAY_CONF" > "$tmp_file" && mv "$tmp_file" "$XRAY_CONF"
+    fi
+
+    # 更新节点配置文件
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        if grep -q "^PORT=" "$node_file"; then
+            sed -i "s/^PORT=.*/PORT=$new_port/" "$node_file"
+        fi
+    done
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 Xray
+    echo -e "${BLUE}[INFO]${NC} 重启 Xray 服务..."
+    service_restart xray
+
+    echo -e "${GREEN}修改成功！${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 修改 XHTTP 端口
+change_xhttp_port() {
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        echo -e "${RED}[ERROR]${NC} Xray 配置文件不存在！"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    if [[ "$CURRENT_XHTTP" == "N/A" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} XHTTP 未启用"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    read -p "请输入新的 XHTTP 端口 [当前: $CURRENT_XHTTP]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 XHTTP 端口...${NC}"
+
+    # 使用 jq 修改端口
+    if command -v jq &>/dev/null; then
+        local tmp_file="${XRAY_CONF}.tmp"
+        jq --argjson port "$new_port" '
+            (.inbounds[] | select(.tag=="xhttp_node") | .port) |= $port
+        ' "$XRAY_CONF" > "$tmp_file" && mv "$tmp_file" "$XRAY_CONF"
+    fi
+
+    # 更新节点配置文件
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        if grep -q "^XHTTP_PORT=" "$node_file"; then
+            sed -i "s/^XHTTP_PORT=.*/XHTTP_PORT=$new_port/" "$node_file"
+        fi
+    done
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 Xray
+    echo -e "${BLUE}[INFO]${NC} 重启 Xray 服务..."
+    service_restart xray
+
+    echo -e "${GREEN}修改成功！${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 端口管理菜单
+cmd_ports() {
+    while true; do
+        get_current_ports
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}              端口管理面板 (Port Manager)              ${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  服务              端口            状态"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        printf "  ${GREEN}1.${NC} 修改 SSH          ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_SSH" "$(check_port_status "$CURRENT_SSH")"
+        printf "  ${GREEN}2.${NC} 修改 Vision       ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_VISION" "$([[ "$CURRENT_VISION" != "N/A" ]] && check_port_status "$CURRENT_VISION" || echo -e "${RED}N/A${NC}")"
+        printf "  ${GREEN}3.${NC} 修改 XHTTP        ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_XHTTP" "$([[ "$CURRENT_XHTTP" != "N/A" ]] && check_port_status "$CURRENT_XHTTP" || echo -e "${RED}N/A${NC}")"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} 返回 (Back)"
+        echo ""
+        read -p "请输入选项 [0-3]: " choice
+
+        case "$choice" in
+            1) change_ssh_port ;;
+            2) change_vision_port ;;
+            3) change_xhttp_port ;;
+            0) return ;;
+            *) echo -e "${RED}输入无效${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============== 日志查看 ==============
+
+cmd_logs() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}              日志查看器 (Log Viewer)                  ${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Xray 日志 (最新 50 行)"
+        echo -e "  ${GREEN}2.${NC} Xray 错误日志"
+        echo -e "  ${GREEN}3.${NC} SSH 登录日志"
+        echo -e "  ${GREEN}4.${NC} Fail2ban 日志"
+        echo -e "  ${GREEN}5.${NC} 系统日志"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} 返回 (Back)"
+        echo ""
+        read -p "请输入选项 [0-5]: " choice
+
+        case "$choice" in
+            1)
+                echo ""
+                echo -e "${CYAN}>>> Xray 日志 (最新 50 行):${NC}"
+                echo ""
+                if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+                    if [[ -f /var/log/xray/access.log ]]; then
+                        tail -50 /var/log/xray/access.log
+                    else
+                        echo "日志文件不存在"
+                    fi
+                else
+                    journalctl -u xray --no-pager -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            2)
+                echo ""
+                echo -e "${CYAN}>>> Xray 错误日志:${NC}"
+                echo ""
+                if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+                    if [[ -f /var/log/xray/error.log ]]; then
+                        tail -50 /var/log/xray/error.log
+                    else
+                        echo "日志文件不存在"
+                    fi
+                else
+                    journalctl -u xray --no-pager -p err -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            3)
+                echo ""
+                echo -e "${CYAN}>>> SSH 登录日志:${NC}"
+                echo ""
+                if [[ -f /var/log/auth.log ]]; then
+                    grep -E "sshd.*(Accepted|Failed)" /var/log/auth.log 2>/dev/null | tail -30
+                elif [[ -f /var/log/secure ]]; then
+                    grep -E "sshd.*(Accepted|Failed)" /var/log/secure 2>/dev/null | tail -30
+                else
+                    journalctl -u ssh -u sshd --no-pager -n 30 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            4)
+                echo ""
+                echo -e "${CYAN}>>> Fail2ban 日志:${NC}"
+                echo ""
+                if [[ -f /var/log/fail2ban.log ]]; then
+                    grep -E "(Ban|Unban)" /var/log/fail2ban.log 2>/dev/null | tail -30
+                else
+                    echo "Fail2ban 日志不存在"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            5)
+                echo ""
+                echo -e "${CYAN}>>> 系统日志 (最新 50 行):${NC}"
+                echo ""
+                if [[ -f /var/log/syslog ]]; then
+                    tail -50 /var/log/syslog
+                elif [[ -f /var/log/messages ]]; then
+                    tail -50 /var/log/messages
+                else
+                    journalctl --no-pager -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            0) return ;;
+            *) echo -e "${RED}输入无效${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============== 独立工具安装 ==============
+
+install_standalone_tools() {
+    local bin_dir="/usr/local/bin"
+
+    echo -e "${BLUE}[INFO]${NC} 安装独立工具命令到 ${bin_dir}..."
+
+    # 1. info 命令 - 显示节点信息
+    cat > "${bin_dir}/xray-info" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Info Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" info
+elif command -v reality-vision &>/dev/null; then
+    reality-vision info
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-info"
+
+    # 2. ports 命令 - 端口管理
+    cat > "${bin_dir}/xray-ports" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Ports Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" ports
+elif command -v reality-vision &>/dev/null; then
+    reality-vision ports
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-ports"
+
+    # 3. logs 命令 - 日志查看
+    cat > "${bin_dir}/xray-logs" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Logs Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" logs
+elif command -v reality-vision &>/dev/null; then
+    reality-vision logs
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-logs"
+
+    # 4. bbr 命令
+    cat > "${bin_dir}/xray-bbr" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - BBR Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" bbr
+elif command -v reality-vision &>/dev/null; then
+    reality-vision bbr
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-bbr"
+
+    # 5. swap 命令
+    cat > "${bin_dir}/xray-swap" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Swap Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" swap
+elif command -v reality-vision &>/dev/null; then
+    reality-vision swap
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-swap"
+
+    # 6. warp 命令
+    cat > "${bin_dir}/xray-warp" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - WARP Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" warp
+elif command -v reality-vision &>/dev/null; then
+    reality-vision warp
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-warp"
+
+    # 7. f2b 命令 - Fail2ban
+    cat > "${bin_dir}/xray-f2b" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Fail2ban Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" fail2ban
+elif command -v reality-vision &>/dev/null; then
+    reality-vision fail2ban
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-f2b"
+
+    # 8. 主脚本链接
+    if [[ -f "/root/reality_vision.sh" ]]; then
+        ln -sf "/root/reality_vision.sh" "${bin_dir}/reality-vision" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}[OK]${NC} 独立工具已安装！可用命令:"
+    echo "  xray-info   - 查看节点信息"
+    echo "  xray-ports  - 端口管理"
+    echo "  xray-logs   - 日志查看"
+    echo "  xray-bbr    - BBR 管理"
+    echo "  xray-swap   - Swap 管理"
+    echo "  xray-warp   - WARP 管理"
+    echo "  xray-f2b    - Fail2ban 管理"
+}
+
+# ============== 系统工具菜单 ==============
+
+cmd_tools() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg tools_menu)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${BLUE}[网络优化]${NC}"
+        echo -e "  ${GREEN}1.${NC} $(msg menu_warp)"
+        echo -e "  ${GREEN}2.${NC} $(msg menu_bbr)"
+        echo ""
+        echo -e "  ${BLUE}[系统管理]${NC}"
+        echo -e "  ${GREEN}3.${NC} $(msg menu_swap)"
+        echo -e "  ${GREEN}4.${NC} $(msg menu_fail2ban)"
+        echo ""
+        echo -e "  ${BLUE}[服务管理]${NC}"
+        echo -e "  ${GREEN}5.${NC} 端口管理 (Ports)"
+        echo -e "  ${GREEN}6.${NC} 日志查看 (Logs)"
+        echo ""
+        echo -e "  ${BLUE}[其他]${NC}"
+        echo -e "  ${GREEN}7.${NC} 安装独立工具命令"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-7]: "
+        read -r choice
+
+        case "$choice" in
+            1) cmd_warp ;;
+            2) cmd_bbr ;;
+            3) cmd_swap ;;
+            4) cmd_fail2ban ;;
+            5) cmd_ports ;;
+            6) cmd_logs ;;
+            7)
+                install_standalone_tools
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
 # ============== 主菜单 ==============
 
 show_menu() {
@@ -1825,9 +3455,14 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${GREEN}6.${NC} Remove Node / 删除节点                                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}7.${NC} $(msg menu_restart)                                            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}8.${NC} $(msg menu_test_sni)                                      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   ${GREEN}9.${NC} $(msg menu_uninstall) (All)                                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${GREEN}9.${NC} $(msg menu_health)                                             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${MAGENTA}L.${NC} $(msg menu_lang)                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${YELLOW}U.${NC} $(msg menu_uninstall) (All)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${RED}0.${NC} $(msg menu_exit)                                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
@@ -1837,7 +3472,7 @@ show_menu() {
 main_menu() {
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,L]: "
+        echo -n "   $(msg menu_choice) [0-9,T,L,U]: "
         read -r choice
         echo ""
 
@@ -1883,12 +3518,20 @@ main_menu() {
                 read -rp "$(msg menu_press_enter)"
                 ;;
             9)
-                cmd_uninstall
+                cmd_health
                 echo ""
                 read -rp "$(msg menu_press_enter)"
                 ;;
+            [Tt])
+                cmd_tools
+                ;;
             [Ll])
                 select_language
+                ;;
+            [Uu])
+                cmd_uninstall
+                echo ""
+                read -rp "$(msg menu_press_enter)"
                 ;;
             0)
                 echo -e "${GREEN}Bye!${NC}"
@@ -1904,7 +3547,7 @@ main_menu() {
 
 show_help() {
     echo ""
-    echo -e "${CYAN}VLESS TCP REALITY Vision (Multi-Node Support)${NC}"
+    echo -e "${CYAN}VLESS TCP REALITY Vision (Enhanced Edition)${NC}"
     echo ""
     echo "Usage: bash $0 [command]"
     echo ""
@@ -1915,10 +3558,22 @@ show_help() {
     echo "  info        Show node information"
     echo "  qr          Show QR code"
     echo "  status      Show service status"
+    echo "  health      Run health check"
     echo "  remove      Remove a node"
     echo "  restart     Restart service"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
+    echo ""
+    echo "System Tools:"
+    echo "  tools       System tools menu (WARP/BBR/Swap/Fail2ban/Ports/Logs)"
+    echo "  ports       Port management (SSH/Vision/XHTTP)"
+    echo "  logs        Log viewer"
+    echo "  warp        WARP routing management"
+    echo "  bbr         BBR/TCP optimization"
+    echo "  swap        Swap management"
+    echo "  fail2ban    Fail2ban management"
+    echo ""
+    echo "Other:"
     echo "  menu        Show interactive menu"
     echo "  help        Show this help"
     echo ""
@@ -1927,12 +3582,17 @@ show_help() {
     echo "  reym=xxx    Specify SNI domain"
     echo "  vlpt=xxx    Specify port"
     echo "  uuid=xxx    Specify UUID"
+    echo "  xhttp=true  Enable XHTTP protocol"
+    echo "  xhpt=xxx    Specify XHTTP port"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
     echo "  bash $0 install                            # Add node (interactive)"
     echo "  name=hk1 bash $0 install                   # Add node with name"
-    echo "  name=jp1 reym=www.tesla.com bash $0 install  # Custom name + SNI"
+    echo "  name=jp1 xhttp=true bash $0 install        # Add node with XHTTP"
+    echo "  bash $0 tools                              # System tools menu"
+    echo "  bash $0 ports                              # Port management"
+    echo "  bash $0 logs                               # Log viewer"
     echo ""
 }
 
@@ -1948,8 +3608,18 @@ init_language_if_needed() {
     fi
 }
 
+# 单实例锁检查（对于可能冲突的操作）
+check_lock_for_write_ops() {
+    if ! lock_acquire; then
+        log_error "$(msg script_running)"
+        log_error "If you are sure no other instance is running, remove: $LOCK_DIR"
+        exit 1
+    fi
+}
+
 case "${1:-}" in
     install)
+        check_lock_for_write_ops
         init_language_if_needed
         cmd_install
         ;;
@@ -1969,15 +3639,22 @@ case "${1:-}" in
         init_language_if_needed
         cmd_status
         ;;
+    health)
+        init_language_if_needed
+        cmd_health
+        ;;
     remove)
+        check_lock_for_write_ops
         init_language_if_needed
         cmd_remove
         ;;
     restart)
+        check_lock_for_write_ops
         init_language_if_needed
         cmd_restart
         ;;
     uninstall)
+        check_lock_for_write_ops
         init_language_if_needed
         cmd_uninstall
         ;;
@@ -1985,7 +3662,42 @@ case "${1:-}" in
         init_language_if_needed
         cmd_test_sni
         ;;
+    tools)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_tools
+        ;;
+    warp)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_warp
+        ;;
+    bbr)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_bbr
+        ;;
+    swap)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_swap
+        ;;
+    fail2ban)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_fail2ban
+        ;;
+    ports)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_ports
+        ;;
+    logs)
+        init_language_if_needed
+        cmd_logs
+        ;;
     menu|"")
+        check_lock_for_write_ops
         init_language_if_needed
         main_menu
         ;;
