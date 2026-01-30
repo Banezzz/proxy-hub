@@ -1887,11 +1887,43 @@ prompt_custom_sni() {
     fi
 }
 
+# 验证 Xray 配置文件有效性
+validate_xray_config() {
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        log_error "Config file not found: $XRAY_CONF"
+        return 1
+    fi
+
+    # 检查文件不为空
+    if [[ ! -s "$XRAY_CONF" ]]; then
+        log_error "Config file is empty"
+        return 1
+    fi
+
+    # 检查 JSON 有效性
+    if ! jq empty "$XRAY_CONF" 2>/dev/null; then
+        log_error "Config file contains invalid JSON"
+        return 1
+    fi
+
+    # 如果 xray 可用，使用 xray -test 验证
+    if command -v "$XRAY_BIN" &>/dev/null; then
+        local test_output
+        if ! test_output=$("$XRAY_BIN" -test -config "$XRAY_CONF" 2>&1); then
+            log_error "Xray config test failed: $test_output"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 write_config() {
     mkdir -p /usr/local/etc/xray
 
     # 构建 inbounds 数组
     local inbounds_json="[]"
+    local jq_error=""
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
@@ -1950,7 +1982,14 @@ write_config() {
 }
 EOF
 )
-            inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]')
+            # 使用临时变量和错误检查来防止 jq 失败导致脚本退出
+            local new_inbounds
+            if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]' 2>&1); then
+                inbounds_json="$new_inbounds"
+            else
+                log_error "Failed to add Vision inbound for node '$n_name': $new_inbounds"
+                return 1
+            fi
         fi
 
         # 添加 XHTTP inbound（如果协议类型包含 xhttp）
@@ -1983,7 +2022,14 @@ EOF
 }
 EOF
 )
-            inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$xhttp_inbound" '. += [$inbound]')
+            # 使用临时变量和错误检查来防止 jq 失败导致脚本退出
+            local new_inbounds
+            if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$xhttp_inbound" '. += [$inbound]' 2>&1); then
+                inbounds_json="$new_inbounds"
+            else
+                log_error "Failed to add XHTTP inbound for node '$n_name': $new_inbounds"
+                return 1
+            fi
         fi
     done
 
@@ -1993,7 +2039,13 @@ EOF
     # 检查是否有 WARP 代理
     if check_warp_running; then
         local warp_outbound='{"tag": "warp_proxy", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": '$WARP_SOCKS_PORT'}]}}'
-        outbounds_json=$(echo "$outbounds_json" | jq --argjson outbound "$warp_outbound" '. += [$outbound]')
+        local new_outbounds
+        if new_outbounds=$(echo "$outbounds_json" | jq --argjson outbound "$warp_outbound" '. += [$outbound]' 2>&1); then
+            outbounds_json="$new_outbounds"
+        else
+            log_error "Failed to add WARP outbound: $new_outbounds"
+            return 1
+        fi
     fi
 
     # 构建路由规则
@@ -2011,15 +2063,25 @@ EOF
 
     # 检查并添加 WARP 分流规则
     if [[ -f "/root/.warp_netflix" ]] && check_warp_running; then
-        routing_json=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:netflix"], "outboundTag": "warp_proxy"}] + .rules')
+        local new_routing
+        if new_routing=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:netflix"], "outboundTag": "warp_proxy"}] + .rules' 2>&1); then
+            routing_json="$new_routing"
+        else
+            log_warn "Failed to add Netflix routing rule: $new_routing"
+        fi
     fi
     if [[ -f "/root/.warp_ai" ]] && check_warp_running; then
-        routing_json=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:openai", "geosite:anthropic"], "outboundTag": "warp_proxy"}] + .rules')
+        local new_routing
+        if new_routing=$(echo "$routing_json" | jq '.rules = [{"type": "field", "domain": ["geosite:openai", "geosite:anthropic"], "outboundTag": "warp_proxy"}] + .rules' 2>&1); then
+            routing_json="$new_routing"
+        else
+            log_warn "Failed to add AI routing rule: $new_routing"
+        fi
     fi
 
     # 组装最终配置
     local config_json
-    config_json=$(jq -n \
+    if ! config_json=$(jq -n \
         --argjson inbounds "$inbounds_json" \
         --argjson outbounds "$outbounds_json" \
         --argjson routing "$routing_json" \
@@ -2028,9 +2090,20 @@ EOF
             "inbounds": $inbounds,
             "outbounds": $outbounds,
             "routing": $routing
-        }')
+        }' 2>&1); then
+        log_error "Failed to assemble final config: $config_json"
+        return 1
+    fi
 
     echo "$config_json" > "$XRAY_CONF"
+
+    # 验证配置文件有效性
+    if ! validate_xray_config; then
+        log_error "Generated config is invalid"
+        return 1
+    fi
+
+    return 0
 }
 
 # 检查 WARP 是否运行
@@ -2302,10 +2375,25 @@ cmd_install() {
     detect_network_stack
 
     save_env
-    write_config
+
+    # 生成配置文件，如果失败则回滚
+    if ! write_config; then
+        log_error "Failed to generate Xray config, rolling back..."
+        # 删除刚保存的节点配置
+        local node_file
+        node_file=$(get_node_file "$CURRENT_NODE_NAME")
+        rm -f "$node_file" 2>/dev/null
+        return 1
+    fi
 
     service_enable xray
     service_restart xray
+
+    # 验证服务启动成功
+    sleep 1
+    if ! service_is_active xray; then
+        log_warn "Xray service may not have started correctly. Run 'xray health' to check."
+    fi
 
     log_info "$(msg install_complete)"
 
@@ -2423,6 +2511,45 @@ cmd_status() {
 cmd_restart() {
     service_restart xray
     log_info "$(msg service_restarted)"
+}
+
+# 重新生成配置文件（用于修复配置问题）
+cmd_regenerate() {
+    log_info "Regenerating Xray config from node files..."
+
+    # 备份当前配置
+    if [[ -f "$XRAY_CONF" ]]; then
+        cp "$XRAY_CONF" "${XRAY_CONF}.bak"
+        log_info "Backed up current config to ${XRAY_CONF}.bak"
+    fi
+
+    # 重新生成配置
+    if write_config; then
+        log_info "Config regenerated successfully"
+        service_restart xray
+        sleep 1
+        if service_is_active xray; then
+            log_info "Xray service restarted successfully"
+        else
+            log_error "Xray service failed to start. Restoring backup..."
+            if [[ -f "${XRAY_CONF}.bak" ]]; then
+                mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+                service_restart xray
+            fi
+            return 1
+        fi
+    else
+        log_error "Failed to regenerate config"
+        if [[ -f "${XRAY_CONF}.bak" ]]; then
+            log_info "Restoring backup config..."
+            mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+        fi
+        return 1
+    fi
+
+    # 清理备份
+    rm -f "${XRAY_CONF}.bak" 2>/dev/null
+    return 0
 }
 
 # 删除单个节点
@@ -3699,6 +3826,7 @@ show_help() {
     echo "  health      Run health check"
     echo "  remove      Remove a node"
     echo "  restart     Restart service"
+    echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -3792,6 +3920,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_restart
+        ;;
+    regenerate|regen)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_regenerate
         ;;
     uninstall)
         check_lock_for_write_ops
