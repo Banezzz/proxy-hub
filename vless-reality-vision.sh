@@ -1887,10 +1887,12 @@ write_config() {
     "network": "tcp",
     "security": "reality",
     "realitySettings": {
+      "show": false,
       "dest": "$n_sni:443",
       "serverNames": ["$n_sni"],
       "privateKey": "$n_private_key",
-      "shortIds": ["$n_short_id"]
+      "shortIds": ["$n_short_id"],
+      "fingerprint": "chrome"
     }
   },
   "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -1917,10 +1919,12 @@ EOF
     "security": "reality",
     "xhttpSettings": {"path": "$n_xhttp_path"},
     "realitySettings": {
+      "show": false,
       "dest": "$n_sni:443",
       "serverNames": ["$n_sni"],
       "privateKey": "$n_private_key",
-      "shortIds": ["$n_short_id"]
+      "shortIds": ["$n_short_id"],
+      "fingerprint": "chrome"
     }
   },
   "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -2039,7 +2043,10 @@ get_xhttp_link() {
         ip_formatted="[$ip]"
     fi
 
-    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${XHTTP_PATH}#${node_label}"
+    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
+    local encoded_path
+    encoded_path=$(echo -n "$XHTTP_PATH" | sed 's|/|%2F|g')
+    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
 }
 
 # 向后兼容的获取分享链接函数
