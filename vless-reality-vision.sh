@@ -302,6 +302,196 @@ show_spinner() {
     printf "\r\033[K"
 }
 
+# ============== 超时输入函数 ==============
+
+# 交互超时设置
+UI_TIMEOUT_SHORT=30   # 简单询问
+UI_TIMEOUT_LONG=60    # 复杂操作
+
+# 核心：统一倒计时交互函数
+# 用法: read_with_timeout "提示语" "默认值" "超时时间"
+# 返回值存储在 USER_INPUT 变量中
+USER_INPUT=""
+
+read_with_timeout() {
+    local prompt="$1"
+    local default="$2"
+    local timeout="${3:-$UI_TIMEOUT_SHORT}"
+    local input_char=""
+
+    # 清空之前的输入残留 (防止幽灵回车导致秒过)
+    while read -r -t 0 2>/dev/null; do read -r -n 1 2>/dev/null; done
+
+    USER_INPUT=""
+
+    # 设定截止时间戳
+    local start_time end_time current_time remaining
+    start_time=$(date +%s)
+    end_time=$((start_time + timeout))
+
+    while true; do
+        current_time=$(date +%s)
+        remaining=$((end_time - current_time))
+
+        # 如果时间到了，退出循环
+        if [[ "$remaining" -le 0 ]]; then
+            break
+        fi
+
+        # 交互 UI： 提示语 [默认: X] [ 10s ] :
+        printf "\r${YELLOW}%s [默认: %s] [ ${RED}%ds${YELLOW} ] : ${NC}" "$prompt" "$default" "$remaining"
+
+        # -t 1 等待一秒，但我们只关心是否按键
+        if read -t 1 -n 1 input_char 2>/dev/null; then
+            # 用户按下了键
+            echo "" # 换行
+            if [[ -z "$input_char" ]]; then
+                USER_INPUT="$default"
+            else
+                USER_INPUT="$input_char"
+            fi
+            return 0
+        fi
+    done
+
+    # 超时处理
+    echo ""
+    echo -e "${BLUE}[INFO]${NC} 倒计时结束，使用默认值: ${default}"
+    USER_INPUT="$default"
+}
+
+# ============== 包管理器状态检查 ==============
+
+# 检查包管理器是否繁忙
+is_pkg_manager_busy() {
+    case "$PKG_MANAGER" in
+        apt)
+            pgrep -x apt >/dev/null 2>&1 || \
+            pgrep -x apt-get >/dev/null 2>&1 || \
+            pgrep -x dpkg >/dev/null 2>&1 || \
+            pgrep -f "unattended-upgr" >/dev/null 2>&1
+            ;;
+        dnf|yum)
+            pgrep -x dnf >/dev/null 2>&1 || \
+            pgrep -x yum >/dev/null 2>&1 || \
+            pgrep -x rpm >/dev/null 2>&1
+            ;;
+        apk)
+            pgrep -x apk >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 检查 dpkg/rpm 数据库状态
+check_pkg_db_status() {
+    case "$PKG_MANAGER" in
+        apt)
+            if ! dpkg --audit >/dev/null 2>&1; then
+                echo -e "${RED}[ERROR]${NC} 检测到 dpkg 数据库状态异常！"
+                echo -e "${YELLOW}建议执行: 'dpkg --configure -a' 修复系统。${NC}"
+                return 1
+            fi
+            ;;
+        dnf|yum)
+            if ! rpm --query --all >/dev/null 2>&1; then
+                echo -e "${RED}[ERROR]${NC} 检测到 RPM 数据库状态异常！"
+                echo -e "${YELLOW}建议执行: 'rpm --rebuilddb' 修复系统。${NC}"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 等待包管理器释放
+wait_for_pkg_manager() {
+    local max_wait=300  # 最长等待 5 分钟
+    local waited=0
+    local i=0
+
+    if ! is_pkg_manager_busy; then
+        return 0
+    fi
+
+    echo -e "${BLUE}[INFO]${NC} 检测到系统更新进程正在运行，正在等待释放..."
+    tput civis 2>/dev/null || true
+
+    while is_pkg_manager_busy; do
+        if [[ $waited -ge $max_wait ]]; then
+            tput cnorm 2>/dev/null || true
+            echo ""
+            echo -e "${YELLOW}[WARN]${NC} 等待超时！"
+            echo -n "是否强制终止占用进程? (y/n) [n]: "
+            read -r kill_choice
+            if [[ "$kill_choice" == "y" || "$kill_choice" == "Y" ]]; then
+                case "$PKG_MANAGER" in
+                    apt)
+                        killall apt apt-get dpkg 2>/dev/null || true
+                        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null
+                        ;;
+                    dnf|yum)
+                        killall dnf yum 2>/dev/null || true
+                        rm -f /var/run/yum.pid /var/run/dnf.pid 2>/dev/null
+                        ;;
+                esac
+                return 0
+            else
+                echo -e "${RED}[ERROR]${NC} 用户取消，安装终止。"
+                return 1
+            fi
+        fi
+
+        local frame="${SPINNER_FRAMES[$((i % 4))]}"
+        printf "\r  ${BLUE}[%s]${NC} 等待包管理器释放... (%ds)" "$frame" "$waited"
+        sleep 1
+        ((waited++))
+        ((i++))
+    done
+
+    tput cnorm 2>/dev/null || true
+    printf "\r\033[K"
+    echo -e "${GREEN}[OK]${NC} 包管理器已释放"
+    return 0
+}
+
+# ============== IPv6 SSH 保护 ==============
+
+# 检查当前 SSH 连接方式 (防自杀核心)
+check_ssh_connection() {
+    # 获取当前 SSH 连接的客户端 IP
+    local client_ip="${SSH_CLIENT%% *}"
+    if [[ -z "$client_ip" ]]; then
+        echo "unknown"
+    elif [[ "$client_ip" =~ : ]]; then
+        echo "v6" # 当前是 IPv6 连接
+    else
+        echo "v4" # 当前是 IPv4 连接
+    fi
+}
+
+# IPv6 操作前安全检查
+check_ipv6_ssh_safety() {
+    local action="$1"  # disable 或 其他操作
+
+    if [[ "$action" == "disable" ]]; then
+        if [[ "$(check_ssh_connection)" == "v6" ]]; then
+            echo -e "${RED}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${RED}                 [危险操作拦截]                        ${NC}"
+            echo -e "${RED}═══════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}检测到您当前正在通过 IPv6 连接 SSH！${NC}"
+            echo -e "${YELLOW}若此时禁用 IPv6，您将立即断开连接且无法重连！${NC}"
+            echo -e "${RED}操作已取消。请切换到 IPv4 网络连接 SSH 后再试。${NC}"
+            echo ""
+            read -n 1 -s -r -p "按任意键返回..."
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # ============== 包管理器检测 ==============
 
 detect_pkg_manager() {
@@ -2705,6 +2895,493 @@ fail2ban_logs() {
     read -rp "$(msg menu_press_enter)"
 }
 
+# ============== 端口管理 ==============
+
+# 验证端口号
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        echo -e "${RED}[ERROR]${NC} 端口必须是 1-65535 之间的数字！"
+        return 1
+    fi
+    return 0
+}
+
+# 检查端口运行状态
+check_port_status() {
+    local port="$1"
+    if ss -tlnp 2>/dev/null | grep -q ":${port} " || \
+       ss -ulnp 2>/dev/null | grep -q ":${port} "; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}未运行${NC}"
+    fi
+}
+
+# 开放端口 (跨系统支持)
+open_firewall_port() {
+    local port="$1"
+
+    # iptables (if available)
+    if command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+
+        # IPv6
+        if [[ -f /proc/net/if_inet6 ]] && command -v ip6tables &>/dev/null; then
+            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+
+        # 持久化 (如果有 netfilter-persistent)
+        if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save 2>/dev/null || true
+        fi
+    fi
+
+    # firewalld (if available)
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/tcp" 2>/dev/null || true
+        firewall-cmd --permanent --add-port="${port}/udp" 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    # ufw (if available)
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port" 2>/dev/null || true
+    fi
+}
+
+# 获取当前端口配置
+get_current_ports() {
+    local ssh_config="/etc/ssh/sshd_config"
+
+    # SSH 端口
+    CURRENT_SSH=$(grep "^Port" "$ssh_config" 2>/dev/null | head -n 1 | awk '{print $2}')
+    [[ -z "$CURRENT_SSH" ]] && CURRENT_SSH=22
+
+    # Xray 端口
+    if [[ -f "$XRAY_CONF" ]] && command -v jq &>/dev/null; then
+        CURRENT_VISION=$(jq -r '.inbounds[] | select(.tag=="vision_node" or .tag=="vless-reality-vision" or .settings.clients) | .port' "$XRAY_CONF" 2>/dev/null | head -1)
+        CURRENT_XHTTP=$(jq -r '.inbounds[] | select(.tag=="xhttp_node") | .port' "$XRAY_CONF" 2>/dev/null | head -1)
+    else
+        CURRENT_VISION="N/A"
+        CURRENT_XHTTP="N/A"
+    fi
+
+    [[ -z "$CURRENT_VISION" || "$CURRENT_VISION" == "null" ]] && CURRENT_VISION="N/A"
+    [[ -z "$CURRENT_XHTTP" || "$CURRENT_XHTTP" == "null" ]] && CURRENT_XHTTP="N/A"
+}
+
+# 修改 SSH 端口
+change_ssh_port() {
+    local ssh_config="/etc/ssh/sshd_config"
+
+    # 安全警告框
+    clear
+    echo -e "${RED}################################################################${NC}"
+    echo -e "${RED}#                    高风险操作警告 (WARNING)                  #${NC}"
+    echo -e "${RED}################################################################${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}#${NC}  1. 云服务器用户 (阿里云/腾讯云/AWS等)：                     ${RED}#${NC}"
+    echo -e "${RED}#${NC}     必须先在网页控制台的【安全组/防火墙】放行新端口！        ${RED}#${NC}"
+    echo -e "${RED}#${NC}     (脚本只能修改系统内部防火墙，无法修改云平台安全组)       ${RED}#${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}#${NC}  2. 修改后【绝对不要】关闭当前窗口！                         ${RED}#${NC}"
+    echo -e "${RED}#${NC}     请新开一个 SSH 窗口测试连接。如果失败，                  ${RED}#${NC}"
+    echo -e "${RED}#${NC}     请立即利用当前窗口改回原端口 ($CURRENT_SSH)。            ${RED}#${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}################################################################${NC}"
+    echo ""
+
+    read -p "我已知晓风险，确认继续修改? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}>>> 操作已取消。${NC}"
+        sleep 1
+        return
+    fi
+
+    echo ""
+    read -p "请输入新的 SSH 端口 [当前: $CURRENT_SSH]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 SSH 端口...${NC}"
+
+    # 修改配置文件
+    if grep -q "^Port" "$ssh_config"; then
+        sed -i "s/^Port.*/Port $new_port/" "$ssh_config"
+    else
+        echo "Port $new_port" >> "$ssh_config"
+    fi
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 SSH 服务
+    echo -e "${BLUE}[INFO]${NC} 重启 SSH 服务..."
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
+    else
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}修改成功！请务必新开窗口测试端口 $new_port 。${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 修改 Vision 端口
+change_vision_port() {
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        echo -e "${RED}[ERROR]${NC} Xray 配置文件不存在！"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    read -p "请输入新的 Vision 端口 [当前: $CURRENT_VISION]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 Vision 端口...${NC}"
+
+    # 使用 jq 修改端口
+    if command -v jq &>/dev/null; then
+        # 尝试多种 tag 名称
+        local tmp_file="${XRAY_CONF}.tmp"
+        jq --argjson port "$new_port" '
+            (.inbounds[] | select(.tag=="vision_node" or .tag=="vless-reality-vision" or (.settings.clients and .streamSettings.realitySettings)) | .port) |= $port
+        ' "$XRAY_CONF" > "$tmp_file" && mv "$tmp_file" "$XRAY_CONF"
+    fi
+
+    # 更新节点配置文件
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        if grep -q "^PORT=" "$node_file"; then
+            sed -i "s/^PORT=.*/PORT=$new_port/" "$node_file"
+        fi
+    done
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 Xray
+    echo -e "${BLUE}[INFO]${NC} 重启 Xray 服务..."
+    service_restart xray
+
+    echo -e "${GREEN}修改成功！${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 修改 XHTTP 端口
+change_xhttp_port() {
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        echo -e "${RED}[ERROR]${NC} Xray 配置文件不存在！"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    if [[ "$CURRENT_XHTTP" == "N/A" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} XHTTP 未启用"
+        read -n 1 -s -r -p "按任意键继续..."
+        return
+    fi
+
+    read -p "请输入新的 XHTTP 端口 [当前: $CURRENT_XHTTP]: " new_port
+    [[ -z "$new_port" ]] && return
+    validate_port "$new_port" || return
+
+    echo -e "${BLUE}正在修改 XHTTP 端口...${NC}"
+
+    # 使用 jq 修改端口
+    if command -v jq &>/dev/null; then
+        local tmp_file="${XRAY_CONF}.tmp"
+        jq --argjson port "$new_port" '
+            (.inbounds[] | select(.tag=="xhttp_node") | .port) |= $port
+        ' "$XRAY_CONF" > "$tmp_file" && mv "$tmp_file" "$XRAY_CONF"
+    fi
+
+    # 更新节点配置文件
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        if grep -q "^XHTTP_PORT=" "$node_file"; then
+            sed -i "s/^XHTTP_PORT=.*/XHTTP_PORT=$new_port/" "$node_file"
+        fi
+    done
+
+    # 开放防火墙
+    open_firewall_port "$new_port"
+
+    # 重启 Xray
+    echo -e "${BLUE}[INFO]${NC} 重启 Xray 服务..."
+    service_restart xray
+
+    echo -e "${GREEN}修改成功！${NC}"
+    read -n 1 -s -r -p "按任意键继续..."
+}
+
+# 端口管理菜单
+cmd_ports() {
+    while true; do
+        get_current_ports
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}              端口管理面板 (Port Manager)              ${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  服务              端口            状态"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        printf "  ${GREEN}1.${NC} 修改 SSH          ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_SSH" "$(check_port_status "$CURRENT_SSH")"
+        printf "  ${GREEN}2.${NC} 修改 Vision       ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_VISION" "$([[ "$CURRENT_VISION" != "N/A" ]] && check_port_status "$CURRENT_VISION" || echo -e "${RED}N/A${NC}")"
+        printf "  ${GREEN}3.${NC} 修改 XHTTP        ${YELLOW}%-12s${NC}  %s\n" "$CURRENT_XHTTP" "$([[ "$CURRENT_XHTTP" != "N/A" ]] && check_port_status "$CURRENT_XHTTP" || echo -e "${RED}N/A${NC}")"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} 返回 (Back)"
+        echo ""
+        read -p "请输入选项 [0-3]: " choice
+
+        case "$choice" in
+            1) change_ssh_port ;;
+            2) change_vision_port ;;
+            3) change_xhttp_port ;;
+            0) return ;;
+            *) echo -e "${RED}输入无效${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============== 日志查看 ==============
+
+cmd_logs() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}              日志查看器 (Log Viewer)                  ${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Xray 日志 (最新 50 行)"
+        echo -e "  ${GREEN}2.${NC} Xray 错误日志"
+        echo -e "  ${GREEN}3.${NC} SSH 登录日志"
+        echo -e "  ${GREEN}4.${NC} Fail2ban 日志"
+        echo -e "  ${GREEN}5.${NC} 系统日志"
+        echo -e "${CYAN}───────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} 返回 (Back)"
+        echo ""
+        read -p "请输入选项 [0-5]: " choice
+
+        case "$choice" in
+            1)
+                echo ""
+                echo -e "${CYAN}>>> Xray 日志 (最新 50 行):${NC}"
+                echo ""
+                if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+                    if [[ -f /var/log/xray/access.log ]]; then
+                        tail -50 /var/log/xray/access.log
+                    else
+                        echo "日志文件不存在"
+                    fi
+                else
+                    journalctl -u xray --no-pager -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            2)
+                echo ""
+                echo -e "${CYAN}>>> Xray 错误日志:${NC}"
+                echo ""
+                if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+                    if [[ -f /var/log/xray/error.log ]]; then
+                        tail -50 /var/log/xray/error.log
+                    else
+                        echo "日志文件不存在"
+                    fi
+                else
+                    journalctl -u xray --no-pager -p err -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            3)
+                echo ""
+                echo -e "${CYAN}>>> SSH 登录日志:${NC}"
+                echo ""
+                if [[ -f /var/log/auth.log ]]; then
+                    grep -E "sshd.*(Accepted|Failed)" /var/log/auth.log 2>/dev/null | tail -30
+                elif [[ -f /var/log/secure ]]; then
+                    grep -E "sshd.*(Accepted|Failed)" /var/log/secure 2>/dev/null | tail -30
+                else
+                    journalctl -u ssh -u sshd --no-pager -n 30 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            4)
+                echo ""
+                echo -e "${CYAN}>>> Fail2ban 日志:${NC}"
+                echo ""
+                if [[ -f /var/log/fail2ban.log ]]; then
+                    grep -E "(Ban|Unban)" /var/log/fail2ban.log 2>/dev/null | tail -30
+                else
+                    echo "Fail2ban 日志不存在"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            5)
+                echo ""
+                echo -e "${CYAN}>>> 系统日志 (最新 50 行):${NC}"
+                echo ""
+                if [[ -f /var/log/syslog ]]; then
+                    tail -50 /var/log/syslog
+                elif [[ -f /var/log/messages ]]; then
+                    tail -50 /var/log/messages
+                else
+                    journalctl --no-pager -n 50 2>/dev/null || echo "无法读取日志"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            0) return ;;
+            *) echo -e "${RED}输入无效${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ============== 独立工具安装 ==============
+
+install_standalone_tools() {
+    local bin_dir="/usr/local/bin"
+
+    echo -e "${BLUE}[INFO]${NC} 安装独立工具命令到 ${bin_dir}..."
+
+    # 1. info 命令 - 显示节点信息
+    cat > "${bin_dir}/xray-info" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Info Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" info
+elif command -v reality-vision &>/dev/null; then
+    reality-vision info
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-info"
+
+    # 2. ports 命令 - 端口管理
+    cat > "${bin_dir}/xray-ports" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Ports Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" ports
+elif command -v reality-vision &>/dev/null; then
+    reality-vision ports
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-ports"
+
+    # 3. logs 命令 - 日志查看
+    cat > "${bin_dir}/xray-logs" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Logs Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" logs
+elif command -v reality-vision &>/dev/null; then
+    reality-vision logs
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-logs"
+
+    # 4. bbr 命令
+    cat > "${bin_dir}/xray-bbr" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - BBR Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" bbr
+elif command -v reality-vision &>/dev/null; then
+    reality-vision bbr
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-bbr"
+
+    # 5. swap 命令
+    cat > "${bin_dir}/xray-swap" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Swap Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" swap
+elif command -v reality-vision &>/dev/null; then
+    reality-vision swap
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-swap"
+
+    # 6. warp 命令
+    cat > "${bin_dir}/xray-warp" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - WARP Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" warp
+elif command -v reality-vision &>/dev/null; then
+    reality-vision warp
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-warp"
+
+    # 7. f2b 命令 - Fail2ban
+    cat > "${bin_dir}/xray-f2b" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - Fail2ban Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" fail2ban
+elif command -v reality-vision &>/dev/null; then
+    reality-vision fail2ban
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-f2b"
+
+    # 8. 主脚本链接
+    if [[ -f "/root/reality_vision.sh" ]]; then
+        ln -sf "/root/reality_vision.sh" "${bin_dir}/reality-vision" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}[OK]${NC} 独立工具已安装！可用命令:"
+    echo "  xray-info   - 查看节点信息"
+    echo "  xray-ports  - 端口管理"
+    echo "  xray-logs   - 日志查看"
+    echo "  xray-bbr    - BBR 管理"
+    echo "  xray-swap   - Swap 管理"
+    echo "  xray-warp   - WARP 管理"
+    echo "  xray-f2b    - Fail2ban 管理"
+}
+
 # ============== 系统工具菜单 ==============
 
 cmd_tools() {
@@ -2715,14 +3392,24 @@ cmd_tools() {
         echo -e "${GREEN}                     $(msg tools_menu)${NC}"
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
         echo ""
+        echo -e "  ${BLUE}[网络优化]${NC}"
         echo -e "  ${GREEN}1.${NC} $(msg menu_warp)"
         echo -e "  ${GREEN}2.${NC} $(msg menu_bbr)"
+        echo ""
+        echo -e "  ${BLUE}[系统管理]${NC}"
         echo -e "  ${GREEN}3.${NC} $(msg menu_swap)"
         echo -e "  ${GREEN}4.${NC} $(msg menu_fail2ban)"
+        echo ""
+        echo -e "  ${BLUE}[服务管理]${NC}"
+        echo -e "  ${GREEN}5.${NC} 端口管理 (Ports)"
+        echo -e "  ${GREEN}6.${NC} 日志查看 (Logs)"
+        echo ""
+        echo -e "  ${BLUE}[其他]${NC}"
+        echo -e "  ${GREEN}7.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-4]: "
+        echo -n "  $(msg menu_choice) [0-7]: "
         read -r choice
 
         case "$choice" in
@@ -2730,6 +3417,13 @@ cmd_tools() {
             2) cmd_bbr ;;
             3) cmd_swap ;;
             4) cmd_fail2ban ;;
+            5) cmd_ports ;;
+            6) cmd_logs ;;
+            7)
+                install_standalone_tools
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             0) return ;;
             *) ;;
         esac
@@ -2869,11 +3563,17 @@ show_help() {
     echo "  restart     Restart service"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
-    echo "  tools       System tools menu (WARP/BBR/Swap/Fail2ban)"
+    echo ""
+    echo "System Tools:"
+    echo "  tools       System tools menu (WARP/BBR/Swap/Fail2ban/Ports/Logs)"
+    echo "  ports       Port management (SSH/Vision/XHTTP)"
+    echo "  logs        Log viewer"
     echo "  warp        WARP routing management"
     echo "  bbr         BBR/TCP optimization"
     echo "  swap        Swap management"
     echo "  fail2ban    Fail2ban management"
+    echo ""
+    echo "Other:"
     echo "  menu        Show interactive menu"
     echo "  help        Show this help"
     echo ""
@@ -2891,6 +3591,8 @@ show_help() {
     echo "  name=hk1 bash $0 install                   # Add node with name"
     echo "  name=jp1 xhttp=true bash $0 install        # Add node with XHTTP"
     echo "  bash $0 tools                              # System tools menu"
+    echo "  bash $0 ports                              # Port management"
+    echo "  bash $0 logs                               # Log viewer"
     echo ""
 }
 
@@ -2984,6 +3686,15 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_fail2ban
+        ;;
+    ports)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_ports
+        ;;
+    logs)
+        init_language_if_needed
+        cmd_logs
         ;;
     menu|"")
         check_lock_for_write_ops
