@@ -1189,62 +1189,87 @@ setup_geodata_cron() {
     (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
 }
 
-# ============== XHTTP 支持 ==============
+# ============== 协议类型选择 ==============
 
-# XHTTP 端口（可选功能）
+# 协议类型: vision, xhttp, both
+PROTOCOL_TYPE="vision"
 XHTTP_PORT=""
 XHTTP_PATH=""
-ENABLE_XHTTP="false"
 
-choose_xhttp_port() {
-    if [[ "$ENABLE_XHTTP" != "true" ]]; then
-        return 0
-    fi
-
-    if [[ -n "${xhpt:-}" ]]; then
-        XHTTP_PORT="$xhpt"
-    else
-        while true; do
-            XHTTP_PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-            if is_port_free "$XHTTP_PORT" && [[ "$XHTTP_PORT" != "$PORT" ]]; then
-                break
-            fi
-        done
-    fi
-
-    # 生成随机路径
-    XHTTP_PATH="/$(openssl rand -hex 4)"
-}
-
-prompt_enable_xhttp() {
+# 选择协议类型
+prompt_protocol_type() {
     {
     echo ""
-    echo -e "${CYAN}$(msg enable_xhttp)${NC}"
-    echo -n "  [y/N]: "
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     选择节点协议类型${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
+    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
+    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
+    echo ""
+    echo -n "  请选择 [1-3] (默认 1): "
     } >/dev/tty
 
-    read -r xhttp_choice </dev/tty
+    local choice
+    read -r choice </dev/tty
 
-    if [[ "$xhttp_choice" =~ ^[yY]$ ]]; then
-        ENABLE_XHTTP="true"
-        log_info "$(msg xhttp_enabled)"
-    fi
+    case "$choice" in
+        2)
+            PROTOCOL_TYPE="xhttp"
+            log_info "已选择: VLESS + XHTTP + REALITY"
+            ;;
+        3)
+            PROTOCOL_TYPE="both"
+            log_info "已选择: Vision + XHTTP 双协议"
+            ;;
+        *)
+            PROTOCOL_TYPE="vision"
+            log_info "已选择: VLESS + Vision + REALITY"
+            ;;
+    esac
 }
 
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
 
-choose_port() {
-    if [[ -n "${vlpt:-}" ]]; then
-        PORT="$vlpt"
+# 选择端口（根据协议类型）
+choose_ports() {
+    # Vision 端口（如果需要）
+    if [[ "$PROTOCOL_TYPE" == "vision" || "$PROTOCOL_TYPE" == "both" ]]; then
+        if [[ -n "${vlpt:-}" ]]; then
+            PORT="$vlpt"
+        else
+            while true; do
+                PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
+                if is_port_free "$PORT"; then
+                    break
+                fi
+            done
+        fi
+        log_info "Vision 端口: $PORT"
     else
-        while true; do
-            PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-            if is_port_free "$PORT"; then
-                break
-            fi
-        done
+        PORT=""
+    fi
+
+    # XHTTP 端口（如果需要）
+    if [[ "$PROTOCOL_TYPE" == "xhttp" || "$PROTOCOL_TYPE" == "both" ]]; then
+        if [[ -n "${xhpt:-}" ]]; then
+            XHTTP_PORT="$xhpt"
+        else
+            while true; do
+                XHTTP_PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
+                if is_port_free "$XHTTP_PORT" && [[ "$XHTTP_PORT" != "${PORT:-0}" ]]; then
+                    break
+                fi
+            done
+        fi
+        XHTTP_PATH="/$(openssl rand -hex 4)"
+        log_info "XHTTP 端口: $XHTTP_PORT, 路径: $XHTTP_PATH"
+    else
+        XHTTP_PORT=""
+        XHTTP_PATH=""
     fi
 }
 
@@ -1859,7 +1884,7 @@ write_config() {
         [[ -f "$node_file" ]] || continue
 
         # 读取节点配置
-        local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path
+        local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
         n_name=$(grep "^NODE_NAME=" "$node_file" | cut -d= -f2)
         n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
         n_uuid=$(grep "^UUID=" "$node_file" | cut -d= -f2)
@@ -1868,12 +1893,25 @@ write_config() {
         n_short_id=$(grep "^SHORT_ID=" "$node_file" | cut -d= -f2)
         n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
         n_xhttp_path=$(grep "^XHTTP_PATH=" "$node_file" | cut -d= -f2)
+        n_protocol_type=$(grep "^PROTOCOL_TYPE=" "$node_file" | cut -d= -f2)
 
-        [[ -z "$n_port" || -z "$n_uuid" ]] && continue
+        # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
+        if [[ -z "$n_protocol_type" ]]; then
+            if [[ -n "$n_port" ]] && [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="both"
+            elif [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="xhttp"
+            else
+                n_protocol_type="vision"
+            fi
+        fi
 
-        # 添加 Vision inbound
-        local vision_inbound
-        vision_inbound=$(cat <<EOF
+        [[ -z "$n_uuid" ]] && continue
+
+        # 添加 Vision inbound（如果协议类型包含 vision）
+        if [[ "$n_protocol_type" == "vision" || "$n_protocol_type" == "both" ]] && [[ -n "$n_port" ]]; then
+            local vision_inbound
+            vision_inbound=$(cat <<EOF
 {
   "tag": "${n_name}_vision",
   "listen": "0.0.0.0",
@@ -1899,10 +1937,11 @@ write_config() {
 }
 EOF
 )
-        inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]')
+            inbounds_json=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]')
+        fi
 
-        # 添加 XHTTP inbound（如果启用）
-        if [[ -n "$n_xhttp_port" ]] && [[ -n "$n_xhttp_path" ]]; then
+        # 添加 XHTTP inbound（如果协议类型包含 xhttp）
+        if [[ "$n_protocol_type" == "xhttp" || "$n_protocol_type" == "both" ]] && [[ -n "$n_xhttp_port" ]] && [[ -n "$n_xhttp_path" ]]; then
             local xhttp_inbound
             xhttp_inbound=$(cat <<EOF
 {
@@ -2003,13 +2042,13 @@ NODE_NAME=$node_name
 SERVER_IP=${save_ipv4:-YOUR_SERVER_IP}
 SERVER_IPV4=${save_ipv4:-}
 SERVER_IPV6=${save_ipv6:-}
-PORT=$PORT
+PORT=${PORT:-}
 UUID=$UUID
 SNI=$SNI
 PUBLIC_KEY=$PUBLIC_KEY
 PRIVATE_KEY=$PRIVATE_KEY
 SHORT_ID=$SHORT_ID
-ENABLE_XHTTP=${ENABLE_XHTTP:-false}
+PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
 ENV
@@ -2100,14 +2139,19 @@ show_info() {
     if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]]; then
         echo -e "  ${BLUE}$(msg server_addr):${NC} ${SERVER_IP:-N/A}"
     fi
-    echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
-    if [[ -n "${XHTTP_PORT:-}" ]]; then
+    # 根据协议类型显示端口
+    local proto_type="${PROTOCOL_TYPE:-both}"
+    if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+        echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
+    fi
+    if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
         echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT"
     fi
     echo -e "  ${BLUE}UUID:${NC}        $UUID"
     echo -e "  ${BLUE}SNI:${NC}         $SNI"
     echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
     echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+    echo -e "  ${BLUE}协议类型:${NC}    $proto_type"
     echo ""
 
     # IPv4 链接
@@ -2115,9 +2159,13 @@ show_info() {
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg ipv4_links):${NC}"
         echo ""
-        echo -e "  ${YELLOW}Vision:${NC}"
-        echo -e "  $(get_vision_link "$SERVER_IPV4" "${hostname}_Vision_v4")"
-        if [[ -n "${XHTTP_PORT:-}" ]] && [[ -n "${XHTTP_PATH:-}" ]]; then
+        # Vision 链接
+        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+            echo -e "  ${YELLOW}Vision:${NC}"
+            echo -e "  $(get_vision_link "$SERVER_IPV4" "${hostname}_Vision_v4")"
+        fi
+        # XHTTP 链接
+        if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
             echo ""
             echo -e "  ${YELLOW}XHTTP:${NC}"
             echo -e "  $(get_xhttp_link "$SERVER_IPV4" "${hostname}_XHTTP_v4")"
@@ -2130,9 +2178,13 @@ show_info() {
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg ipv6_links):${NC}"
         echo ""
-        echo -e "  ${YELLOW}Vision:${NC}"
-        echo -e "  $(get_vision_link "$SERVER_IPV6" "${hostname}_Vision_v6")"
-        if [[ -n "${XHTTP_PORT:-}" ]] && [[ -n "${XHTTP_PATH:-}" ]]; then
+        # Vision 链接
+        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+            echo -e "  ${YELLOW}Vision:${NC}"
+            echo -e "  $(get_vision_link "$SERVER_IPV6" "${hostname}_Vision_v6")"
+        fi
+        # XHTTP 链接
+        if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
             echo ""
             echo -e "  ${YELLOW}XHTTP:${NC}"
             echo -e "  $(get_xhttp_link "$SERVER_IPV6" "${hostname}_XHTTP_v6")"
@@ -2143,7 +2195,11 @@ show_info() {
     if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]] && [[ -n "${SERVER_IP:-}" ]]; then
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg share_link):${NC}"
-        echo -e "${YELLOW}$(get_vision_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}")${NC}"
+        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+            echo -e "${YELLOW}$(get_vision_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}")${NC}"
+        elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+            echo -e "${YELLOW}$(get_xhttp_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}_XHTTP")${NC}"
+        fi
     fi
 
     echo ""
@@ -2187,22 +2243,27 @@ cmd_install() {
         select_best_sni
     fi
 
-    # 询问是否启用 XHTTP（除非通过环境变量指定）
-    if [[ -n "${xhttp:-}" ]]; then
+    # 选择协议类型（除非通过环境变量指定）
+    if [[ -n "${proto:-}" ]]; then
+        # 支持环境变量 proto=vision/xhttp/both
+        case "$proto" in
+            xhttp) PROTOCOL_TYPE="xhttp" ;;
+            both) PROTOCOL_TYPE="both" ;;
+            *) PROTOCOL_TYPE="vision" ;;
+        esac
+        log_info "协议类型: $PROTOCOL_TYPE"
+    elif [[ -n "${xhttp:-}" ]]; then
+        # 向后兼容: xhttp=true 等同于 proto=both
         if [[ "$xhttp" == "true" ]] || [[ "$xhttp" == "1" ]] || [[ "$xhttp" == "y" ]]; then
-            ENABLE_XHTTP="true"
+            PROTOCOL_TYPE="both"
+            log_info "协议类型: both (Vision + XHTTP)"
         fi
     else
-        prompt_enable_xhttp
+        prompt_protocol_type
     fi
 
     gen_uuid
-    choose_port
-
-    # 如果启用了 XHTTP，选择端口
-    if [[ "$ENABLE_XHTTP" == "true" ]]; then
-        choose_xhttp_port
-    fi
+    choose_ports
 
     gen_reality_keys
 
@@ -3585,18 +3646,20 @@ show_help() {
     echo "  help        Show this help"
     echo ""
     echo "Optional parameters (for install):"
-    echo "  name=xxx    Specify node name"
-    echo "  reym=xxx    Specify SNI domain"
-    echo "  vlpt=xxx    Specify port"
-    echo "  uuid=xxx    Specify UUID"
-    echo "  xhttp=true  Enable XHTTP protocol"
-    echo "  xhpt=xxx    Specify XHTTP port"
+    echo "  name=xxx      Specify node name"
+    echo "  reym=xxx      Specify SNI domain"
+    echo "  proto=xxx     Protocol type: vision, xhttp, or both"
+    echo "  vlpt=xxx      Specify Vision port (for vision/both)"
+    echo "  xhpt=xxx      Specify XHTTP port (for xhttp/both)"
+    echo "  uuid=xxx      Specify UUID"
+    echo "  xhttp=true    (deprecated) Same as proto=both"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
     echo "  bash $0 install                            # Add node (interactive)"
-    echo "  name=hk1 bash $0 install                   # Add node with name"
-    echo "  name=jp1 xhttp=true bash $0 install        # Add node with XHTTP"
+    echo "  name=hk1 bash $0 install                   # Add Vision node with name"
+    echo "  name=jp1 proto=xhttp bash $0 install       # Add XHTTP only node"
+    echo "  name=sg1 proto=both bash $0 install        # Add Vision + XHTTP node"
     echo "  bash $0 tools                              # System tools menu"
     echo "  bash $0 ports                              # Port management"
     echo "  bash $0 logs                               # Log viewer"
