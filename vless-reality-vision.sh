@@ -181,7 +181,8 @@ safe_read_config_value() {
 # Safe load all config values from node file
 # Usage: safe_load_node_config FILE
 # Sets variables: NODE_NAME, PORT, UUID, SNI, PUBLIC_KEY, PRIVATE_KEY, SHORT_ID,
-#                 PROTOCOL_TYPE, XHTTP_PORT, XHTTP_PATH, SERVER_IP, SERVER_IPV4, SERVER_IPV6
+#                 PROTOCOL_TYPE, XHTTP_PORT, XHTTP_PATH, SERVER_IP, SERVER_IPV4, SERVER_IPV6,
+#                 SS_METHOD, SS_PASSWORD
 safe_load_node_config() {
     local file="$1"
 
@@ -190,6 +191,7 @@ safe_load_node_config() {
     # Reset all variables first
     NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
     PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
+    SS_METHOD="" SS_PASSWORD=""
 
     # Load each value safely
     NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")
@@ -205,6 +207,8 @@ safe_load_node_config() {
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
+    SS_METHOD=$(safe_read_config_value "$file" "SS_METHOD")
+    SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
 
     return 0
 }
@@ -316,6 +320,36 @@ build_xhttp_inbound() {
                     "shortIds": [$short_id],
                     "fingerprint": "chrome"
                 }
+            },
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+        }'
+}
+
+# Build Shadowsocks inbound JSON using jq (prevents injection)
+# Usage: build_shadowsocks_inbound NAME PORT METHOD PASSWORD
+build_shadowsocks_inbound() {
+    local name="$1"
+    local port="$2"
+    local method="$3"
+    local password="$4"
+
+    # Validate port
+    port=$(get_validated_port "$port" true) || return 1
+
+    jq -n \
+        --arg tag "${name}_ss" \
+        --argjson port "$port" \
+        --arg method "$method" \
+        --arg password "$password" \
+        '{
+            "tag": $tag,
+            "listen": "0.0.0.0",
+            "port": $port,
+            "protocol": "shadowsocks",
+            "settings": {
+                "method": $method,
+                "password": $password,
+                "network": "tcp,udp"
             },
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
@@ -1265,14 +1299,21 @@ select_node() {
         # 根据协议类型显示对应的端口
         local display_port=""
         local proto="${PROTOCOL_TYPE:-vision}"
-        if [[ "$proto" == "xhttp" ]]; then
+        local display_info=""
+        if [[ "$proto" == "shadowsocks" ]]; then
+            display_port="${PORT:-N/A}"
+            display_info="Method: ${SS_METHOD:-N/A}"
+        elif [[ "$proto" == "xhttp" ]]; then
             display_port="${XHTTP_PORT:-N/A}"
+            display_info="SNI: $SNI"
         elif [[ "$proto" == "both" ]]; then
             display_port="${PORT:-}/${XHTTP_PORT:-}"
+            display_info="SNI: $SNI"
         else
             display_port="${PORT:-N/A}"
+            display_info="SNI: $SNI"
         fi
-        echo -e "  ${GREEN}$i.${NC} $node (Port: $display_port, SNI: $SNI)" >/dev/tty
+        echo -e "  ${GREEN}$i.${NC} $node (Port: $display_port, $display_info)" >/dev/tty
         ((i++))
     done
 
@@ -1545,10 +1586,24 @@ setup_geodata_cron() {
 
 # ============== 协议类型选择 ==============
 
-# 协议类型: vision, xhttp, both
+# 协议类型: vision, xhttp, both, shadowsocks
 PROTOCOL_TYPE="vision"
 XHTTP_PORT=""
 XHTTP_PATH=""
+
+# Shadowsocks 相关变量
+SS_METHOD=""
+SS_PASSWORD=""
+
+# Shadowsocks 支持的加密方式
+SS_METHODS_2022=(
+    "2022-blake3-aes-256-gcm"
+    "2022-blake3-chacha20-poly1305"
+)
+SS_METHODS_LEGACY=(
+    "chacha20-ietf-poly1305"
+    "aes-256-gcm"
+)
 
 # 选择协议类型
 prompt_protocol_type() {
@@ -1561,8 +1616,9 @@ prompt_protocol_type() {
     echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
     echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
     echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
+    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
     echo ""
-    echo -n "  请选择 [1-3] (默认 1): "
+    echo -n "  请选择 [1-4] (默认 1): "
     } >/dev/tty
 
     local choice
@@ -1577,11 +1633,74 @@ prompt_protocol_type() {
             PROTOCOL_TYPE="both"
             log_info "已选择: Vision + XHTTP 双协议"
             ;;
+        4)
+            PROTOCOL_TYPE="shadowsocks"
+            log_info "已选择: Shadowsocks 2022"
+            ;;
         *)
             PROTOCOL_TYPE="vision"
             log_info "已选择: VLESS + Vision + REALITY"
             ;;
     esac
+}
+
+# 选择 Shadowsocks 加密方式
+prompt_ss_method() {
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                  Shadowsocks 加密方式${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${YELLOW}推荐 (2022 协议, 更安全):${NC}"
+    echo -e "  ${GREEN}1.${NC} 2022-blake3-aes-256-gcm      ${GRAY}(推荐, 硬件加速)${NC}"
+    echo -e "  ${GREEN}2.${NC} 2022-blake3-chacha20-poly1305 ${GRAY}(移动设备优化)${NC}"
+    echo ""
+    echo -e "  ${YELLOW}传统方式 (兼容性更好):${NC}"
+    echo -e "  ${GREEN}3.${NC} chacha20-ietf-poly1305       ${GRAY}(广泛支持)${NC}"
+    echo -e "  ${GREEN}4.${NC} aes-256-gcm                  ${GRAY}(经典加密)${NC}"
+    echo ""
+    echo -n "  请选择 [1-4] (默认 1): "
+    } >/dev/tty
+
+    local choice
+    read -r choice </dev/tty
+
+    case "$choice" in
+        2)
+            SS_METHOD="2022-blake3-chacha20-poly1305"
+            ;;
+        3)
+            SS_METHOD="chacha20-ietf-poly1305"
+            ;;
+        4)
+            SS_METHOD="aes-256-gcm"
+            ;;
+        *)
+            SS_METHOD="2022-blake3-aes-256-gcm"
+            ;;
+    esac
+    log_info "加密方式: $SS_METHOD"
+}
+
+# 生成 Shadowsocks 密码/密钥
+gen_ss_password() {
+    # 2022 协议需要 base64 编码的预共享密钥
+    # 2022-blake3-aes-256-gcm 和 2022-blake3-chacha20-poly1305 需要 32 字节
+    # 传统方式使用随机字符串密码
+    case "$SS_METHOD" in
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
+            SS_PASSWORD=$(openssl rand -base64 32)
+            ;;
+        2022-blake3-aes-128-gcm)
+            SS_PASSWORD=$(openssl rand -base64 16)
+            ;;
+        *)
+            # 传统方式：生成 16 字符随机密码
+            SS_PASSWORD=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+            ;;
+    esac
+    log_info "密码已生成"
 }
 
 gen_uuid() {
@@ -1662,6 +1781,27 @@ choose_ports() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     } >/dev/tty
+
+    # Shadowsocks 端口
+    if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
+        if [[ -n "${sspt:-}" ]]; then
+            # 环境变量指定
+            PORT="$sspt"
+        elif [[ -n "${vlpt:-}" ]]; then
+            # 兼容 vlpt 变量
+            PORT="$vlpt"
+        else
+            # 交互式选择
+            local default_ss_port
+            default_ss_port=$(gen_random_free_port)
+            PORT=$(prompt_port "Shadowsocks 端口" "$default_ss_port")
+        fi
+        log_info "Shadowsocks 端口: $PORT"
+        XHTTP_PORT=""
+        XHTTP_PATH=""
+        echo "" >/dev/tty
+        return 0
+    fi
 
     # Vision 端口（如果需要）
     if [[ "$PROTOCOL_TYPE" == "vision" || "$PROTOCOL_TYPE" == "both" ]]; then
@@ -2343,6 +2483,7 @@ write_config() {
 
         # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
+        local n_ss_method n_ss_password
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_uuid=$(safe_read_config_value "$node_file" "UUID")
@@ -2352,10 +2493,13 @@ write_config() {
         n_xhttp_port=$(safe_read_config_value "$node_file" "XHTTP_PORT")
         n_xhttp_path=$(safe_read_config_value "$node_file" "XHTTP_PATH")
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
+        n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
+        n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
         n_uuid=$(decrypt_value "$n_uuid")
+        n_ss_password=$(decrypt_value "$n_ss_password")
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -2368,7 +2512,38 @@ write_config() {
             fi
         fi
 
-        [[ -z "$n_uuid" ]] && continue
+        # 跳过无效节点（VLESS 需要 UUID，Shadowsocks 需要密码）
+        if [[ "$n_protocol_type" == "shadowsocks" ]]; then
+            [[ -z "$n_ss_password" ]] && continue
+        else
+            [[ -z "$n_uuid" ]] && continue
+        fi
+
+        # 添加 Shadowsocks inbound
+        if [[ "$n_protocol_type" == "shadowsocks" ]] && [[ -n "$n_port" ]] && [[ -n "$n_ss_method" ]] && [[ -n "$n_ss_password" ]]; then
+            local validated_port
+            validated_port=$(get_validated_port "$n_port" true)
+            if [[ -z "$validated_port" ]]; then
+                log_warn "Invalid Shadowsocks port for node '$n_name', skipping"
+                continue
+            fi
+
+            local ss_inbound
+            ss_inbound=$(build_shadowsocks_inbound "$n_name" "$validated_port" "$n_ss_method" "$n_ss_password")
+            if [[ -z "$ss_inbound" ]]; then
+                log_error "Failed to build Shadowsocks inbound for node '$n_name'"
+                return 1
+            fi
+
+            local new_inbounds
+            if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$ss_inbound" '. += [$inbound]' 2>&1); then
+                inbounds_json="$new_inbounds"
+            else
+                log_error "Failed to add Shadowsocks inbound for node '$n_name': $new_inbounds"
+                return 1
+            fi
+            continue  # Shadowsocks 节点处理完毕，跳过 VLESS 处理
+        fi
 
         # 添加 Vision inbound（如果协议类型包含 vision）
         if [[ "$n_protocol_type" == "vision" || "$n_protocol_type" == "both" ]] && [[ -n "$n_port" ]]; then
@@ -2520,10 +2695,12 @@ save_env() {
     # Optional: encrypt sensitive values if encryption is enabled
     local save_uuid="$UUID"
     local save_private_key="$PRIVATE_KEY"
+    local save_ss_password="${SS_PASSWORD:-}"
 
     if is_encryption_enabled; then
         save_uuid=$(encrypt_value "$UUID")
         save_private_key=$(encrypt_value "$PRIVATE_KEY")
+        [[ -n "$save_ss_password" ]] && save_ss_password=$(encrypt_value "$SS_PASSWORD")
     fi
 
     cat > "$node_file" <<ENV
@@ -2540,6 +2717,8 @@ SHORT_ID=$SHORT_ID
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
+SS_METHOD=${SS_METHOD:-}
+SS_PASSWORD=$save_ss_password
 ENV
     chmod 600 "$node_file"
 
@@ -2577,6 +2756,24 @@ get_xhttp_link() {
     echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
 }
 
+# 生成 Shadowsocks 分享链接
+# 格式: ss://BASE64(method:password)@host:port#name
+get_ss_link() {
+    local ip="$1"
+    local node_label="$2"
+    local ip_formatted="$ip"
+
+    # IPv6 需要方括号
+    if [[ "$ip" == *:* ]]; then
+        ip_formatted="[$ip]"
+    fi
+
+    # SS 链接格式: ss://BASE64(method:password)@server:port#tag
+    local userinfo
+    userinfo=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+    echo "ss://${userinfo}@${ip_formatted}:${PORT}#${node_label}"
+}
+
 # 向后兼容的获取分享链接函数
 get_share_link() {
     local node_file
@@ -2588,7 +2785,10 @@ get_share_link() {
     local proto_type="${PROTOCOL_TYPE:-vision}"
 
     # 根据协议类型返回对应的链接
-    if [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+    if [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
+        # Shadowsocks 节点
+        get_ss_link "$ip" "${node_label}_SS"
+    elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
         # XHTTP-only 节点
         get_xhttp_link "$ip" "${node_label}_XHTTP"
     elif [[ -n "${PORT:-}" ]]; then
@@ -2644,55 +2844,86 @@ show_info() {
     if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]]; then
         echo -e "  ${BLUE}$(msg server_addr):${NC} ${SERVER_IP:-N/A}"
     fi
-    # 根据协议类型显示端口
+
     local proto_type="${PROTOCOL_TYPE:-both}"
-    if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
-        echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
-    fi
-    if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
-        echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT"
-    fi
-    echo -e "  ${BLUE}UUID:${NC}        $UUID"
-    echo -e "  ${BLUE}SNI:${NC}         $SNI"
-    echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
-    echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
-    echo -e "  ${BLUE}协议类型:${NC}    $proto_type"
-    echo ""
 
-    # IPv4 链接
-    if [[ -n "${SERVER_IPV4:-}" ]]; then
-        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-        echo -e "${GREEN}$(msg ipv4_links):${NC}"
+    # Shadowsocks 节点显示不同信息
+    if [[ "$proto_type" == "shadowsocks" ]]; then
+        echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
+        echo -e "  ${BLUE}Method:${NC}      ${SS_METHOD:-N/A}"
+        echo -e "  ${BLUE}Password:${NC}    ${SS_PASSWORD:-N/A}"
+        echo -e "  ${BLUE}协议类型:${NC}    Shadowsocks"
         echo ""
-        # Vision 链接
-        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
-            echo -e "  ${YELLOW}Vision:${NC}"
-            echo -e "  $(get_vision_link "$SERVER_IPV4" "${hostname}_Vision_v4")"
-        fi
-        # XHTTP 链接
-        if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
-            echo ""
-            echo -e "  ${YELLOW}XHTTP:${NC}"
-            echo -e "  $(get_xhttp_link "$SERVER_IPV4" "${hostname}_XHTTP_v4")"
-        fi
-    fi
 
-    # IPv6 链接
-    if [[ -n "${SERVER_IPV6:-}" ]]; then
-        echo ""
-        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-        echo -e "${GREEN}$(msg ipv6_links):${NC}"
-        echo ""
-        # Vision 链接
-        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
-            echo -e "  ${YELLOW}Vision:${NC}"
-            echo -e "  $(get_vision_link "$SERVER_IPV6" "${hostname}_Vision_v6")"
-        fi
-        # XHTTP 链接
-        if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+        # Shadowsocks IPv4 链接
+        if [[ -n "${SERVER_IPV4:-}" ]]; then
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
-            echo -e "  ${YELLOW}XHTTP:${NC}"
-            echo -e "  $(get_xhttp_link "$SERVER_IPV6" "${hostname}_XHTTP_v6")"
+            echo -e "  ${YELLOW}Shadowsocks:${NC}"
+            echo -e "  $(get_ss_link "$SERVER_IPV4" "${hostname}_SS_v4")"
+        fi
+
+        # Shadowsocks IPv6 链接
+        if [[ -n "${SERVER_IPV6:-}" ]]; then
+            echo ""
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv6_links):${NC}"
+            echo ""
+            echo -e "  ${YELLOW}Shadowsocks:${NC}"
+            echo -e "  $(get_ss_link "$SERVER_IPV6" "${hostname}_SS_v6")"
+        fi
+    else
+        # VLESS 节点显示
+        # 根据协议类型显示端口
+        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+            echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
+        fi
+        if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+            echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT"
+        fi
+        echo -e "  ${BLUE}UUID:${NC}        $UUID"
+        echo -e "  ${BLUE}SNI:${NC}         $SNI"
+        echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
+        echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+        echo -e "  ${BLUE}协议类型:${NC}    $proto_type"
+        echo ""
+
+        # IPv4 链接
+        if [[ -n "${SERVER_IPV4:-}" ]]; then
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv4_links):${NC}"
+            echo ""
+            # Vision 链接
+            if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+                echo -e "  ${YELLOW}Vision:${NC}"
+                echo -e "  $(get_vision_link "$SERVER_IPV4" "${hostname}_Vision_v4")"
+            fi
+            # XHTTP 链接
+            if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+                echo ""
+                echo -e "  ${YELLOW}XHTTP:${NC}"
+                echo -e "  $(get_xhttp_link "$SERVER_IPV4" "${hostname}_XHTTP_v4")"
+            fi
+        fi
+
+        # IPv6 链接
+        if [[ -n "${SERVER_IPV6:-}" ]]; then
+            echo ""
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv6_links):${NC}"
+            echo ""
+            # Vision 链接
+            if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
+                echo -e "  ${YELLOW}Vision:${NC}"
+                echo -e "  $(get_vision_link "$SERVER_IPV6" "${hostname}_Vision_v6")"
+            fi
+            # XHTTP 链接
+            if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
+                echo ""
+                echo -e "  ${YELLOW}XHTTP:${NC}"
+                echo -e "  $(get_xhttp_link "$SERVER_IPV6" "${hostname}_XHTTP_v6")"
+            fi
         fi
     fi
 
@@ -2738,22 +2969,13 @@ cmd_install() {
     fi
     log_info "Node name: $CURRENT_NODE_NAME"
 
-    # 安装时清除 SNI 缓存，强制重新测试
-    rm -f "$CACHE_FILE" 2>/dev/null
-
-    if [[ -n "${reym:-}" ]]; then
-        SNI="$reym"
-        log_info "$(msg using_sni): $SNI"
-    else
-        select_best_sni
-    fi
-
     # 选择协议类型（除非通过环境变量指定）
     if [[ -n "${proto:-}" ]]; then
-        # 支持环境变量 proto=vision/xhttp/both
+        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss
         case "$proto" in
             xhttp) PROTOCOL_TYPE="xhttp" ;;
             both) PROTOCOL_TYPE="both" ;;
+            shadowsocks|ss) PROTOCOL_TYPE="shadowsocks" ;;
             *) PROTOCOL_TYPE="vision" ;;
         esac
         log_info "协议类型: $PROTOCOL_TYPE"
@@ -2767,10 +2989,50 @@ cmd_install() {
         prompt_protocol_type
     fi
 
-    gen_uuid
-    choose_ports
+    # Shadowsocks 和 VLESS 的安装流程不同
+    if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
+        # Shadowsocks 安装流程
+        # 选择加密方式（或使用环境变量 ssmethod=xxx）
+        if [[ -n "${ssmethod:-}" ]]; then
+            SS_METHOD="$ssmethod"
+            log_info "加密方式: $SS_METHOD"
+        else
+            prompt_ss_method
+        fi
 
-    gen_reality_keys
+        # 生成密码（或使用环境变量 sspwd=xxx）
+        if [[ -n "${sspwd:-}" ]]; then
+            SS_PASSWORD="$sspwd"
+            log_info "使用指定密码"
+        else
+            gen_ss_password
+        fi
+
+        # 选择端口
+        choose_ports
+
+        # SS 不需要 SNI, UUID, Reality Keys
+        SNI=""
+        UUID=""
+        PUBLIC_KEY=""
+        PRIVATE_KEY=""
+        SHORT_ID=""
+    else
+        # VLESS 安装流程
+        # 安装时清除 SNI 缓存，强制重新测试
+        rm -f "$CACHE_FILE" 2>/dev/null
+
+        if [[ -n "${reym:-}" ]]; then
+            SNI="$reym"
+            log_info "$(msg using_sni): $SNI"
+        else
+            select_best_sni
+        fi
+
+        gen_uuid
+        choose_ports
+        gen_reality_keys
+    fi
 
     # 检测双栈 IP
     detect_network_stack
@@ -2850,7 +3112,9 @@ cmd_list() {
         # 根据协议类型显示对应的端口
         local display_port=""
         local proto="${PROTOCOL_TYPE:-vision}"
-        if [[ "$proto" == "xhttp" ]]; then
+        if [[ "$proto" == "shadowsocks" ]]; then
+            display_port="${PORT:-N/A}"
+        elif [[ "$proto" == "xhttp" ]]; then
             display_port="${XHTTP_PORT:-N/A}"
         elif [[ "$proto" == "both" ]]; then
             display_port="${PORT:-}/${XHTTP_PORT:-}"
@@ -2858,10 +3122,15 @@ cmd_list() {
             display_port="${PORT:-N/A}"
         fi
         echo -e "  ${GREEN}$i.${NC} ${BLUE}$node${NC}"
-        echo -e "     Port: $display_port | SNI: $SNI"
-        echo -e "     UUID: ${UUID:0:8}..."
-        if [[ -n "$XHTTP_PORT" ]] && [[ "$proto" != "vision" ]]; then
-            echo -e "     XHTTP: $XHTTP_PORT"
+        if [[ "$proto" == "shadowsocks" ]]; then
+            echo -e "     Port: $display_port | Method: ${SS_METHOD:-N/A}"
+            echo -e "     Password: ${SS_PASSWORD:0:12}..."
+        else
+            echo -e "     Port: $display_port | SNI: $SNI"
+            echo -e "     UUID: ${UUID:0:8}..."
+            if [[ -n "$XHTTP_PORT" ]] && [[ "$proto" != "vision" ]]; then
+                echo -e "     XHTTP: $XHTTP_PORT"
+            fi
         fi
         echo ""
         ((i++))
@@ -4337,11 +4606,17 @@ show_help() {
     echo ""
     echo "Optional parameters (for install):"
     echo "  name=xxx      Specify node name"
-    echo "  reym=xxx      Specify SNI domain"
-    echo "  proto=xxx     Protocol type: vision, xhttp, or both"
+    echo "  reym=xxx      Specify SNI domain (VLESS only)"
+    echo "  proto=xxx     Protocol type: vision, xhttp, both, or shadowsocks"
     echo "  vlpt=xxx      Specify Vision port (for vision/both)"
     echo "  xhpt=xxx      Specify XHTTP port (for xhttp/both)"
-    echo "  uuid=xxx      Specify UUID"
+    echo "  uuid=xxx      Specify UUID (VLESS only)"
+    echo ""
+    echo "Shadowsocks parameters:"
+    echo "  ssmethod=xxx  Encryption: 2022-blake3-aes-256-gcm (default),"
+    echo "                2022-blake3-chacha20-poly1305, chacha20-ietf-poly1305, aes-256-gcm"
+    echo "  sspwd=xxx     Specify password (auto-generated if not set)"
+    echo "  sspt=xxx      Specify Shadowsocks port"
     echo "  xhttp=true    (deprecated) Same as proto=both"
     echo ""
     echo "Examples:"
