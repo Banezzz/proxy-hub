@@ -1,12 +1,16 @@
-# VLESS TCP REALITY Vision Auto-Setup
+# Proxy Hub
 
-一键部署 VLESS + TCP + REALITY Vision 节点的自动化脚本，支持多节点、XHTTP 协议、WARP 分流、系统优化工具和多语言界面。
+一键部署多协议代理节点的自动化脚本，支持 VLESS Reality、Shadowsocks 2022、多节点管理、WARP 分流、系统优化工具和多语言界面。
 
 ## 特性
 
+### 支持协议
+- **VLESS + Vision + REALITY** - TCP 传输，推荐
+- **VLESS + XHTTP + REALITY** - XHTTP 传输，更好的伪装
+- **Shadowsocks 2022** - 高性能 SS 协议，支持多种加密方式
+
 ### 核心功能
 - **多节点支持** - 同时运行多个节点，独立配置
-- **XHTTP 协议** - 可选启用 XHTTP 协议，提供更好的伪装
 - **双栈链接** - 自动检测并生成 IPv4/IPv6 分享链接
 - **动态 SNI** - 自动测试 117 个域名，选择最低延迟 SNI
 - **并行测试** - 30 并发测试，5-10 秒完成（原需 4+ 分钟）
@@ -17,7 +21,7 @@
 - **BBR 优化** - TCP 拥塞控制优化
 - **Swap 管理** - 虚拟内存管理
 - **Fail2ban** - SSH 暴力破解防护
-- **端口管理** - SSH/Vision/XHTTP 端口修改
+- **端口管理** - SSH/Vision/XHTTP/SS 端口修改
 - **日志查看** - 统一日志查看器
 
 ### 多系统支持
@@ -27,6 +31,7 @@
 
 ### 安全特性
 - **单实例锁** - 防止脚本重复运行
+- **安全配置加载** - 防止配置文件注入攻击
 - **IPv6 SSH 保护** - 防止禁用 IPv6 时断开连接
 - **包管理器检查** - 等待系统更新完成后再安装
 
@@ -35,20 +40,20 @@
 ### 一键安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/reality-vision---fast-setup/main/vless-reality-vision.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-hub.sh)
 ```
 
 ### 手动安装
 
 ```bash
 # 下载脚本
-curl -O https://raw.githubusercontent.com/Banezzz/reality-vision---fast-setup/main/vless-reality-vision.sh
+curl -O https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-hub.sh
 
 # 添加执行权限
-chmod +x vless-reality-vision.sh
+chmod +x proxy-hub.sh
 
 # 运行
-./vless-reality-vision.sh
+./proxy-hub.sh
 ```
 
 ## 使用方法
@@ -56,12 +61,12 @@ chmod +x vless-reality-vision.sh
 ### 交互式菜单
 
 ```bash
-bash vless-reality-vision.sh
+./proxy-hub.sh
 ```
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
-║         VLESS TCP REALITY Vision 管理面板                      ║
+║              Proxy Hub 管理面板                               ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║   1. 安装节点 (Add Node)                                       ║
 ║   2. 查看节点信息                                              ║
@@ -81,55 +86,90 @@ bash vless-reality-vision.sh
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
+### 协议选择
+
+安装节点时可以选择：
+
+```
+═══════════════════════════════════════════════════════════════
+                     选择节点协议类型
+═══════════════════════════════════════════════════════════════
+
+  1. VLESS + Vision + REALITY  (TCP 传输, 推荐)
+  2. VLESS + XHTTP + REALITY   (XHTTP 传输)
+  3. 两个都安装               (生成两个端口)
+  4. Shadowsocks 2022         (SS 协议, 高性能)
+```
+
+### Shadowsocks 加密方式
+
+选择 Shadowsocks 时支持以下加密方式：
+
+| 方式 | 说明 |
+|------|------|
+| `2022-blake3-aes-256-gcm` | 推荐，硬件加速 |
+| `2022-blake3-chacha20-poly1305` | 移动设备优化 |
+| `chacha20-ietf-poly1305` | 传统方式，广泛支持 |
+| `aes-256-gcm` | 传统方式，经典加密 |
+
 ### 命令行模式
 
 ```bash
 # 节点管理
-bash vless-reality-vision.sh install     # 添加新节点
-bash vless-reality-vision.sh list        # 列出所有节点
-bash vless-reality-vision.sh info        # 查看节点信息
-bash vless-reality-vision.sh qr          # 显示二维码
-bash vless-reality-vision.sh status      # 服务状态
-bash vless-reality-vision.sh health      # 健康检查
-bash vless-reality-vision.sh remove      # 删除节点
-bash vless-reality-vision.sh restart     # 重启服务
-bash vless-reality-vision.sh test-sni    # 测试 SNI 延迟
-bash vless-reality-vision.sh uninstall   # 卸载所有节点和 Xray
+./proxy-hub.sh install     # 添加新节点
+./proxy-hub.sh list        # 列出所有节点
+./proxy-hub.sh info        # 查看节点信息
+./proxy-hub.sh qr          # 显示二维码
+./proxy-hub.sh status      # 服务状态
+./proxy-hub.sh health      # 健康检查
+./proxy-hub.sh remove      # 删除节点
+./proxy-hub.sh restart     # 重启服务
+./proxy-hub.sh test-sni    # 测试 SNI 延迟
+./proxy-hub.sh uninstall   # 卸载所有节点和 Xray
 
 # 系统工具
-bash vless-reality-vision.sh tools       # 系统工具菜单
-bash vless-reality-vision.sh ports       # 端口管理
-bash vless-reality-vision.sh logs        # 日志查看
-bash vless-reality-vision.sh warp        # WARP 分流管理
-bash vless-reality-vision.sh bbr         # BBR 优化
-bash vless-reality-vision.sh swap        # Swap 管理
-bash vless-reality-vision.sh fail2ban    # Fail2ban 管理
+./proxy-hub.sh tools       # 系统工具菜单
+./proxy-hub.sh ports       # 端口管理
+./proxy-hub.sh logs        # 日志查看
+./proxy-hub.sh warp        # WARP 分流管理
+./proxy-hub.sh bbr         # BBR 优化
+./proxy-hub.sh swap        # Swap 管理
+./proxy-hub.sh fail2ban    # Fail2ban 管理
 ```
 
 ### 高级参数
 
 ```bash
-# 指定节点名称
-name=hk1 bash vless-reality-vision.sh install
+# VLESS Vision 节点
+name=hk1 proto=vision vlpt=443 reym=www.microsoft.com ./proxy-hub.sh install
 
-# 指定 SNI 域名
-reym=www.microsoft.com bash vless-reality-vision.sh install
+# VLESS XHTTP 节点
+name=jp1 proto=xhttp xhpt=8443 reym=www.apple.com ./proxy-hub.sh install
 
-# 指定端口
-vlpt=443 bash vless-reality-vision.sh install
+# VLESS Vision + XHTTP 双协议
+name=sg1 proto=both vlpt=443 xhpt=8443 ./proxy-hub.sh install
 
-# 指定 UUID
-uuid=your-custom-uuid bash vless-reality-vision.sh install
+# Shadowsocks 2022 节点
+name=us1 proto=shadowsocks sspt=8388 ./proxy-hub.sh install
 
-# 启用 XHTTP 协议
-xhttp=true bash vless-reality-vision.sh install
-
-# 指定 XHTTP 端口
-xhttp=true xhpt=8443 bash vless-reality-vision.sh install
+# 指定 UUID (VLESS)
+uuid=your-custom-uuid ./proxy-hub.sh install
 
 # 组合使用
-name=jp1 reym=www.apple.com vlpt=8443 xhttp=true bash vless-reality-vision.sh install
+name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 ```
+
+### 参数说明
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `name` | 节点名称 | `name=hk1` |
+| `proto` | 协议类型 | `proto=vision/xhttp/both/shadowsocks` |
+| `vlpt` | Vision 端口 | `vlpt=443` |
+| `xhpt` | XHTTP 端口 | `xhpt=8443` |
+| `sspt` | Shadowsocks 端口 | `sspt=8388` |
+| `reym` | SNI 域名 | `reym=www.microsoft.com` |
+| `uuid` | 自定义 UUID | `uuid=xxx-xxx-xxx` |
 
 ## 系统工具
 
@@ -138,7 +178,7 @@ name=jp1 reym=www.apple.com vlpt=8443 xhttp=true bash vless-reality-vision.sh in
 通过 WARP Socks5 代理实现智能分流：
 
 ```bash
-bash vless-reality-vision.sh warp
+./proxy-hub.sh warp
 ```
 
 功能：
@@ -152,7 +192,7 @@ bash vless-reality-vision.sh warp
 TCP 拥塞控制优化：
 
 ```bash
-bash vless-reality-vision.sh bbr
+./proxy-hub.sh bbr
 ```
 
 功能：
@@ -163,20 +203,21 @@ bash vless-reality-vision.sh bbr
 ### 端口管理
 
 ```bash
-bash vless-reality-vision.sh ports
+./proxy-hub.sh ports
 ```
 
 ```
-═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
               端口管理面板 (Port Manager)
-═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
 
   服务              端口            状态
-───────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────
   1. 修改 SSH          22            运行中
   2. 修改 Vision       12345         运行中
   3. 修改 XHTTP        8443          运行中
-───────────────────────────────────────────────────────
+  4. 修改 Shadowsocks  8388          运行中
+───────────────────────────────────────────────────────────────
   0. 返回 (Back)
 ```
 
@@ -185,7 +226,7 @@ bash vless-reality-vision.sh ports
 ### 日志查看
 
 ```bash
-bash vless-reality-vision.sh logs
+./proxy-hub.sh logs
 ```
 
 支持查看：
@@ -216,22 +257,21 @@ xray-f2b     # Fail2ban 管理
 ### 添加节点
 
 ```bash
-# 交互式添加（会提示输入名称，直接回车使用随机名称）
-bash vless-reality-vision.sh install
+# 交互式添加（会提示选择协议类型和端口）
+./proxy-hub.sh install
 
-# 命令行指定名称
-name=hk1 bash vless-reality-vision.sh install
-name=jp1 bash vless-reality-vision.sh install
-name=sg1 bash vless-reality-vision.sh install
+# 命令行添加 VLESS 节点
+name=hk1 proto=vision ./proxy-hub.sh install
+name=jp1 proto=xhttp ./proxy-hub.sh install
 
-# 添加带 XHTTP 的节点
-name=us1 xhttp=true bash vless-reality-vision.sh install
+# 命令行添加 Shadowsocks 节点
+name=ss1 proto=shadowsocks sspt=8388 ./proxy-hub.sh install
 ```
 
 ### 查看所有节点
 
 ```bash
-bash vless-reality-vision.sh list
+./proxy-hub.sh list
 ```
 
 输出示例：
@@ -240,45 +280,16 @@ bash vless-reality-vision.sh list
                      All Nodes / 所有节点
 ═══════════════════════════════════════════════════════════════
 
-  1. hk1
+  1. hk1 [VLESS Vision]
      Port: 12345 | SNI: www.microsoft.com
      UUID: 03761544...
      XHTTP: 8443
 
-  2. jp1
-     Port: 23456 | SNI: www.apple.com
-     UUID: a1b2c3d4...
+  2. ss1 [Shadowsocks]
+     Port: 8388 | Method: 2022-blake3-aes-256-gcm
+     Password: abc123...
 
 ═══════════════════════════════════════════════════════════════
-```
-
-### 节点信息
-
-安装完成后会显示双栈链接：
-
-```
-═══════════════════════════════════════════════════════════════
-                    节点信息 / Node Info
-═══════════════════════════════════════════════════════════════
-
-Node Name:  hk1
-服务器地址:
-  IPv4: 1.2.3.4
-  IPv6: 2001:db8::1
-Vision 端口: 12345
-XHTTP 端口:  8443
-
-═══════════════════════════════════════════════════════════════
-                    IPv4 Links
-───────────────────────────────────────────────────────────────
-Vision: vless://uuid@1.2.3.4:12345?...
-XHTTP:  vless://uuid@1.2.3.4:8443?...
-
-═══════════════════════════════════════════════════════════════
-                    IPv6 Links
-───────────────────────────────────────────────────────────────
-Vision: vless://uuid@[2001:db8::1]:12345?...
-XHTTP:  vless://uuid@[2001:db8::1]:8443?...
 ```
 
 ## 系统要求
@@ -292,7 +303,7 @@ XHTTP:  vless://uuid@[2001:db8::1]:8443?...
 
 ## 客户端配置
 
-### Vision 协议
+### VLESS Vision 协议
 
 ```
 协议: VLESS
@@ -308,7 +319,7 @@ PublicKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ShortID: xxxxxxxx
 ```
 
-### XHTTP 协议
+### VLESS XHTTP 协议
 
 ```
 协议: VLESS
@@ -321,6 +332,16 @@ SNI: www.microsoft.com
 Fingerprint: chrome
 PublicKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ShortID: xxxxxxxx
+```
+
+### Shadowsocks 2022
+
+```
+协议: Shadowsocks
+地址: your.server.ip
+端口: 8388
+加密: 2022-blake3-aes-256-gcm
+密码: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 ### 推荐客户端
@@ -351,10 +372,10 @@ ShortID: xxxxxxxx
 
 ### Q: 安装后无法连接？
 
-1. 运行 `bash vless-reality-vision.sh status` 检查服务状态
+1. 运行 `./proxy-hub.sh status` 检查服务状态
 2. 确保服务器防火墙/安全组开放了对应端口
 3. 检查客户端配置是否正确
-4. 查看日志：`bash vless-reality-vision.sh logs`
+4. 查看日志：`./proxy-hub.sh logs`
 
 ### Q: SNI 测试全部超时？
 
@@ -364,22 +385,26 @@ ShortID: xxxxxxxx
 
 ```bash
 # 删除旧节点，重新添加
-bash vless-reality-vision.sh remove
-name=hk1 reym=new.sni.com bash vless-reality-vision.sh install
+./proxy-hub.sh remove
+name=hk1 reym=new.sni.com ./proxy-hub.sh install
 ```
 
 ### Q: 如何修改端口？
 
 ```bash
-bash vless-reality-vision.sh ports
+./proxy-hub.sh ports
 # 选择要修改的端口类型
 ```
 
 ### Q: WARP 分流不生效？
 
-1. 确认 WARP 服务运行中：`bash vless-reality-vision.sh warp`
+1. 确认 WARP 服务运行中：`./proxy-hub.sh warp`
 2. 检查 Xray 配置中是否有 WARP outbound
-3. 重启 Xray 服务：`bash vless-reality-vision.sh restart`
+3. 重启 Xray 服务：`./proxy-hub.sh restart`
+
+### Q: Shadowsocks 密码错误？
+
+确保客户端使用完整的 base64 密码，包括末尾的 `==` 填充字符。
 
 ### Q: Alpine Linux 支持如何？
 
@@ -390,6 +415,14 @@ bash vless-reality-vision.sh ports
 是的，所有节点配置在同一个 Xray 配置文件中作为多个 inbounds，共用一个 Xray 进程。
 
 ## 更新日志
+
+### v5.0.0
+- 项目重命名为 Proxy Hub
+- 新增 Shadowsocks 2022 协议支持
+- 支持多种 SS 加密方式 (2022-blake3-aes-256-gcm, chacha20-ietf-poly1305 等)
+- 交互式端口选择
+- 安全增强：配置文件安全加载，防止注入攻击
+- 修复 base64 密码解析问题
 
 ### v4.0.0
 - XHTTP 协议支持
