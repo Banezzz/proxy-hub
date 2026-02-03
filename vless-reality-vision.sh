@@ -42,6 +42,333 @@ lock_release() {
     rm -rf "$LOCK_DIR" 2>/dev/null
 }
 
+# ============== Security Helper Functions ==============
+
+# Atomic lock using flock (preferred) with mkdir fallback
+LOCK_FILE="/var/lock/reality_vision.lock"
+LOCK_FD=200
+
+# Try flock-based locking first (atomic, no TOCTOU race)
+lock_acquire_flock() {
+    # Create lock file directory if needed
+    local lock_dir
+    lock_dir=$(dirname "$LOCK_FILE")
+    if [[ ! -d "$lock_dir" ]]; then
+        LOCK_FILE="/tmp/reality_vision.lock"
+    fi
+
+    # Open lock file descriptor
+    exec 200>"$LOCK_FILE" || return 1
+
+    # Try non-blocking lock
+    if flock -n 200; then
+        echo "$$" >&200
+        return 0
+    fi
+    return 1
+}
+
+lock_release_flock() {
+    flock -u 200 2>/dev/null || true
+    exec 200>&- 2>/dev/null || true
+}
+
+# Smart lock acquire: use flock if available, fallback to mkdir
+lock_acquire_smart() {
+    if command -v flock &>/dev/null; then
+        lock_acquire_flock
+    else
+        lock_acquire
+    fi
+}
+
+lock_release_smart() {
+    if command -v flock &>/dev/null; then
+        lock_release_flock
+    fi
+    lock_release  # Always clean up mkdir lock too
+}
+
+# Secure curl wrapper with TLS enforcement and redirect limits
+# Usage: secure_curl [curl_options] URL
+secure_curl() {
+    curl --proto '=https' --tlsv1.2 --max-redirs 3 -fsSL "$@"
+}
+
+# Safe download with optional SHA256 verification
+# Usage: safe_download_and_verify URL DEST_FILE [EXPECTED_SHA256]
+# Returns: 0 on success, 1 on download failure, 2 on checksum mismatch
+safe_download_and_verify() {
+    local url="$1"
+    local dest="$2"
+    local expected_sha="${3:-}"
+
+    # Download file
+    if ! secure_curl "$url" -o "$dest" 2>/dev/null; then
+        return 1
+    fi
+
+    # Verify checksum if provided
+    if [[ -n "$expected_sha" ]]; then
+        local actual_sha
+        actual_sha=$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+            log_warn "Checksum mismatch for $url"
+            log_warn "Expected: $expected_sha"
+            log_warn "Got: $actual_sha"
+            return 2
+        fi
+    fi
+
+    return 0
+}
+
+# Fetch GitHub release tag using jq instead of grep/cut
+# Usage: fetch_github_release_tag REPO
+fetch_github_release_tag() {
+    local repo="$1"
+    local api_url="https://api.github.com/repos/${repo}/releases/latest"
+    local response
+
+    response=$(secure_curl "$api_url" 2>/dev/null) || return 1
+
+    # Use jq for safe JSON parsing
+    if command -v jq &>/dev/null; then
+        echo "$response" | jq -r '.tag_name // empty' 2>/dev/null
+    else
+        # Fallback: careful grep (less safe but functional)
+        echo "$response" | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1
+    fi
+}
+
+# Safe config value extraction (prevents command injection)
+# Usage: safe_read_config_value FILE KEY
+# Returns the value or empty string if not found/invalid
+safe_read_config_value() {
+    local file="$1"
+    local key="$2"
+    local value=""
+
+    [[ ! -f "$file" ]] && return 1
+
+    # Read line matching KEY= pattern
+    # Strict pattern: KEY=VALUE where VALUE contains no shell metacharacters
+    while IFS='=' read -r k v; do
+        # Skip comments and empty lines
+        [[ "$k" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$k" ]] && continue
+
+        # Match exact key
+        if [[ "$k" == "$key" ]]; then
+            # Security: reject values containing dangerous characters
+            # Allow: alphanumeric, dash, underscore, dot, slash, colon, equals, plus, at, brackets
+            # Reject: backticks, $, ;, |, &, newlines, etc.
+            # Note: In POSIX regex, ] must be first if included, - must be last or first
+            if [[ "$v" =~ ^[]a-zA-Z0-9_./:=+@[-]*$ ]]; then
+                value="$v"
+            else
+                # Log warning but don't fail (backward compat)
+                log_warn "Potentially unsafe value for $key in $file, using empty"
+                value=""
+            fi
+            break
+        fi
+    done < "$file"
+
+    echo "$value"
+}
+
+# Safe load all config values from node file
+# Usage: safe_load_node_config FILE
+# Sets variables: NODE_NAME, PORT, UUID, SNI, PUBLIC_KEY, PRIVATE_KEY, SHORT_ID,
+#                 PROTOCOL_TYPE, XHTTP_PORT, XHTTP_PATH, SERVER_IP, SERVER_IPV4, SERVER_IPV6
+safe_load_node_config() {
+    local file="$1"
+
+    [[ ! -f "$file" ]] && return 1
+
+    # Reset all variables first
+    NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
+
+    # Load each value safely
+    NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")
+    PORT=$(safe_read_config_value "$file" "PORT")
+    UUID=$(safe_read_config_value "$file" "UUID")
+    SNI=$(safe_read_config_value "$file" "SNI")
+    PUBLIC_KEY=$(safe_read_config_value "$file" "PUBLIC_KEY")
+    PRIVATE_KEY=$(safe_read_config_value "$file" "PRIVATE_KEY")
+    SHORT_ID=$(safe_read_config_value "$file" "SHORT_ID")
+    PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
+    XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
+    XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
+    SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
+    SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
+    SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
+
+    return 0
+}
+
+# Validate and extract port number (strips non-numeric, validates range)
+# Usage: get_validated_port RAW_PORT [SILENT]
+# Returns: validated port number or empty string
+get_validated_port() {
+    local raw_port="$1"
+    local silent="${2:-false}"
+
+    # Strip any non-numeric characters (security hardening)
+    local port="${raw_port//[^0-9]/}"
+
+    # Validate range
+    if [[ -z "$port" ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        [[ "$silent" != "true" ]] && log_error "Invalid port: $raw_port"
+        return 1
+    fi
+
+    echo "$port"
+}
+
+# Build Vision inbound JSON using jq (prevents injection)
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+build_vision_inbound() {
+    local name="$1"
+    local port="$2"
+    local uuid="$3"
+    local sni="$4"
+    local private_key="$5"
+    local short_id="$6"
+
+    # Validate port
+    port=$(get_validated_port "$port" true) || return 1
+
+    jq -n \
+        --arg tag "${name}_vision" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg sni "$sni" \
+        --arg private_key "$private_key" \
+        --arg short_id "$short_id" \
+        '{
+            "tag": $tag,
+            "listen": "0.0.0.0",
+            "port": $port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "\($sni):443",
+                    "serverNames": [$sni],
+                    "privateKey": $private_key,
+                    "shortIds": [$short_id],
+                    "fingerprint": "chrome"
+                }
+            },
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+        }'
+}
+
+# Build XHTTP inbound JSON using jq (prevents injection)
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH
+build_xhttp_inbound() {
+    local name="$1"
+    local port="$2"
+    local uuid="$3"
+    local sni="$4"
+    local private_key="$5"
+    local short_id="$6"
+    local xhttp_path="$7"
+
+    # Validate port
+    port=$(get_validated_port "$port" true) || return 1
+
+    jq -n \
+        --arg tag "${name}_xhttp" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg sni "$sni" \
+        --arg private_key "$private_key" \
+        --arg short_id "$short_id" \
+        --arg path "$xhttp_path" \
+        '{
+            "tag": $tag,
+            "listen": "0.0.0.0",
+            "port": $port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": $uuid, "flow": ""}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "reality",
+                "xhttpSettings": {"path": $path},
+                "realitySettings": {
+                    "show": false,
+                    "dest": "\($sni):443",
+                    "serverNames": [$sni],
+                    "privateKey": $private_key,
+                    "shortIds": [$short_id],
+                    "fingerprint": "chrome"
+                }
+            },
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+        }'
+}
+
+# Optional encryption for sensitive config values
+# Usage: encrypt_value PLAINTEXT
+# Returns: base64-encoded encrypted value with "U2FsdGVk" prefix (OpenSSL magic)
+ENCRYPTION_KEY_FILE="/root/.reality_vision_key"
+
+setup_encryption_key() {
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        # Generate random key on first use
+        head -c 32 /dev/urandom | base64 > "$ENCRYPTION_KEY_FILE"
+        chmod 600 "$ENCRYPTION_KEY_FILE"
+    fi
+}
+
+encrypt_value() {
+    local plaintext="$1"
+    [[ -z "$plaintext" ]] && return 0
+
+    setup_encryption_key
+    local key
+    key=$(cat "$ENCRYPTION_KEY_FILE")
+
+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
+}
+
+decrypt_value() {
+    local ciphertext="$1"
+    [[ -z "$ciphertext" ]] && return 0
+
+    # Check if value is encrypted (starts with U2FsdGVk after base64 decode)
+    if [[ ! "$ciphertext" =~ ^U2FsdGVk ]]; then
+        # Not encrypted, return as-is (backward compatibility)
+        echo "$ciphertext"
+        return 0
+    fi
+
+    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
+
+    local key
+    key=$(cat "$ENCRYPTION_KEY_FILE")
+
+    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
+}
+
+# Check if config encryption is enabled
+is_encryption_enabled() {
+    [[ -f "$ENCRYPTION_KEY_FILE" ]] && [[ "${ENABLE_CONFIG_ENCRYPTION:-false}" == "true" ]]
+}
+
 # 配置目录（支持多节点）
 NODES_DIR="/root/reality_nodes"
 LANG_FILE="/root/reality_vision.lang"
@@ -933,9 +1260,8 @@ select_node() {
     for node in "${nodes[@]}"; do
         local node_file
         node_file=$(get_node_file "$node")
-        # 重置变量以避免上一个节点的值残留
-        unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH
-        source "$node_file"
+        # 使用安全的配置加载（防止命令注入）
+        safe_load_node_config "$node_file"
         # 根据协议类型显示对应的端口
         local display_port=""
         local proto="${PROTOCOL_TYPE:-vision}"
@@ -1067,10 +1393,24 @@ install_xray() {
     if [[ "$PKG_MANAGER" == "apk" ]]; then
         install_xray_alpine
     else
-        if ! bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null 2>&1; then
-            log_error "Failed to install Xray. Please check your network connection."
+        # Security: Download script to temp file first, then execute
+        # This allows for potential verification and avoids direct pipe-to-bash
+        local installer_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+        local tmp_installer="/tmp/xray-install-$$.sh"
+
+        if ! secure_curl "$installer_url" -o "$tmp_installer"; then
+            log_error "Failed to download Xray installer"
+            rm -f "$tmp_installer"
             return 1
         fi
+
+        # Execute downloaded script
+        if ! bash "$tmp_installer" >/dev/null 2>&1; then
+            log_error "Failed to install Xray. Please check your network connection."
+            rm -f "$tmp_installer"
+            return 1
+        fi
+        rm -f "$tmp_installer"
     fi
 }
 
@@ -1097,9 +1437,9 @@ install_xray_alpine() {
             ;;
     esac
 
-    # 获取最新版本号
+    # 获取最新版本号（使用安全的 API 解析）
     local latest_version
-    latest_version=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    latest_version=$(fetch_github_release_tag "XTLS/Xray-core")
     if [[ -z "$latest_version" ]]; then
         log_error "Failed to get Xray latest version"
         return 1
@@ -1107,12 +1447,12 @@ install_xray_alpine() {
 
     log_info "Installing Xray $latest_version for Alpine (${xray_arch})..."
 
-    # 下载 Xray
+    # 下载 Xray（使用安全的 curl 封装）
     local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-linux-${xray_arch}.zip"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    if ! curl -sL "$download_url" -o "${tmp_dir}/xray.zip"; then
+    if ! secure_curl "$download_url" -o "${tmp_dir}/xray.zip"; then
         log_error "Failed to download Xray"
         rm -rf "$tmp_dir"
         return 1
@@ -1172,14 +1512,14 @@ install_geodata() {
     local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
     local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
-    # 下载 geoip.dat
-    if execute_task "curl -sL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
+    # 下载 geoip.dat（使用安全的 curl 封装）
+    if execute_task "secure_curl '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
         # 创建软链接到 /usr/local/bin (Xray 查找位置)
         ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
     fi
 
     # 下载 geosite.dat
-    if execute_task "curl -sL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
+    if execute_task "secure_curl '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
         ln -sf "$XRAY_GEODATA_DIR/geosite.dat" /usr/local/bin/geosite.dat 2>/dev/null || true
     fi
 
@@ -1190,7 +1530,8 @@ install_geodata() {
 }
 
 setup_geodata_cron() {
-    local cron_cmd="curl -sL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl -sL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
+    # Use secure curl options in cron job (--proto, --tlsv1.2)
+    local cron_cmd="curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
     local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
 
     # 检查 crontab 命令是否存在
@@ -1923,22 +2264,25 @@ write_config() {
 
     # 构建 inbounds 数组
     local inbounds_json="[]"
-    local jq_error=""
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 
-        # 读取节点配置
+        # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
-        n_name=$(grep "^NODE_NAME=" "$node_file" | cut -d= -f2)
-        n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
-        n_uuid=$(grep "^UUID=" "$node_file" | cut -d= -f2)
-        n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
-        n_private_key=$(grep "^PRIVATE_KEY=" "$node_file" | cut -d= -f2)
-        n_short_id=$(grep "^SHORT_ID=" "$node_file" | cut -d= -f2)
-        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
-        n_xhttp_path=$(grep "^XHTTP_PATH=" "$node_file" | cut -d= -f2)
-        n_protocol_type=$(grep "^PROTOCOL_TYPE=" "$node_file" | cut -d= -f2)
+        n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
+        n_port=$(safe_read_config_value "$node_file" "PORT")
+        n_uuid=$(safe_read_config_value "$node_file" "UUID")
+        n_sni=$(safe_read_config_value "$node_file" "SNI")
+        n_private_key=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
+        n_short_id=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_xhttp_port=$(safe_read_config_value "$node_file" "XHTTP_PORT")
+        n_xhttp_path=$(safe_read_config_value "$node_file" "XHTTP_PATH")
+        n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
+
+        # 处理可能加密的敏感值
+        n_private_key=$(decrypt_value "$n_private_key")
+        n_uuid=$(decrypt_value "$n_uuid")
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -1955,33 +2299,22 @@ write_config() {
 
         # 添加 Vision inbound（如果协议类型包含 vision）
         if [[ "$n_protocol_type" == "vision" || "$n_protocol_type" == "both" ]] && [[ -n "$n_port" ]]; then
+            # 验证端口（安全检查）
+            local validated_port
+            validated_port=$(get_validated_port "$n_port" true)
+            if [[ -z "$validated_port" ]]; then
+                log_warn "Invalid Vision port for node '$n_name', skipping"
+                continue
+            fi
+
+            # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(cat <<EOF
-{
-  "tag": "${n_name}_vision",
-  "listen": "0.0.0.0",
-  "port": $n_port,
-  "protocol": "vless",
-  "settings": {
-    "clients": [{"id": "$n_uuid", "flow": "xtls-rprx-vision"}],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "show": false,
-      "dest": "$n_sni:443",
-      "serverNames": ["$n_sni"],
-      "privateKey": "$n_private_key",
-      "shortIds": ["$n_short_id"],
-      "fingerprint": "chrome"
-    }
-  },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-}
-EOF
-)
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
+            if [[ -z "$vision_inbound" ]]; then
+                log_error "Failed to build Vision inbound for node '$n_name'"
+                return 1
+            fi
+
             # 使用临时变量和错误检查来防止 jq 失败导致脚本退出
             local new_inbounds
             if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$vision_inbound" '. += [$inbound]' 2>&1); then
@@ -1994,34 +2327,22 @@ EOF
 
         # 添加 XHTTP inbound（如果协议类型包含 xhttp）
         if [[ "$n_protocol_type" == "xhttp" || "$n_protocol_type" == "both" ]] && [[ -n "$n_xhttp_port" ]] && [[ -n "$n_xhttp_path" ]]; then
+            # 验证端口（安全检查）
+            local validated_xhttp_port
+            validated_xhttp_port=$(get_validated_port "$n_xhttp_port" true)
+            if [[ -z "$validated_xhttp_port" ]]; then
+                log_warn "Invalid XHTTP port for node '$n_name', skipping"
+                continue
+            fi
+
+            # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(cat <<EOF
-{
-  "tag": "${n_name}_xhttp",
-  "listen": "0.0.0.0",
-  "port": $n_xhttp_port,
-  "protocol": "vless",
-  "settings": {
-    "clients": [{"id": "$n_uuid", "flow": ""}],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "xhttp",
-    "security": "reality",
-    "xhttpSettings": {"path": "$n_xhttp_path"},
-    "realitySettings": {
-      "show": false,
-      "dest": "$n_sni:443",
-      "serverNames": ["$n_sni"],
-      "privateKey": "$n_private_key",
-      "shortIds": ["$n_short_id"],
-      "fingerprint": "chrome"
-    }
-  },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-}
-EOF
-)
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
+            if [[ -z "$xhttp_inbound" ]]; then
+                log_error "Failed to build XHTTP inbound for node '$n_name'"
+                return 1
+            fi
+
             # 使用临时变量和错误检查来防止 jq 失败导致脚本退出
             local new_inbounds
             if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$xhttp_inbound" '. += [$inbound]' 2>&1); then
@@ -2123,16 +2444,25 @@ save_env() {
     local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
     local save_ipv6="${SERVER_IPV6:-}"
 
+    # Optional: encrypt sensitive values if encryption is enabled
+    local save_uuid="$UUID"
+    local save_private_key="$PRIVATE_KEY"
+
+    if is_encryption_enabled; then
+        save_uuid=$(encrypt_value "$UUID")
+        save_private_key=$(encrypt_value "$PRIVATE_KEY")
+    fi
+
     cat > "$node_file" <<ENV
 NODE_NAME=$node_name
 SERVER_IP=${save_ipv4:-YOUR_SERVER_IP}
 SERVER_IPV4=${save_ipv4:-}
 SERVER_IPV6=${save_ipv6:-}
 PORT=${PORT:-}
-UUID=$UUID
+UUID=$save_uuid
 SNI=$SNI
 PUBLIC_KEY=$PUBLIC_KEY
-PRIVATE_KEY=$PRIVATE_KEY
+PRIVATE_KEY=$save_private_key
 SHORT_ID=$SHORT_ID
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
@@ -2178,9 +2508,8 @@ get_xhttp_link() {
 get_share_link() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    # 重置变量以避免其他节点的值残留
-    unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH SERVER_IP SERVER_IPV4 SERVER_IPV6 PUBLIC_KEY SHORT_ID
-    source "$node_file"
+    # 使用安全的配置加载（防止命令注入）
+    safe_load_node_config "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip="${SERVER_IPV4:-$SERVER_IP}"
     local proto_type="${PROTOCOL_TYPE:-vision}"
@@ -2221,9 +2550,8 @@ show_qrcode() {
 show_info() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    # 重置变量以避免其他节点的值残留
-    unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH SERVER_IP SERVER_IPV4 SERVER_IPV6 PUBLIC_KEY PRIVATE_KEY SHORT_ID
-    source "$node_file"
+    # 使用安全的配置加载（防止命令注入）
+    safe_load_node_config "$node_file"
 
     local hostname
     hostname=$(hostname 2>/dev/null || echo "server")
@@ -2444,9 +2772,8 @@ cmd_list() {
     for node in "${nodes[@]}"; do
         local node_file
         node_file=$(get_node_file "$node")
-        # 重置变量以避免上一个节点的值残留
-        unset NODE_NAME PORT UUID SNI PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH
-        source "$node_file"
+        # 使用安全的配置加载（防止命令注入）
+        safe_load_node_config "$node_file"
         # 根据协议类型显示对应的端口
         local display_port=""
         local proto="${PROTOCOL_TYPE:-vision}"
@@ -2596,7 +2923,12 @@ cmd_uninstall() {
         rm -rf /var/log/xray
         rm -f /etc/init.d/xray
     else
-        curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- remove >/dev/null 2>&1
+        # Security: Download script to temp file first, then execute
+        local tmp_installer="/tmp/xray-uninstall-$$.sh"
+        if secure_curl "https://github.com/XTLS/Xray-install/raw/main/install-release.sh" -o "$tmp_installer"; then
+            bash "$tmp_installer" remove >/dev/null 2>&1
+            rm -f "$tmp_installer"
+        fi
     fi
     log_info "$(msg uninstall_complete)"
 }
@@ -2778,9 +3110,11 @@ cmd_warp() {
 warp_install() {
     echo ""
     log_info "Installing WARP (Socks5 mode)..."
-    if wget -qN https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null; then
-        bash menu.sh c
-        rm -f menu.sh
+    # Security: Download to temp file with secure options
+    local tmp_warp="/tmp/warp-menu-$$.sh"
+    if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
+        bash "$tmp_warp" c
+        rm -f "$tmp_warp"
         if check_warp_running; then
             log_info "WARP installed successfully"
             write_config
@@ -2788,6 +3122,7 @@ warp_install() {
         fi
     else
         log_error "Failed to download WARP installer"
+        rm -f "$tmp_warp"
     fi
     echo ""
     read -rp "$(msg menu_press_enter)"
@@ -2801,8 +3136,12 @@ warp_uninstall() {
     elif [[ -f menu.sh ]]; then
         bash menu.sh u
     else
-        wget -qN https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null && bash menu.sh u
-        rm -f menu.sh
+        # Security: Download to temp file with secure options
+        local tmp_warp="/tmp/warp-menu-$$.sh"
+        if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
+            bash "$tmp_warp" u
+            rm -f "$tmp_warp"
+        fi
     fi
     rm -f /root/.warp_netflix /root/.warp_ai
     write_config
@@ -3238,9 +3577,32 @@ get_current_ports() {
     [[ -z "$CURRENT_XHTTP" || "$CURRENT_XHTTP" == "null" ]] && CURRENT_XHTTP="N/A"
 }
 
-# 修改 SSH 端口
+# SSH rollback helper: restore original port
+_ssh_rollback() {
+    local ssh_config="$1"
+    local backup_file="$2"
+    local original_port="$3"
+
+    if [[ -f "$backup_file" ]]; then
+        cp "$backup_file" "$ssh_config"
+        rm -f "$backup_file"
+
+        # Restart SSH with original config
+        if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+            rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
+        else
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        fi
+
+        echo -e "\n${YELLOW}[AUTO-ROLLBACK]${NC} SSH 端口已自动恢复为 ${original_port}"
+    fi
+}
+
+# 修改 SSH 端口（带自动回滚保护）
 change_ssh_port() {
     local ssh_config="/etc/ssh/sshd_config"
+    local backup_file="/tmp/sshd_config.backup.$$"
+    local rollback_timeout=120  # 2 minutes to confirm
 
     # 安全警告框
     clear
@@ -3252,9 +3614,10 @@ change_ssh_port() {
     echo -e "${RED}#${NC}     必须先在网页控制台的【安全组/防火墙】放行新端口！        ${RED}#${NC}"
     echo -e "${RED}#${NC}     (脚本只能修改系统内部防火墙，无法修改云平台安全组)       ${RED}#${NC}"
     echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
-    echo -e "${RED}#${NC}  2. 修改后【绝对不要】关闭当前窗口！                         ${RED}#${NC}"
-    echo -e "${RED}#${NC}     请新开一个 SSH 窗口测试连接。如果失败，                  ${RED}#${NC}"
-    echo -e "${RED}#${NC}     请立即利用当前窗口改回原端口 ($CURRENT_SSH)。            ${RED}#${NC}"
+    echo -e "${RED}#${NC}  2. 修改后你有 ${rollback_timeout} 秒时间确认连接是否正常         ${RED}#${NC}"
+    echo -e "${RED}#${NC}     如果未确认，端口将自动恢复为原端口 ($CURRENT_SSH)       ${RED}#${NC}"
+    echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
+    echo -e "${RED}#${NC}  3. 请新开一个 SSH 窗口测试新端口，然后回来输入 'confirm'   ${RED}#${NC}"
     echo -e "${RED}#${NC}                                                              ${RED}#${NC}"
     echo -e "${RED}################################################################${NC}"
     echo ""
@@ -3271,19 +3634,37 @@ change_ssh_port() {
     [[ -z "$new_port" ]] && return
     validate_port "$new_port" || return
 
+    # Security: validate port more strictly
+    new_port=$(get_validated_port "$new_port" false) || return
+
     echo -e "${BLUE}正在修改 SSH 端口...${NC}"
 
-    # 修改配置文件
+    # Step 1: Create backup BEFORE any changes
+    cp "$ssh_config" "$backup_file"
+    echo -e "${GREEN}[BACKUP]${NC} 配置已备份到 $backup_file"
+
+    # Step 2: Modify config
     if grep -q "^Port" "$ssh_config"; then
         sed -i "s/^Port.*/Port $new_port/" "$ssh_config"
     else
         echo "Port $new_port" >> "$ssh_config"
     fi
 
-    # 开放防火墙
+    # Step 3: Open firewall for new port
     open_firewall_port "$new_port"
 
-    # 重启 SSH 服务
+    # Step 4: Start background rollback timer
+    (
+        sleep "$rollback_timeout"
+        # Check if marker file exists (means user confirmed)
+        if [[ ! -f "/tmp/ssh_port_confirmed.$$" ]]; then
+            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH"
+        fi
+    ) &
+    local rollback_pid=$!
+    disown $rollback_pid 2>/dev/null || true
+
+    # Step 5: Restart SSH service
     echo -e "${BLUE}[INFO]${NC} 重启 SSH 服务..."
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
         rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
@@ -3291,7 +3672,45 @@ change_ssh_port() {
         systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
     fi
 
-    echo -e "${GREEN}修改成功！请务必新开窗口测试端口 $new_port 。${NC}"
+    # Step 6: Wait for user confirmation
+    echo ""
+    echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║  SSH 端口已修改为 $new_port                                     ${NC}"
+    echo -e "${YELLOW}║                                                               ${NC}"
+    echo -e "${YELLOW}║  请立即在【新窗口】测试: ssh -p $new_port user@server          ${NC}"
+    echo -e "${YELLOW}║                                                               ${NC}"
+    echo -e "${YELLOW}║  如果连接成功，请在这里输入 'confirm' 保留更改                ${NC}"
+    echo -e "${YELLOW}║  如果 ${rollback_timeout} 秒内未确认，端口将自动恢复为 $CURRENT_SSH     ${NC}"
+    echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local user_confirm=""
+    local start_time=$SECONDS
+    while [[ $((SECONDS - start_time)) -lt $rollback_timeout ]]; do
+        local remaining=$((rollback_timeout - (SECONDS - start_time)))
+        echo -ne "\r  剩余时间: ${remaining}s | 输入 'confirm' 确认: "
+        if read -t 1 -r user_confirm; then
+            break
+        fi
+    done
+    echo ""
+
+    if [[ "$user_confirm" == "confirm" ]]; then
+        # User confirmed, create marker and clean up
+        touch "/tmp/ssh_port_confirmed.$$"
+        rm -f "$backup_file"
+        # Try to kill rollback process
+        kill $rollback_pid 2>/dev/null || true
+        echo -e "${GREEN}[SUCCESS]${NC} SSH 端口修改已确认！新端口: $new_port"
+        rm -f "/tmp/ssh_port_confirmed.$$"
+    else
+        # Timeout or cancelled, rollback will happen automatically
+        echo -e "${YELLOW}[TIMEOUT]${NC} 未收到确认，将自动回滚..."
+        # Force immediate rollback instead of waiting
+        kill $rollback_pid 2>/dev/null || true
+        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH"
+    fi
+
     read -n 1 -s -r -p "按任意键继续..."
 }
 
