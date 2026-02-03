@@ -3514,7 +3514,8 @@ warp_toggle_netflix() {
     fi
     write_config
     service_restart xray
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 warp_toggle_ai() {
@@ -3532,7 +3533,8 @@ warp_toggle_ai() {
     fi
     write_config
     service_restart xray
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 # ============== BBR 管理 ==============
@@ -3587,7 +3589,8 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl --system >/dev/null 2>&1
     log_info "BBR enabled"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 bbr_disable() {
@@ -3599,7 +3602,8 @@ net.ipv4.tcp_congestion_control = cubic
 EOF
     sysctl --system >/dev/null 2>&1
     log_info "BBR disabled, using CUBIC"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 bbr_optimize() {
@@ -3621,7 +3625,8 @@ net.ipv4.tcp_mtu_probing = 1
 EOF
     sysctl --system >/dev/null 2>&1
     log_info "TCP optimization applied"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 # ============== Swap 管理 ==============
@@ -3688,7 +3693,8 @@ swap_create() {
     fi
 
     log_info "Swap created: ${size}MB"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 swap_remove() {
@@ -3698,7 +3704,8 @@ swap_remove() {
     rm -f /swapfile
     sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null || true
     log_info "Swap removed"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 swap_swappiness() {
@@ -3715,7 +3722,8 @@ swap_swappiness() {
     else
         log_error "Invalid value"
     fi
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 # ============== Fail2ban 管理 ==============
@@ -3806,7 +3814,8 @@ EOF
     systemctl enable fail2ban >/dev/null 2>&1
     systemctl restart fail2ban >/dev/null 2>&1
     log_info "Fail2ban installed and configured"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 fail2ban_stop() {
@@ -3814,7 +3823,8 @@ fail2ban_stop() {
     systemctl stop fail2ban 2>/dev/null
     systemctl disable fail2ban 2>/dev/null
     log_info "Fail2ban stopped"
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 fail2ban_list() {
@@ -3832,7 +3842,8 @@ fail2ban_unban() {
     if [[ -n "$ip" ]]; then
         fail2ban-client set sshd unbanip "$ip" 2>/dev/null && log_info "Unbanned: $ip" || log_error "Failed to unban"
     fi
-    sleep 1
+    echo ""
+    read -rp "$(msg menu_press_enter)"
 }
 
 fail2ban_logs() {
