@@ -1588,19 +1588,91 @@ gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
 
+# 生成一个可用的随机端口
+gen_random_free_port() {
+    local exclude_port="${1:-0}"
+    local port
+    while true; do
+        port="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
+        if is_port_free "$port" && [[ "$port" != "$exclude_port" ]]; then
+            echo "$port"
+            return 0
+        fi
+    done
+}
+
+# 交互式选择端口
+# Usage: prompt_port "提示信息" "默认端口" "排除端口(可选)"
+prompt_port() {
+    local prompt_msg="$1"
+    local default_port="$2"
+    local exclude_port="${3:-0}"
+    local user_port
+
+    while true; do
+        echo -n "  $prompt_msg [默认: $default_port]: " >/dev/tty
+        read -r user_port </dev/tty
+
+        # 用户直接回车，使用默认端口
+        if [[ -z "$user_port" ]]; then
+            echo "$default_port"
+            return 0
+        fi
+
+        # 验证端口格式
+        if ! [[ "$user_port" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${RED}端口必须是数字${NC}" >/dev/tty
+            continue
+        fi
+
+        # 验证端口范围
+        if [[ "$user_port" -lt 1 || "$user_port" -gt 65535 ]]; then
+            echo -e "  ${RED}端口必须在 1-65535 之间${NC}" >/dev/tty
+            continue
+        fi
+
+        # 检查是否与排除端口冲突
+        if [[ "$user_port" == "$exclude_port" ]]; then
+            echo -e "  ${RED}端口不能与其他服务端口相同${NC}" >/dev/tty
+            continue
+        fi
+
+        # 检查端口是否被占用
+        if ! is_port_free "$user_port"; then
+            echo -e "  ${YELLOW}端口 $user_port 已被占用，是否仍然使用? [y/N]: ${NC}" >/dev/tty
+            read -r confirm </dev/tty
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                echo "$user_port"
+                return 0
+            fi
+            continue
+        fi
+
+        echo "$user_port"
+        return 0
+    done
+}
+
 # 选择端口（根据协议类型）
 choose_ports() {
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     端口配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    } >/dev/tty
+
     # Vision 端口（如果需要）
     if [[ "$PROTOCOL_TYPE" == "vision" || "$PROTOCOL_TYPE" == "both" ]]; then
         if [[ -n "${vlpt:-}" ]]; then
+            # 环境变量指定，直接使用
             PORT="$vlpt"
         else
-            while true; do
-                PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-                if is_port_free "$PORT"; then
-                    break
-                fi
-            done
+            # 交互式选择
+            local default_vision_port
+            default_vision_port=$(gen_random_free_port)
+            PORT=$(prompt_port "Vision 端口" "$default_vision_port")
         fi
         log_info "Vision 端口: $PORT"
     else
@@ -1610,14 +1682,13 @@ choose_ports() {
     # XHTTP 端口（如果需要）
     if [[ "$PROTOCOL_TYPE" == "xhttp" || "$PROTOCOL_TYPE" == "both" ]]; then
         if [[ -n "${xhpt:-}" ]]; then
+            # 环境变量指定，直接使用
             XHTTP_PORT="$xhpt"
         else
-            while true; do
-                XHTTP_PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-                if is_port_free "$XHTTP_PORT" && [[ "$XHTTP_PORT" != "${PORT:-0}" ]]; then
-                    break
-                fi
-            done
+            # 交互式选择（排除 Vision 端口）
+            local default_xhttp_port
+            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
+            XHTTP_PORT=$(prompt_port "XHTTP 端口" "$default_xhttp_port" "${PORT:-0}")
         fi
         XHTTP_PATH="/$(openssl rand -hex 4)"
         log_info "XHTTP 端口: $XHTTP_PORT, 路径: $XHTTP_PATH"
@@ -1625,6 +1696,8 @@ choose_ports() {
         XHTTP_PORT=""
         XHTTP_PATH=""
     fi
+
+    echo "" >/dev/tty
 }
 
 gen_reality_keys() {
