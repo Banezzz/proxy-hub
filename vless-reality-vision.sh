@@ -152,11 +152,17 @@ safe_read_config_value() {
     [[ ! -f "$file" ]] && return 1
 
     # Read line matching KEY= pattern
-    # Strict pattern: KEY=VALUE where VALUE contains no shell metacharacters
-    while IFS='=' read -r k v; do
+    # Note: Cannot use IFS='=' because values may contain '=' (e.g., base64 padding)
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
         # Skip comments and empty lines
-        [[ "$k" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "$k" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+
+        # Extract key (everything before first '=')
+        local k="${line%%=*}"
+        # Extract value (everything after first '=')
+        local v="${line#*=}"
 
         # Match exact key
         if [[ "$k" == "$key" ]]; then
