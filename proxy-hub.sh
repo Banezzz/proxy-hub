@@ -1083,6 +1083,24 @@ msg() {
             "xhttp_enabled") echo "XHTTP protocol enabled" ;;
             "detecting_ip") echo "Detecting server IP..." ;;
             "tools_menu") echo "System Optimization Tools" ;;
+            "menu_timesync") echo "Time Sync" ;;
+            "timesync_title") echo "System Time Sync" ;;
+            "timesync_status") echo "Sync Status" ;;
+            "timesync_current") echo "Current Time" ;;
+            "timesync_timezone") echo "Timezone" ;;
+            "timesync_install") echo "Install & Enable Time Sync" ;;
+            "timesync_force") echo "Force Sync Now" ;;
+            "timesync_uninstall") echo "Remove Time Sync" ;;
+            "timesync_not_installed") echo "Not Installed" ;;
+            "timesync_synced") echo "Synchronized" ;;
+            "timesync_installing") echo "Installing time sync service..." ;;
+            "timesync_installed") echo "Time sync service installed and enabled" ;;
+            "timesync_forcing") echo "Forcing time synchronization..." ;;
+            "timesync_forced") echo "Time synchronized successfully" ;;
+            "timesync_removing") echo "Removing time sync service..." ;;
+            "timesync_removed") echo "Time sync service removed" ;;
+            "timesync_already") echo "Time sync service is already installed" ;;
+            "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Install time sync now? (y/n)" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1184,6 +1202,24 @@ msg() {
             "xhttp_enabled") echo "XHTTP 协议已启用" ;;
             "detecting_ip") echo "检测服务器 IP..." ;;
             "tools_menu") echo "系统优化工具" ;;
+            "menu_timesync") echo "时间同步" ;;
+            "timesync_title") echo "系统时间同步" ;;
+            "timesync_status") echo "同步状态" ;;
+            "timesync_current") echo "当前时间" ;;
+            "timesync_timezone") echo "时区" ;;
+            "timesync_install") echo "安装并启用时间同步" ;;
+            "timesync_force") echo "立即强制同步" ;;
+            "timesync_uninstall") echo "卸载时间同步" ;;
+            "timesync_not_installed") echo "未安装" ;;
+            "timesync_synced") echo "已同步" ;;
+            "timesync_installing") echo "正在安装时间同步服务..." ;;
+            "timesync_installed") echo "时间同步服务已安装并启用" ;;
+            "timesync_forcing") echo "正在强制同步时间..." ;;
+            "timesync_forced") echo "时间同步成功" ;;
+            "timesync_removing") echo "正在卸载时间同步服务..." ;;
+            "timesync_removed") echo "时间同步服务已卸载" ;;
+            "timesync_already") echo "时间同步服务已安装" ;;
+            "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，是否立即安装时间同步？(y/n)" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -3072,6 +3108,11 @@ cmd_install() {
     local link
     link=$(get_share_link)
     show_qrcode "$link"
+
+    # SS2022 安装完成后自动提示时间同步
+    if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
+        prompt_timesync_for_ss2022
+    fi
 }
 
 cmd_info() {
@@ -4410,19 +4451,314 @@ fi
 TOOLEOF
     chmod +x "${bin_dir}/xray-f2b"
 
-    # 8. 主脚本链接
+    # 8. timesync 命令 - 时间同步
+    cat > "${bin_dir}/xray-timesync" << 'TOOLEOF'
+#!/bin/bash
+# Reality Vision - TimeSync Tool
+SCRIPT_PATH="/root/reality_vision.sh"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    bash "$SCRIPT_PATH" timesync
+elif command -v reality-vision &>/dev/null; then
+    reality-vision timesync
+else
+    echo "Reality Vision script not found"
+    exit 1
+fi
+TOOLEOF
+    chmod +x "${bin_dir}/xray-timesync"
+
+    # 9. 主脚本链接
     if [[ -f "/root/reality_vision.sh" ]]; then
         ln -sf "/root/reality_vision.sh" "${bin_dir}/reality-vision" 2>/dev/null || true
     fi
 
     echo -e "${GREEN}[OK]${NC} 独立工具已安装！可用命令:"
-    echo "  xray-info   - 查看节点信息"
-    echo "  xray-ports  - 端口管理"
-    echo "  xray-logs   - 日志查看"
-    echo "  xray-bbr    - BBR 管理"
-    echo "  xray-swap   - Swap 管理"
-    echo "  xray-warp   - WARP 管理"
-    echo "  xray-f2b    - Fail2ban 管理"
+    echo "  xray-info     - 查看节点信息"
+    echo "  xray-ports    - 端口管理"
+    echo "  xray-logs     - 日志查看"
+    echo "  xray-bbr      - BBR 管理"
+    echo "  xray-swap     - Swap 管理"
+    echo "  xray-warp     - WARP 管理"
+    echo "  xray-f2b      - Fail2ban 管理"
+    echo "  xray-timesync - 时间同步管理"
+}
+
+# ============== 时间同步管理 ==============
+
+# 检查 chrony 是否已安装
+is_timesync_installed() {
+    command -v chronyd &>/dev/null
+}
+
+# 获取时间同步状态
+get_timesync_status() {
+    if ! is_timesync_installed; then
+        echo "not_installed"
+        return
+    fi
+    if service_is_active chronyd 2>/dev/null || service_is_active chrony 2>/dev/null; then
+        echo "running"
+    else
+        echo "stopped"
+    fi
+}
+
+# 获取 chrony 服务名 (不同发行版名称不同)
+get_chrony_service_name() {
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        echo "chrony"
+    else
+        echo "chronyd"
+    fi
+}
+
+# 安装并启用时间同步
+timesync_install() {
+    echo ""
+    if is_timesync_installed; then
+        log_info "$(msg timesync_already)"
+        local svc_name
+        svc_name=$(get_chrony_service_name)
+        if ! service_is_active "$svc_name" 2>/dev/null; then
+            log_info "$(msg timesync_installing)"
+            service_enable "$svc_name"
+            service_start "$svc_name"
+            log_info "$(msg timesync_installed)"
+        fi
+        echo ""
+        read -rp "$(msg menu_press_enter)"
+        return
+    fi
+
+    log_info "$(msg timesync_installing)"
+
+    # 安装 chrony
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y chrony >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf install -y chrony >/dev/null 2>&1
+            ;;
+        yum)
+            yum install -y chrony >/dev/null 2>&1
+            ;;
+        apk)
+            apk add --no-cache chrony >/dev/null 2>&1
+            ;;
+    esac
+
+    # 停用 systemd-timesyncd 避免冲突 (仅 systemd 系统)
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+            systemctl stop systemd-timesyncd 2>/dev/null || true
+            systemctl disable systemd-timesyncd 2>/dev/null || true
+        fi
+    fi
+
+    # 配置 Chrony - 使用全球可达的 NTP 服务器
+    local chrony_conf="/etc/chrony/chrony.conf"
+    if [[ "$PKG_MANAGER" == "dnf" ]] || [[ "$PKG_MANAGER" == "yum" ]]; then
+        chrony_conf="/etc/chrony.conf"
+    elif [[ "$PKG_MANAGER" == "apk" ]]; then
+        chrony_conf="/etc/chrony/chrony.conf"
+        mkdir -p /etc/chrony
+    fi
+
+    cat > "$chrony_conf" <<CHRONYCFG
+server time.google.com iburst
+server time.cloudflare.com iburst
+server pool.ntp.org iburst
+driftfile /var/lib/chrony/chrony.drift
+makestep 1.0 3
+rtcsync
+CHRONYCFG
+
+    # Alpine 需要确保 driftfile 目录存在
+    if [[ "$PKG_MANAGER" == "apk" ]]; then
+        mkdir -p /var/lib/chrony
+    fi
+
+    # 启动并启用服务
+    local svc_name
+    svc_name=$(get_chrony_service_name)
+    service_enable "$svc_name"
+    service_restart "$svc_name"
+
+    # 强制同步一次
+    sleep 1
+    chronyc -a makestep >/dev/null 2>&1 || true
+
+    # 写入硬件时钟 (容器中可能失败，忽略错误)
+    hwclock --systohc 2>/dev/null || true
+
+    log_info "$(msg timesync_installed)"
+    echo ""
+    echo -e "  $(msg timesync_current): ${GREEN}$(date -R)${NC}"
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+# 强制同步时间
+timesync_force() {
+    echo ""
+    if ! is_timesync_installed; then
+        log_error "$(msg timesync_not_installed)"
+        echo ""
+        read -rp "$(msg menu_press_enter)"
+        return
+    fi
+
+    log_info "$(msg timesync_forcing)"
+
+    local svc_name
+    svc_name=$(get_chrony_service_name)
+
+    # 确保服务在运行
+    if ! service_is_active "$svc_name" 2>/dev/null; then
+        service_start "$svc_name"
+        sleep 1
+    fi
+
+    # 强制步进同步
+    chronyc -a makestep 2>/dev/null
+
+    # 写入硬件时钟
+    hwclock --systohc 2>/dev/null || true
+
+    log_info "$(msg timesync_forced)"
+    echo ""
+    echo -e "  $(msg timesync_current): ${GREEN}$(date -R)${NC}"
+    echo ""
+
+    # 显示 chronyc tracking 信息
+    if command -v chronyc &>/dev/null; then
+        echo -e "  ${BLUE}Chrony Tracking:${NC}"
+        chronyc tracking 2>/dev/null | while IFS= read -r line; do
+            echo "    $line"
+        done
+    fi
+
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+# 卸载时间同步
+timesync_uninstall() {
+    echo ""
+    if ! is_timesync_installed; then
+        log_error "$(msg timesync_not_installed)"
+        echo ""
+        read -rp "$(msg menu_press_enter)"
+        return
+    fi
+
+    log_info "$(msg timesync_removing)"
+
+    local svc_name
+    svc_name=$(get_chrony_service_name)
+
+    service_stop "$svc_name"
+    service_disable "$svc_name"
+
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get remove -y chrony >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf remove -y chrony >/dev/null 2>&1
+            ;;
+        yum)
+            yum remove -y chrony >/dev/null 2>&1
+            ;;
+        apk)
+            apk del chrony >/dev/null 2>&1
+            ;;
+    esac
+
+    log_info "$(msg timesync_removed)"
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+# 时间同步菜单
+cmd_timesync() {
+    while true; do
+        clear
+        local sync_status sync_display svc_name
+
+        sync_status=$(get_timesync_status)
+        case "$sync_status" in
+            running)
+                sync_display="${GREEN}$(msg timesync_synced)${NC}"
+                ;;
+            stopped)
+                sync_display="${YELLOW}Stopped${NC}"
+                ;;
+            *)
+                sync_display="${RED}$(msg timesync_not_installed)${NC}"
+                ;;
+        esac
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg timesync_title)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg timesync_status): $sync_display"
+        echo -e "  $(msg timesync_current): ${YELLOW}$(date -R)${NC}"
+        echo -e "  $(msg timesync_timezone): ${YELLOW}$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo 'N/A')${NC}"
+        echo ""
+
+        # 如果 chrony 已安装并运行，显示源信息
+        if [[ "$sync_status" == "running" ]] && command -v chronyc &>/dev/null; then
+            echo -e "  ${BLUE}NTP Sources:${NC}"
+            chronyc sources 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+                echo "    $line"
+            done
+            echo ""
+        fi
+
+        echo -e "  ${GREEN}1.${NC} $(msg timesync_install)"
+        echo -e "  ${GREEN}2.${NC} $(msg timesync_force)"
+        echo -e "  ${GREEN}3.${NC} $(msg timesync_uninstall)"
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} Back / 返回"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-3]: "
+        read -r choice
+
+        case "$choice" in
+            1) timesync_install ;;
+            2) timesync_force ;;
+            3) timesync_uninstall ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# SS2022 安装后自动提示时间同步
+prompt_timesync_for_ss2022() {
+    if is_timesync_installed; then
+        local svc_name
+        svc_name=$(get_chrony_service_name)
+        if service_is_active "$svc_name" 2>/dev/null; then
+            return
+        fi
+    fi
+
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${YELLOW}⚠${NC}  $(msg timesync_ss2022_hint)"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -n "  [y/N]: "
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        timesync_install
+    fi
 }
 
 # ============== 系统工具菜单 ==============
@@ -4442,17 +4778,18 @@ cmd_tools() {
         echo -e "  ${BLUE}[系统管理]${NC}"
         echo -e "  ${GREEN}3.${NC} $(msg menu_swap)"
         echo -e "  ${GREEN}4.${NC} $(msg menu_fail2ban)"
+        echo -e "  ${GREEN}5.${NC} $(msg menu_timesync)"
         echo ""
         echo -e "  ${BLUE}[服务管理]${NC}"
-        echo -e "  ${GREEN}5.${NC} 端口管理 (Ports)"
-        echo -e "  ${GREEN}6.${NC} 日志查看 (Logs)"
+        echo -e "  ${GREEN}6.${NC} 端口管理 (Ports)"
+        echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
         echo ""
         echo -e "  ${BLUE}[其他]${NC}"
-        echo -e "  ${GREEN}7.${NC} 安装独立工具命令"
+        echo -e "  ${GREEN}8.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-7]: "
+        echo -n "  $(msg menu_choice) [0-8]: "
         read -r choice
 
         case "$choice" in
@@ -4460,9 +4797,10 @@ cmd_tools() {
             2) cmd_bbr ;;
             3) cmd_swap ;;
             4) cmd_fail2ban ;;
-            5) cmd_ports ;;
-            6) cmd_logs ;;
-            7)
+            5) cmd_timesync ;;
+            6) cmd_ports ;;
+            7) cmd_logs ;;
+            8)
                 install_standalone_tools
                 echo ""
                 read -rp "$(msg menu_press_enter)"
@@ -4501,7 +4839,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${GREEN}9.${NC} $(msg menu_health)                                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban)                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${MAGENTA}L.${NC} $(msg menu_lang)                                            ${CYAN}║${NC}"
@@ -4609,13 +4947,14 @@ show_help() {
     echo "  test-sni    Test all SNI latency"
     echo ""
     echo "System Tools:"
-    echo "  tools       System tools menu (WARP/BBR/Swap/Fail2ban/Ports/Logs)"
+    echo "  tools       System tools menu (WARP/BBR/Swap/Fail2ban/TimeSync/Ports/Logs)"
     echo "  ports       Port management (SSH/Vision/XHTTP)"
     echo "  logs        Log viewer"
     echo "  warp        WARP routing management"
     echo "  bbr         BBR/TCP optimization"
     echo "  swap        Swap management"
     echo "  fail2ban    Fail2ban management"
+    echo "  timesync    System time synchronization (NTP/Chrony)"
     echo ""
     echo "Other:"
     echo "  menu        Show interactive menu"
@@ -4743,6 +5082,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_fail2ban
+        ;;
+    timesync)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_timesync
         ;;
     ports)
         check_lock_for_write_ops
