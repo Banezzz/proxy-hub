@@ -1101,6 +1101,29 @@ msg() {
             "timesync_removed") echo "Time sync service removed" ;;
             "timesync_already") echo "Time sync service is already installed" ;;
             "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Install time sync now? (y/n)" ;;
+            "timesync_env") echo "Environment" ;;
+            "timesync_container_warn") echo "Container environment detected - time sync may not work" ;;
+            "timesync_container_type") echo "Container type" ;;
+            "timesync_container_detail") echo "Containers share the host kernel clock. Time sync should run on the host." ;;
+            "timesync_pve_title") echo "Proxmox VE / LXC solutions" ;;
+            "timesync_pve_method1") echo "Method 1: Sync time on the PVE host (recommended)" ;;
+            "timesync_pve_host_tip") echo "Run chrony/ntpdate on the PVE host, all containers will inherit the time." ;;
+            "timesync_pve_method2") echo "Method 2: Grant SYS_TIME capability to this container" ;;
+            "timesync_pve_cap_step1") echo "Edit the container config on the PVE host:" ;;
+            "timesync_pve_cap_step2") echo "Add this line:" ;;
+            "timesync_pve_cap_step3") echo "Then restart the container and try again." ;;
+            "timesync_docker_tip") echo "Run the container with SYS_TIME capability:" ;;
+            "timesync_try_anyway") echo "Try to install anyway?" ;;
+            "timesync_start_failed") echo "Chrony service failed to start!" ;;
+            "timesync_check_log") echo "Error log" ;;
+            "timesync_check") echo "Check Time Accuracy (no privileges needed)" ;;
+            "timesync_checking") echo "Checking time accuracy via HTTP..." ;;
+            "timesync_offset") echo "Time offset" ;;
+            "timesync_offset_ok") echo "Time is accurate. SS2022 will work normally." ;;
+            "timesync_offset_warn") echo "Time offset is large! SS2022 connections may fail." ;;
+            "timesync_offset_fail") echo "Failed to fetch remote time. Check network connectivity." ;;
+            "timesync_container_no_host") echo "No host access? You can only verify time, not change it." ;;
+            "timesync_seconds") echo "seconds" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1220,6 +1243,29 @@ msg() {
             "timesync_removed") echo "时间同步服务已卸载" ;;
             "timesync_already") echo "时间同步服务已安装" ;;
             "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，是否立即安装时间同步？(y/n)" ;;
+            "timesync_env") echo "运行环境" ;;
+            "timesync_container_warn") echo "检测到容器环境 - 时间同步可能无法工作" ;;
+            "timesync_container_type") echo "容器类型" ;;
+            "timesync_container_detail") echo "容器与宿主机共享内核时钟，时间同步应在宿主机上进行。" ;;
+            "timesync_pve_title") echo "Proxmox VE / LXC 解决方案" ;;
+            "timesync_pve_method1") echo "方法一: 在 PVE 宿主机上同步时间 (推荐)" ;;
+            "timesync_pve_host_tip") echo "在 PVE 宿主机运行 chrony/ntpdate，所有容器自动继承。" ;;
+            "timesync_pve_method2") echo "方法二: 给此容器授权 SYS_TIME 能力" ;;
+            "timesync_pve_cap_step1") echo "在 PVE 宿主机上编辑容器配置:" ;;
+            "timesync_pve_cap_step2") echo "添加以下行:" ;;
+            "timesync_pve_cap_step3") echo "然后重启容器，再次尝试安装。" ;;
+            "timesync_docker_tip") echo "使用 SYS_TIME 能力运行容器:" ;;
+            "timesync_try_anyway") echo "仍然尝试安装？" ;;
+            "timesync_start_failed") echo "Chrony 服务启动失败！" ;;
+            "timesync_check_log") echo "错误日志" ;;
+            "timesync_check") echo "检查时间准确度 (无需特权)" ;;
+            "timesync_checking") echo "正在通过 HTTP 校验时间..." ;;
+            "timesync_offset") echo "时间偏差" ;;
+            "timesync_offset_ok") echo "时间准确，SS2022 可正常工作。" ;;
+            "timesync_offset_warn") echo "时间偏差较大！SS2022 连接可能失败。" ;;
+            "timesync_offset_fail") echo "无法获取远程时间，请检查网络连接。" ;;
+            "timesync_container_no_host") echo "没有宿主机权限？只能校验时间，无法修改。" ;;
+            "timesync_seconds") echo "秒" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -4485,6 +4531,68 @@ TOOLEOF
 
 # ============== 时间同步管理 ==============
 
+# 检测虚拟化/容器类型
+# 返回: none, lxc, docker, openvz, kvm, vmware, 等
+detect_virt_type() {
+    # 优先使用 systemd-detect-virt
+    if command -v systemd-detect-virt &>/dev/null; then
+        local virt
+        virt=$(systemd-detect-virt 2>/dev/null || echo "none")
+        echo "$virt"
+        return
+    fi
+    # 手动检测
+    if [[ -f /proc/1/environ ]] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q "^container=lxc"; then
+        echo "lxc"
+    elif [[ -f /.dockerenv ]]; then
+        echo "docker"
+    elif [[ -d /proc/vz ]] && [[ ! -d /proc/bc ]]; then
+        echo "openvz"
+    else
+        echo "none"
+    fi
+}
+
+# 检查是否在容器环境中运行
+is_container_env() {
+    local virt
+    virt=$(detect_virt_type)
+    case "$virt" in
+        lxc|lxc-libvirt|docker|podman|openvz|containerd|systemd-nspawn)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 检查系统是否有修改时钟的权限 (CAP_SYS_TIME)
+check_time_capability() {
+    # 方法1: 尝试无害的 adjtimex 查询
+    if command -v adjtimex &>/dev/null; then
+        adjtimex --print &>/dev/null && return 0
+    fi
+    # 方法2: 检查 /proc/1/status 的 CapEff (bit 25 = CAP_SYS_TIME)
+    if [[ -f /proc/1/status ]]; then
+        local cap_eff
+        cap_eff=$(grep "^CapEff:" /proc/1/status 2>/dev/null | awk '{print $2}')
+        if [[ -n "$cap_eff" ]]; then
+            # CAP_SYS_TIME = bit 25 = 0x2000000
+            local cap_dec
+            cap_dec=$(printf "%d" "0x$cap_eff" 2>/dev/null || echo 0)
+            if (( cap_dec & 0x2000000 )); then
+                return 0
+            else
+                return 1
+            fi
+        fi
+    fi
+    # 方法3: 尝试直接执行 chronyd 测试 (最可靠的检测)
+    # 无法判断时默认假设有权限, 让后续操作自然失败并捕获
+    return 0
+}
+
 # 检查 chrony 是否已安装
 is_timesync_installed() {
     command -v chronyd &>/dev/null
@@ -4512,9 +4620,57 @@ get_chrony_service_name() {
     fi
 }
 
+# 显示容器环境时间同步的提示信息
+show_container_timesync_hint() {
+    local virt
+    virt=$(detect_virt_type)
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${YELLOW}⚠${NC}  $(msg timesync_container_warn)"
+    echo -e "  $(msg timesync_container_type): ${CYAN}${virt}${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  $(msg timesync_container_detail)"
+    echo ""
+    if [[ "$virt" == "lxc" ]] || [[ "$virt" == "lxc-libvirt" ]]; then
+        echo -e "  ${BLUE}$(msg timesync_pve_title):${NC}"
+        echo ""
+        echo -e "  ${GREEN}$(msg timesync_pve_method1):${NC}"
+        echo -e "    $(msg timesync_pve_host_tip)"
+        echo ""
+        echo -e "  ${GREEN}$(msg timesync_pve_method2):${NC}"
+        echo -e "    $(msg timesync_pve_cap_step1)"
+        echo -e "    ${CYAN}nano /etc/pve/lxc/<CTID>.conf${NC}"
+        echo -e "    $(msg timesync_pve_cap_step2)"
+        echo -e "    ${CYAN}lxc.cap.keep: sys_time${NC}"
+        echo -e "    $(msg timesync_pve_cap_step3)"
+        echo ""
+    elif [[ "$virt" == "docker" ]] || [[ "$virt" == "podman" ]]; then
+        echo -e "  ${BLUE}Docker/Podman:${NC}"
+        echo -e "    $(msg timesync_docker_tip)"
+        echo -e "    ${CYAN}docker run --cap-add SYS_TIME ...${NC}"
+        echo ""
+    fi
+    echo -e "  ${GREEN}$(msg timesync_container_no_host)${NC}"
+    echo -e "    $(msg timesync_check) → $(msg menu_choice) 3"
+    echo ""
+}
+
 # 安装并启用时间同步
 timesync_install() {
     echo ""
+
+    # 容器环境检测
+    if is_container_env && ! check_time_capability; then
+        show_container_timesync_hint
+        echo -n "  $(msg timesync_try_anyway) [y/N]: "
+        read -r try_anyway
+        if [[ ! "$try_anyway" =~ ^[Yy]$ ]]; then
+            return
+        fi
+        echo ""
+    fi
+
     if is_timesync_installed; then
         log_info "$(msg timesync_already)"
         local svc_name
@@ -4522,7 +4678,10 @@ timesync_install() {
         if ! service_is_active "$svc_name" 2>/dev/null; then
             log_info "$(msg timesync_installing)"
             service_enable "$svc_name"
-            service_start "$svc_name"
+            if ! service_start "$svc_name" 2>/dev/null; then
+                timesync_handle_start_failure
+                return
+            fi
             log_info "$(msg timesync_installed)"
         fi
         echo ""
@@ -4584,7 +4743,11 @@ CHRONYCFG
     local svc_name
     svc_name=$(get_chrony_service_name)
     service_enable "$svc_name"
-    service_restart "$svc_name"
+
+    if ! service_restart "$svc_name" 2>/dev/null; then
+        timesync_handle_start_failure
+        return
+    fi
 
     # 强制同步一次
     sleep 1
@@ -4596,6 +4759,96 @@ CHRONYCFG
     log_info "$(msg timesync_installed)"
     echo ""
     echo -e "  $(msg timesync_current): ${GREEN}$(date -R)${NC}"
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
+# 处理 chrony 启动失败
+timesync_handle_start_failure() {
+    local svc_name
+    svc_name=$(get_chrony_service_name)
+
+    echo ""
+    log_error "$(msg timesync_start_failed)"
+    echo ""
+
+    # 检查是否是容器环境导致的 adjtimex 错误
+    local journal_err=""
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        journal_err=$(journalctl -u "$svc_name" --no-pager -n 10 2>/dev/null || true)
+    fi
+
+    if echo "$journal_err" | grep -q "adjtimex.*not permitted\|Operation not permitted" 2>/dev/null; then
+        show_container_timesync_hint
+    else
+        echo -e "  ${BLUE}$(msg timesync_check_log):${NC}"
+        echo ""
+        if [[ -n "$journal_err" ]]; then
+            echo "$journal_err" | tail -5 | while IFS= read -r line; do
+                echo "    $line"
+            done
+        fi
+        echo ""
+    fi
+
+    read -rp "$(msg menu_press_enter)"
+}
+
+# 通过 HTTP 头检查时间准确度 (无需任何特权，适用于容器环境)
+timesync_check() {
+    echo ""
+    log_info "$(msg timesync_checking)"
+    echo ""
+
+    local remote_epoch="" local_epoch="" offset=""
+    local sources=("https://www.google.com" "https://www.cloudflare.com" "https://www.apple.com")
+    local src_used=""
+
+    for src in "${sources[@]}"; do
+        local http_date
+        http_date=$(curl -sI --max-time 5 --proto '=https' "$src" 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
+        if [[ -n "$http_date" ]]; then
+            remote_epoch=$(date -d "$http_date" +%s 2>/dev/null)
+            if [[ -n "$remote_epoch" ]]; then
+                src_used="$src"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$remote_epoch" ]]; then
+        log_error "$(msg timesync_offset_fail)"
+        echo ""
+        read -rp "$(msg menu_press_enter)"
+        return
+    fi
+
+    local_epoch=$(date +%s)
+    offset=$(( local_epoch - remote_epoch ))
+    # 取绝对值
+    local abs_offset=${offset#-}
+
+    echo -e "  $(msg timesync_current): ${YELLOW}$(date -R)${NC}"
+    echo -e "  Remote (${src_used}): ${YELLOW}$(date -d "@$remote_epoch" -R 2>/dev/null)${NC}"
+    echo ""
+    echo -e "  $(msg timesync_offset): ${CYAN}${offset}${NC} $(msg timesync_seconds)"
+    echo ""
+
+    if [[ "$abs_offset" -le 30 ]]; then
+        echo -e "  ${GREEN}✓${NC} $(msg timesync_offset_ok)"
+    elif [[ "$abs_offset" -le 90 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} $(msg timesync_offset_warn)"
+        echo -e "  ${YELLOW}    (SS2022 tolerance: ~30s)${NC}"
+    else
+        echo -e "  ${RED}✗${NC} $(msg timesync_offset_warn)"
+        echo -e "  ${RED}    (SS2022 tolerance: ~30s, current: ${abs_offset}s)${NC}"
+        echo ""
+        if is_container_env && ! check_time_capability; then
+            echo -e "  ${YELLOW}$(msg timesync_container_no_host)${NC}"
+            echo -e "  $(msg timesync_container_detail)"
+        fi
+    fi
+
     echo ""
     read -rp "$(msg menu_press_enter)"
 }
@@ -4617,7 +4870,10 @@ timesync_force() {
 
     # 确保服务在运行
     if ! service_is_active "$svc_name" 2>/dev/null; then
-        service_start "$svc_name"
+        if ! service_start "$svc_name" 2>/dev/null; then
+            timesync_handle_start_failure
+            return
+        fi
         sleep 1
     fi
 
@@ -4709,6 +4965,13 @@ cmd_timesync() {
         echo -e "  $(msg timesync_status): $sync_display"
         echo -e "  $(msg timesync_current): ${YELLOW}$(date -R)${NC}"
         echo -e "  $(msg timesync_timezone): ${YELLOW}$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo 'N/A')${NC}"
+
+        # 显示容器类型提示
+        if is_container_env; then
+            local virt
+            virt=$(detect_virt_type)
+            echo -e "  $(msg timesync_env): ${YELLOW}${virt}${NC}"
+        fi
         echo ""
 
         # 如果 chrony 已安装并运行，显示源信息
@@ -4722,17 +4985,19 @@ cmd_timesync() {
 
         echo -e "  ${GREEN}1.${NC} $(msg timesync_install)"
         echo -e "  ${GREEN}2.${NC} $(msg timesync_force)"
-        echo -e "  ${GREEN}3.${NC} $(msg timesync_uninstall)"
+        echo -e "  ${GREEN}3.${NC} $(msg timesync_check)"
+        echo -e "  ${GREEN}4.${NC} $(msg timesync_uninstall)"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-3]: "
+        echo -n "  $(msg menu_choice) [0-4]: "
         read -r choice
 
         case "$choice" in
             1) timesync_install ;;
             2) timesync_force ;;
-            3) timesync_uninstall ;;
+            3) timesync_check ;;
+            4) timesync_uninstall ;;
             0) return ;;
             *) ;;
         esac
@@ -4741,6 +5006,7 @@ cmd_timesync() {
 
 # SS2022 安装后自动提示时间同步
 prompt_timesync_for_ss2022() {
+    # 已安装且运行中则跳过
     if is_timesync_installed; then
         local svc_name
         svc_name=$(get_chrony_service_name)
@@ -4753,6 +5019,16 @@ prompt_timesync_for_ss2022() {
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${YELLOW}⚠${NC}  $(msg timesync_ss2022_hint)"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # 容器环境且无权限: 自动运行时间校验而非安装
+    if is_container_env && ! check_time_capability; then
+        echo ""
+        echo -e "  $(msg timesync_container_no_host)"
+        echo ""
+        timesync_check
+        return
+    fi
+
     echo ""
     echo -n "  [y/N]: "
     read -r answer
