@@ -1116,6 +1116,14 @@ msg() {
             "timesync_try_anyway") echo "Try to install anyway?" ;;
             "timesync_start_failed") echo "Chrony service failed to start!" ;;
             "timesync_check_log") echo "Error log" ;;
+            "timesync_check") echo "Check Time Accuracy (no privileges needed)" ;;
+            "timesync_checking") echo "Checking time accuracy via HTTP..." ;;
+            "timesync_offset") echo "Time offset" ;;
+            "timesync_offset_ok") echo "Time is accurate. SS2022 will work normally." ;;
+            "timesync_offset_warn") echo "Time offset is large! SS2022 connections may fail." ;;
+            "timesync_offset_fail") echo "Failed to fetch remote time. Check network connectivity." ;;
+            "timesync_container_no_host") echo "No host access? You can only verify time, not change it." ;;
+            "timesync_seconds") echo "seconds" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1250,6 +1258,14 @@ msg() {
             "timesync_try_anyway") echo "仍然尝试安装？" ;;
             "timesync_start_failed") echo "Chrony 服务启动失败！" ;;
             "timesync_check_log") echo "错误日志" ;;
+            "timesync_check") echo "检查时间准确度 (无需特权)" ;;
+            "timesync_checking") echo "正在通过 HTTP 校验时间..." ;;
+            "timesync_offset") echo "时间偏差" ;;
+            "timesync_offset_ok") echo "时间准确，SS2022 可正常工作。" ;;
+            "timesync_offset_warn") echo "时间偏差较大！SS2022 连接可能失败。" ;;
+            "timesync_offset_fail") echo "无法获取远程时间，请检查网络连接。" ;;
+            "timesync_container_no_host") echo "没有宿主机权限？只能校验时间，无法修改。" ;;
+            "timesync_seconds") echo "秒" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -4635,6 +4651,9 @@ show_container_timesync_hint() {
         echo -e "    ${CYAN}docker run --cap-add SYS_TIME ...${NC}"
         echo ""
     fi
+    echo -e "  ${GREEN}$(msg timesync_container_no_host)${NC}"
+    echo -e "    $(msg timesync_check) → $(msg menu_choice) 3"
+    echo ""
 }
 
 # 安装并启用时间同步
@@ -4775,6 +4794,65 @@ timesync_handle_start_failure() {
     read -rp "$(msg menu_press_enter)"
 }
 
+# 通过 HTTP 头检查时间准确度 (无需任何特权，适用于容器环境)
+timesync_check() {
+    echo ""
+    log_info "$(msg timesync_checking)"
+    echo ""
+
+    local remote_epoch="" local_epoch="" offset=""
+    local sources=("https://www.google.com" "https://www.cloudflare.com" "https://www.apple.com")
+    local src_used=""
+
+    for src in "${sources[@]}"; do
+        local http_date
+        http_date=$(curl -sI --max-time 5 --proto '=https' "$src" 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: *//' | tr -d '\r')
+        if [[ -n "$http_date" ]]; then
+            remote_epoch=$(date -d "$http_date" +%s 2>/dev/null)
+            if [[ -n "$remote_epoch" ]]; then
+                src_used="$src"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$remote_epoch" ]]; then
+        log_error "$(msg timesync_offset_fail)"
+        echo ""
+        read -rp "$(msg menu_press_enter)"
+        return
+    fi
+
+    local_epoch=$(date +%s)
+    offset=$(( local_epoch - remote_epoch ))
+    # 取绝对值
+    local abs_offset=${offset#-}
+
+    echo -e "  $(msg timesync_current): ${YELLOW}$(date -R)${NC}"
+    echo -e "  Remote (${src_used}): ${YELLOW}$(date -d "@$remote_epoch" -R 2>/dev/null)${NC}"
+    echo ""
+    echo -e "  $(msg timesync_offset): ${CYAN}${offset}${NC} $(msg timesync_seconds)"
+    echo ""
+
+    if [[ "$abs_offset" -le 30 ]]; then
+        echo -e "  ${GREEN}✓${NC} $(msg timesync_offset_ok)"
+    elif [[ "$abs_offset" -le 90 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} $(msg timesync_offset_warn)"
+        echo -e "  ${YELLOW}    (SS2022 tolerance: ~30s)${NC}"
+    else
+        echo -e "  ${RED}✗${NC} $(msg timesync_offset_warn)"
+        echo -e "  ${RED}    (SS2022 tolerance: ~30s, current: ${abs_offset}s)${NC}"
+        echo ""
+        if is_container_env && ! check_time_capability; then
+            echo -e "  ${YELLOW}$(msg timesync_container_no_host)${NC}"
+            echo -e "  $(msg timesync_container_detail)"
+        fi
+    fi
+
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
 # 强制同步时间
 timesync_force() {
     echo ""
@@ -4907,17 +4985,19 @@ cmd_timesync() {
 
         echo -e "  ${GREEN}1.${NC} $(msg timesync_install)"
         echo -e "  ${GREEN}2.${NC} $(msg timesync_force)"
-        echo -e "  ${GREEN}3.${NC} $(msg timesync_uninstall)"
+        echo -e "  ${GREEN}3.${NC} $(msg timesync_check)"
+        echo -e "  ${GREEN}4.${NC} $(msg timesync_uninstall)"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-3]: "
+        echo -n "  $(msg menu_choice) [0-4]: "
         read -r choice
 
         case "$choice" in
             1) timesync_install ;;
             2) timesync_force ;;
-            3) timesync_uninstall ;;
+            3) timesync_check ;;
+            4) timesync_uninstall ;;
             0) return ;;
             *) ;;
         esac
@@ -4926,6 +5006,7 @@ cmd_timesync() {
 
 # SS2022 安装后自动提示时间同步
 prompt_timesync_for_ss2022() {
+    # 已安装且运行中则跳过
     if is_timesync_installed; then
         local svc_name
         svc_name=$(get_chrony_service_name)
@@ -4938,6 +5019,16 @@ prompt_timesync_for_ss2022() {
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${YELLOW}⚠${NC}  $(msg timesync_ss2022_hint)"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # 容器环境且无权限: 自动运行时间校验而非安装
+    if is_container_env && ! check_time_capability; then
+        echo ""
+        echo -e "  $(msg timesync_container_no_host)"
+        echo ""
+        timesync_check
+        return
+    fi
+
     echo ""
     echo -n "  [y/N]: "
     read -r answer
