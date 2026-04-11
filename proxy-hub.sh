@@ -3614,7 +3614,7 @@ cmd_update_ip() {
         fi
 
         echo -e "  ${GREEN}✓${NC} $(msg update_ip_node_updated): $n_name"
-        ((updated_count++))
+        updated_count=$((updated_count + 1))
     done
 
     echo ""
