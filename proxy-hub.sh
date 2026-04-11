@@ -1124,6 +1124,20 @@ msg() {
             "timesync_offset_fail") echo "Failed to fetch remote time. Check network connectivity." ;;
             "timesync_container_no_host") echo "No host access? You can only verify time, not change it." ;;
             "timesync_seconds") echo "seconds" ;;
+            "update_ip") echo "Update Node IP" ;;
+            "update_ip_detecting") echo "Detecting current public IP..." ;;
+            "update_ip_current") echo "Current IP" ;;
+            "update_ip_stored") echo "Stored IP" ;;
+            "update_ip_no_nodes") echo "No nodes configured" ;;
+            "update_ip_no_change") echo "IP has not changed, no update needed" ;;
+            "update_ip_changed") echo "IP change detected!" ;;
+            "update_ip_updating") echo "Updating node configurations..." ;;
+            "update_ip_node_updated") echo "Updated node" ;;
+            "update_ip_done") echo "All node IPs updated successfully" ;;
+            "update_ip_regen") echo "Regenerating Xray config..." ;;
+            "update_ip_restarting") echo "Restarting Xray service..." ;;
+            "update_ip_complete") echo "IP update complete! New share links will use the updated IP." ;;
+            "update_ip_detect_fail") echo "Failed to detect current public IP" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1266,6 +1280,20 @@ msg() {
             "timesync_offset_fail") echo "无法获取远程时间，请检查网络连接。" ;;
             "timesync_container_no_host") echo "没有宿主机权限？只能校验时间，无法修改。" ;;
             "timesync_seconds") echo "秒" ;;
+            "update_ip") echo "更新节点 IP" ;;
+            "update_ip_detecting") echo "正在检测当前公网 IP..." ;;
+            "update_ip_current") echo "当前 IP" ;;
+            "update_ip_stored") echo "已存储 IP" ;;
+            "update_ip_no_nodes") echo "未配置任何节点" ;;
+            "update_ip_no_change") echo "IP 未变更，无需更新" ;;
+            "update_ip_changed") echo "检测到 IP 变更！" ;;
+            "update_ip_updating") echo "正在更新节点配置..." ;;
+            "update_ip_node_updated") echo "已更新节点" ;;
+            "update_ip_done") echo "所有节点 IP 已更新完成" ;;
+            "update_ip_regen") echo "正在重新生成 Xray 配置..." ;;
+            "update_ip_restarting") echo "正在重启 Xray 服务..." ;;
+            "update_ip_complete") echo "IP 更新完成！分享链接将使用新的 IP 地址。" ;;
+            "update_ip_detect_fail") echo "无法检测当前公网 IP" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -3489,6 +3517,134 @@ cmd_health() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+# ============== IP 变更检测与更新 ==============
+
+cmd_update_ip() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     $(msg update_ip)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # 检查是否有节点
+    local node_count
+    node_count=$(count_nodes)
+    if [[ $node_count -eq 0 ]]; then
+        log_error "$(msg update_ip_no_nodes)"
+        return 1
+    fi
+
+    # 检测当前公网 IP
+    log_info "$(msg update_ip_detecting)"
+    local current_ipv4 current_ipv6
+    current_ipv4=$(get_ipv4)
+    current_ipv6=$(get_ipv6)
+
+    if [[ -z "$current_ipv4" ]] && [[ -z "$current_ipv6" ]]; then
+        log_error "$(msg update_ip_detect_fail)"
+        return 1
+    fi
+
+    [[ -n "$current_ipv4" ]] && echo -e "  ${BLUE}$(msg update_ip_current) IPv4:${NC} $current_ipv4"
+    [[ -n "$current_ipv6" ]] && echo -e "  ${BLUE}$(msg update_ip_current) IPv6:${NC} $current_ipv6"
+    echo ""
+
+    # 读取第一个节点的存储 IP 作为比较基准
+    local stored_ipv4="" stored_ipv6=""
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        stored_ipv4=$(safe_read_config_value "$node_file" "SERVER_IPV4")
+        # 向后兼容：如果没有 SERVER_IPV4，使用 SERVER_IP
+        [[ -z "$stored_ipv4" ]] && stored_ipv4=$(safe_read_config_value "$node_file" "SERVER_IP")
+        stored_ipv6=$(safe_read_config_value "$node_file" "SERVER_IPV6")
+        break
+    done
+
+    [[ -n "$stored_ipv4" ]] && echo -e "  ${BLUE}$(msg update_ip_stored) IPv4:${NC} $stored_ipv4"
+    [[ -n "$stored_ipv6" ]] && echo -e "  ${BLUE}$(msg update_ip_stored) IPv6:${NC} ${stored_ipv6:-N/A}"
+    echo ""
+
+    # 比较 IP 是否变更
+    local ipv4_changed=false ipv6_changed=false
+
+    if [[ -n "$current_ipv4" ]] && [[ "$current_ipv4" != "$stored_ipv4" ]]; then
+        ipv4_changed=true
+    fi
+    if [[ -n "$current_ipv6" ]] && [[ "$current_ipv6" != "$stored_ipv6" ]]; then
+        ipv6_changed=true
+    fi
+
+    if ! $ipv4_changed && ! $ipv6_changed; then
+        echo -e "  ${GREEN}✓${NC} $(msg update_ip_no_change)"
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        return 0
+    fi
+
+    # 显示变更详情
+    echo -e "  ${YELLOW}⚠${NC} $(msg update_ip_changed)"
+    $ipv4_changed && echo -e "    IPv4: ${RED}$stored_ipv4${NC} → ${GREEN}$current_ipv4${NC}"
+    $ipv6_changed && echo -e "    IPv6: ${RED}${stored_ipv6:-N/A}${NC} → ${GREEN}$current_ipv6${NC}"
+    echo ""
+
+    # 更新所有节点的 .env 文件
+    log_info "$(msg update_ip_updating)"
+    local updated_count=0
+
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        local n_name
+        n_name=$(basename "$node_file" .env)
+
+        if $ipv4_changed && [[ -n "$current_ipv4" ]]; then
+            # 更新 SERVER_IP（向后兼容字段）
+            if grep -q "^SERVER_IP=" "$node_file"; then
+                sed -i "s|^SERVER_IP=.*|SERVER_IP=${current_ipv4}|" "$node_file"
+            fi
+            # 更新 SERVER_IPV4
+            if grep -q "^SERVER_IPV4=" "$node_file"; then
+                sed -i "s|^SERVER_IPV4=.*|SERVER_IPV4=${current_ipv4}|" "$node_file"
+            fi
+        fi
+
+        if $ipv6_changed && [[ -n "$current_ipv6" ]]; then
+            if grep -q "^SERVER_IPV6=" "$node_file"; then
+                sed -i "s|^SERVER_IPV6=.*|SERVER_IPV6=${current_ipv6}|" "$node_file"
+            fi
+        fi
+
+        echo -e "  ${GREEN}✓${NC} $(msg update_ip_node_updated): $n_name"
+        ((updated_count++))
+    done
+
+    echo ""
+    log_info "$(msg update_ip_done) ($updated_count)"
+
+    # 更新全局变量
+    [[ -n "$current_ipv4" ]] && SERVER_IPV4="$current_ipv4"
+    [[ -n "$current_ipv6" ]] && SERVER_IPV6="$current_ipv6"
+    SERVER_IP="${current_ipv4:-$SERVER_IP}"
+
+    # 重新生成 Xray 配置（分享链接使用 .env 中的 IP，配置本身不含 IP，但为安全起见重新生成）
+    log_info "$(msg update_ip_regen)"
+    if write_config; then
+        log_info "$(msg update_ip_restarting)"
+        service_restart xray
+        sleep 1
+        if service_is_active xray; then
+            echo ""
+            echo -e "  ${GREEN}✓${NC} $(msg update_ip_complete)"
+        else
+            log_error "Xray service failed to start after IP update"
+        fi
+    else
+        log_error "Failed to regenerate config"
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
 # ============== WARP 管理 ==============
 
 cmd_warp() {
@@ -5115,6 +5271,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${GREEN}9.${NC} $(msg menu_health)                                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
@@ -5129,7 +5286,7 @@ show_menu() {
 main_menu() {
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,I,T,L,U]: "
         read -r choice
         echo ""
 
@@ -5179,6 +5336,11 @@ main_menu() {
                 echo ""
                 read -rp "$(msg menu_press_enter)"
                 ;;
+            [Ii])
+                cmd_update_ip
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Tt])
                 cmd_tools
                 ;;
@@ -5219,6 +5381,7 @@ show_help() {
     echo "  remove      Remove a node"
     echo "  restart     Restart service"
     echo "  regenerate  Regenerate config from node files (fix config issues)"
+    echo "  update-ip   Detect IP change and update all node configs"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -5324,6 +5487,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_regenerate
+        ;;
+    update-ip)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_update_ip
         ;;
     uninstall)
         check_lock_for_write_ops
