@@ -1138,6 +1138,32 @@ msg() {
             "update_ip_restarting") echo "Restarting Xray service..." ;;
             "update_ip_complete") echo "IP update complete! New share links will use the updated IP." ;;
             "update_ip_detect_fail") echo "Failed to detect current public IP" ;;
+            # Xray 定时重启
+            "xray_restart_title") echo "Xray Periodic Restart" ;;
+            "xray_restart_prompt") echo "Enable periodic Xray restart? (recommended for long-running stability)" ;;
+            "xray_restart_choose") echo "Choose restart schedule" ;;
+            "xray_restart_default") echo "default" ;;
+            "xray_restart_daily") echo "Daily at 04:00" ;;
+            "xray_restart_12h") echo "Every 12 hours" ;;
+            "xray_restart_6h") echo "Every 6 hours" ;;
+            "xray_restart_weekly") echo "Weekly (Sun 04:00)" ;;
+            "xray_restart_custom") echo "Custom cron expression" ;;
+            "xray_restart_cron_hint") echo "Format: 'minute hour day month weekday' (e.g. '0 3 * * *')" ;;
+            "xray_restart_cron_prompt") echo "Enter cron expression" ;;
+            "xray_restart_cron_invalid") echo "Invalid cron expression, falling back to daily" ;;
+            "xray_restart_enabled") echo "Xray periodic restart enabled" ;;
+            "xray_restart_disabled") echo "Xray periodic restart disabled" ;;
+            "xray_restart_not_enabled") echo "Periodic restart is not currently enabled" ;;
+            "xray_restart_already") echo "Periodic restart already enabled" ;;
+            "xray_restart_setup_failed") echo "Failed to set up periodic restart (crontab or systemd unavailable)" ;;
+            "xray_restart_status") echo "Status" ;;
+            "xray_restart_status_on") echo "Enabled" ;;
+            "xray_restart_status_off") echo "Disabled" ;;
+            "xray_restart_current") echo "Current schedule" ;;
+            "xray_restart_backend") echo "Backend" ;;
+            "xray_restart_action_set") echo "Enable / Modify schedule" ;;
+            "xray_restart_action_disable") echo "Disable periodic restart" ;;
+            "xray_restart_back") echo "Back" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1294,6 +1320,32 @@ msg() {
             "update_ip_restarting") echo "正在重启 Xray 服务..." ;;
             "update_ip_complete") echo "IP 更新完成！分享链接将使用新的 IP 地址。" ;;
             "update_ip_detect_fail") echo "无法检测当前公网 IP" ;;
+            # Xray 定时重启
+            "xray_restart_title") echo "Xray 定时重启" ;;
+            "xray_restart_prompt") echo "是否启用 Xray 定时重启？（长期运行建议启用）" ;;
+            "xray_restart_choose") echo "请选择重启频率" ;;
+            "xray_restart_default") echo "默认" ;;
+            "xray_restart_daily") echo "每日一次 (04:00)" ;;
+            "xray_restart_12h") echo "每 12 小时一次" ;;
+            "xray_restart_6h") echo "每 6 小时一次" ;;
+            "xray_restart_weekly") echo "每周一次 (周日 04:00)" ;;
+            "xray_restart_custom") echo "自定义 cron 表达式" ;;
+            "xray_restart_cron_hint") echo "格式: '分 时 日 月 周'（例如 '0 3 * * *' 表示每日 03:00）" ;;
+            "xray_restart_cron_prompt") echo "请输入 cron 表达式" ;;
+            "xray_restart_cron_invalid") echo "cron 表达式无效，已回退到默认（每日）" ;;
+            "xray_restart_enabled") echo "已启用 Xray 定时重启" ;;
+            "xray_restart_disabled") echo "已禁用 Xray 定时重启" ;;
+            "xray_restart_not_enabled") echo "当前未启用定时重启" ;;
+            "xray_restart_already") echo "已启用定时重启" ;;
+            "xray_restart_setup_failed") echo "定时重启配置失败（crontab 或 systemd 不可用）" ;;
+            "xray_restart_status") echo "状态" ;;
+            "xray_restart_status_on") echo "已启用" ;;
+            "xray_restart_status_off") echo "未启用" ;;
+            "xray_restart_current") echo "当前计划" ;;
+            "xray_restart_backend") echo "后端" ;;
+            "xray_restart_action_set") echo "启用 / 修改计划" ;;
+            "xray_restart_action_disable") echo "禁用定时重启" ;;
+            "xray_restart_back") echo "返回" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -1698,6 +1750,362 @@ setup_geodata_cron() {
 
     # 添加定时任务（先删除旧的）
     (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
+}
+
+# ============== Xray 定时重启 ==============
+
+XRAY_RESTART_CONF="/etc/proxy-hub/xray-restart.conf"
+XRAY_RESTART_NAME="xray-restart"
+XRAY_RESTART_SYSTEMD_SERVICE="/etc/systemd/system/${XRAY_RESTART_NAME}.service"
+XRAY_RESTART_SYSTEMD_TIMER="/etc/systemd/system/${XRAY_RESTART_NAME}.timer"
+XRAY_RESTART_CRON_MARKER="# proxy-hub-xray-restart"
+
+# 调度选择的全局返回值
+XRAY_RESTART_LABEL=""
+XRAY_RESTART_CRON=""
+XRAY_RESTART_CALENDAR=""
+
+is_xray_restart_enabled() {
+    [[ -f "$XRAY_RESTART_CONF" ]] && grep -q "^RESTART_ENABLED=yes" "$XRAY_RESTART_CONF" 2>/dev/null
+}
+
+get_xray_restart_label() {
+    [[ -f "$XRAY_RESTART_CONF" ]] || return 0
+    grep "^RESTART_LABEL=" "$XRAY_RESTART_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"'
+}
+
+get_xray_restart_backend() {
+    [[ -f "$XRAY_RESTART_CONF" ]] || return 0
+    grep "^RESTART_BACKEND=" "$XRAY_RESTART_CONF" 2>/dev/null | cut -d'=' -f2- | tr -d '"'
+}
+
+# 将标签翻译为人类可读字符串
+xray_restart_describe_label() {
+    case "$1" in
+        daily)  msg xray_restart_daily ;;
+        12h)    msg xray_restart_12h ;;
+        6h)     msg xray_restart_6h ;;
+        weekly) msg xray_restart_weekly ;;
+        custom) msg xray_restart_custom ;;
+        *)      echo "$1" ;;
+    esac
+}
+
+save_xray_restart_config() {
+    local label="$1" cron_expr="$2" systemd_cal="$3" backend="$4"
+    mkdir -p "$(dirname "$XRAY_RESTART_CONF")"
+    cat > "$XRAY_RESTART_CONF" <<EOF
+# Xray periodic restart config - managed by proxy-hub
+RESTART_ENABLED=yes
+RESTART_LABEL="$label"
+RESTART_CRON="$cron_expr"
+RESTART_SYSTEMD_CALENDAR="$systemd_cal"
+RESTART_BACKEND="$backend"
+EOF
+    chmod 600 "$XRAY_RESTART_CONF"
+}
+
+# 通过 systemd timer + service 安装（Ubuntu/Debian/CentOS 等）
+install_xray_restart_systemd() {
+    local systemd_cal="$1"
+
+    cat > "$XRAY_RESTART_SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=Restart Xray service (proxy-hub)
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart xray.service
+EOF
+
+    cat > "$XRAY_RESTART_SYSTEMD_TIMER" <<EOF
+[Unit]
+Description=Periodic restart for Xray (proxy-hub)
+
+[Timer]
+OnCalendar=$systemd_cal
+Persistent=true
+Unit=${XRAY_RESTART_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    chmod 644 "$XRAY_RESTART_SYSTEMD_SERVICE" "$XRAY_RESTART_SYSTEMD_TIMER"
+
+    systemctl daemon-reload 2>/dev/null || return 1
+    systemctl enable --now "${XRAY_RESTART_NAME}.timer" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 通过 crontab 安装（Alpine/OpenRC，以及自定义 cron 表达式场景）
+install_xray_restart_cron() {
+    local cron_expr="$1"
+
+    if ! command -v crontab &>/dev/null; then
+        log_warn "crontab not available; cannot schedule Xray restart"
+        return 1
+    fi
+
+    local restart_cmd
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        restart_cmd="rc-service xray restart"
+    else
+        restart_cmd="systemctl restart xray"
+    fi
+
+    local cron_line="$cron_expr $restart_cmd >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
+
+    if ! (crontab -l 2>/dev/null | grep -v "$XRAY_RESTART_CRON_MARKER"; echo "$cron_line") | crontab - 2>/dev/null; then
+        log_warn "Failed to write crontab for Xray restart"
+        return 1
+    fi
+
+    # Alpine / OpenRC：确保 crond 已启用并运行
+    if [[ "$INIT_SYSTEM" == "openrc" ]] && command -v rc-service &>/dev/null; then
+        rc-service crond status &>/dev/null || rc-service crond start &>/dev/null || true
+        rc-update show default 2>/dev/null | grep -q crond || rc-update add crond default &>/dev/null || true
+    fi
+
+    return 0
+}
+
+remove_xray_restart_systemd() {
+    if command -v systemctl &>/dev/null && [[ -f "$XRAY_RESTART_SYSTEMD_TIMER" ]]; then
+        systemctl disable --now "${XRAY_RESTART_NAME}.timer" >/dev/null 2>&1 || true
+    fi
+    rm -f "$XRAY_RESTART_SYSTEMD_SERVICE" "$XRAY_RESTART_SYSTEMD_TIMER"
+    if command -v systemctl &>/dev/null; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+remove_xray_restart_cron() {
+    if command -v crontab &>/dev/null; then
+        crontab -l 2>/dev/null | grep -v "$XRAY_RESTART_CRON_MARKER" | crontab - 2>/dev/null || true
+    fi
+}
+
+remove_xray_restart_schedule() {
+    remove_xray_restart_systemd
+    remove_xray_restart_cron
+    rm -f "$XRAY_RESTART_CONF"
+}
+
+# 统一安装入口
+# $1 label  $2 cron expr  $3 systemd OnCalendar (可为空)
+setup_xray_restart_schedule() {
+    local label="$1" cron_expr="$2" systemd_cal="$3"
+
+    # 清理旧的
+    remove_xray_restart_systemd
+    remove_xray_restart_cron
+
+    local backend=""
+    if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl &>/dev/null && [[ -n "$systemd_cal" ]]; then
+        if install_xray_restart_systemd "$systemd_cal"; then
+            backend="systemd-timer"
+        else
+            log_warn "systemd timer setup failed, falling back to cron"
+            if install_xray_restart_cron "$cron_expr"; then
+                backend="cron"
+            fi
+        fi
+    else
+        if install_xray_restart_cron "$cron_expr"; then
+            backend="cron"
+        fi
+    fi
+
+    if [[ -z "$backend" ]]; then
+        return 1
+    fi
+
+    save_xray_restart_config "$label" "$cron_expr" "$systemd_cal" "$backend"
+    return 0
+}
+
+# 让用户选择一个预设调度或输入 cron 表达式
+# 结果写入 XRAY_RESTART_LABEL / XRAY_RESTART_CRON / XRAY_RESTART_CALENDAR
+prompt_xray_restart_choose_schedule() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                  $(msg xray_restart_choose)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} $(msg xray_restart_daily) [${YELLOW}$(msg xray_restart_default)${NC}]"
+    echo -e "  ${GREEN}2.${NC} $(msg xray_restart_12h)"
+    echo -e "  ${GREEN}3.${NC} $(msg xray_restart_6h)"
+    echo -e "  ${GREEN}4.${NC} $(msg xray_restart_weekly)"
+    echo -e "  ${GREEN}5.${NC} $(msg xray_restart_custom)"
+    echo ""
+    echo -n "  $(msg menu_choice) [1-5]: "
+    read -r choice
+    case "$choice" in
+        2)
+            XRAY_RESTART_LABEL="12h"
+            XRAY_RESTART_CRON="0 */12 * * *"
+            XRAY_RESTART_CALENDAR="*-*-* 00/12:00:00"
+            ;;
+        3)
+            XRAY_RESTART_LABEL="6h"
+            XRAY_RESTART_CRON="0 */6 * * *"
+            XRAY_RESTART_CALENDAR="*-*-* 00/6:00:00"
+            ;;
+        4)
+            XRAY_RESTART_LABEL="weekly"
+            XRAY_RESTART_CRON="0 4 * * 0"
+            XRAY_RESTART_CALENDAR="Sun *-*-* 04:00:00"
+            ;;
+        5)
+            echo ""
+            echo -e "  $(msg xray_restart_cron_hint)"
+            echo -n "  $(msg xray_restart_cron_prompt): "
+            local custom_cron
+            read -r custom_cron
+            # 简单验证：5 个字段
+            if [[ -z "$custom_cron" ]] || [[ $(echo "$custom_cron" | awk '{print NF}') -ne 5 ]]; then
+                log_warn "$(msg xray_restart_cron_invalid)"
+                XRAY_RESTART_LABEL="daily"
+                XRAY_RESTART_CRON="0 4 * * *"
+                XRAY_RESTART_CALENDAR="*-*-* 04:00:00"
+            else
+                XRAY_RESTART_LABEL="custom"
+                XRAY_RESTART_CRON="$custom_cron"
+                # 自定义 cron 强制走 crontab 后端
+                XRAY_RESTART_CALENDAR=""
+            fi
+            ;;
+        *)
+            XRAY_RESTART_LABEL="daily"
+            XRAY_RESTART_CRON="0 4 * * *"
+            XRAY_RESTART_CALENDAR="*-*-* 04:00:00"
+            ;;
+    esac
+}
+
+# 创建节点时询问是否启用定时重启
+prompt_xray_restart_on_install() {
+    # 已配置过则仅提示当前状态
+    if is_xray_restart_enabled; then
+        local cur
+        cur=$(xray_restart_describe_label "$(get_xray_restart_label)")
+        log_info "$(msg xray_restart_already): $cur"
+        return 0
+    fi
+
+    # 支持环境变量自动选择
+    if [[ -n "${restart:-}" ]]; then
+        case "$restart" in
+            no|false|0|n)
+                return 0
+                ;;
+            daily|yes|true|1|y)
+                XRAY_RESTART_LABEL="daily"
+                XRAY_RESTART_CRON="0 4 * * *"
+                XRAY_RESTART_CALENDAR="*-*-* 04:00:00"
+                ;;
+            12h)
+                XRAY_RESTART_LABEL="12h"
+                XRAY_RESTART_CRON="0 */12 * * *"
+                XRAY_RESTART_CALENDAR="*-*-* 00/12:00:00"
+                ;;
+            6h)
+                XRAY_RESTART_LABEL="6h"
+                XRAY_RESTART_CRON="0 */6 * * *"
+                XRAY_RESTART_CALENDAR="*-*-* 00/6:00:00"
+                ;;
+            weekly)
+                XRAY_RESTART_LABEL="weekly"
+                XRAY_RESTART_CRON="0 4 * * 0"
+                XRAY_RESTART_CALENDAR="Sun *-*-* 04:00:00"
+                ;;
+            *)
+                log_warn "Unknown restart value: $restart (use: daily/12h/6h/weekly/no)"
+                return 0
+                ;;
+        esac
+        if setup_xray_restart_schedule "$XRAY_RESTART_LABEL" "$XRAY_RESTART_CRON" "$XRAY_RESTART_CALENDAR"; then
+            log_info "$(msg xray_restart_enabled): $(xray_restart_describe_label "$XRAY_RESTART_LABEL")"
+        else
+            log_warn "$(msg xray_restart_setup_failed)"
+        fi
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${YELLOW}⏰${NC}  $(msg xray_restart_prompt)"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -n "  [y/N]: "
+    local answer
+    read -r answer
+    [[ ! "$answer" =~ ^[Yy]$ ]] && return 0
+
+    prompt_xray_restart_choose_schedule
+
+    if setup_xray_restart_schedule "$XRAY_RESTART_LABEL" "$XRAY_RESTART_CRON" "$XRAY_RESTART_CALENDAR"; then
+        log_info "$(msg xray_restart_enabled): $(xray_restart_describe_label "$XRAY_RESTART_LABEL")"
+    else
+        log_warn "$(msg xray_restart_setup_failed)"
+    fi
+}
+
+# 工具菜单入口：显示当前状态并允许修改/禁用
+cmd_xray_restart() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                  $(msg xray_restart_title)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        if is_xray_restart_enabled; then
+            local cur backend
+            cur=$(xray_restart_describe_label "$(get_xray_restart_label)")
+            backend=$(get_xray_restart_backend)
+            echo -e "  $(msg xray_restart_status): ${GREEN}$(msg xray_restart_status_on)${NC}"
+            echo -e "  $(msg xray_restart_current): ${YELLOW}$cur${NC}"
+            echo -e "  $(msg xray_restart_backend): ${BLUE}$backend${NC}"
+        else
+            echo -e "  $(msg xray_restart_status): ${RED}$(msg xray_restart_status_off)${NC}"
+        fi
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}1.${NC} $(msg xray_restart_action_set)"
+        echo -e "  ${GREEN}2.${NC} $(msg xray_restart_action_disable)"
+        echo -e "  ${RED}0.${NC} $(msg xray_restart_back)"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-2]: "
+        local choice
+        read -r choice
+        case "$choice" in
+            1)
+                prompt_xray_restart_choose_schedule
+                if setup_xray_restart_schedule "$XRAY_RESTART_LABEL" "$XRAY_RESTART_CRON" "$XRAY_RESTART_CALENDAR"; then
+                    log_info "$(msg xray_restart_enabled): $(xray_restart_describe_label "$XRAY_RESTART_LABEL")"
+                else
+                    log_warn "$(msg xray_restart_setup_failed)"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            2)
+                if is_xray_restart_enabled; then
+                    remove_xray_restart_schedule
+                    log_info "$(msg xray_restart_disabled)"
+                else
+                    log_info "$(msg xray_restart_not_enabled)"
+                fi
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
 }
 
 # ============== 协议类型选择 ==============
@@ -3183,6 +3591,9 @@ cmd_install() {
     link=$(get_share_link)
     show_qrcode "$link"
 
+    # 询问是否启用定时重启 Xray（仅首次创建节点时提示，或通过环境变量 restart= 指定）
+    prompt_xray_restart_on_install
+
     # SS2022 安装完成后自动提示时间同步
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
         prompt_timesync_for_ss2022
@@ -3373,6 +3784,8 @@ cmd_remove() {
 
 cmd_uninstall() {
     log_info "$(msg uninstalling)"
+    # 清理定时重启计划（service/timer 或 crontab 条目）
+    remove_xray_restart_schedule
     service_stop xray
     service_disable xray
     rm -f "$XRAY_CONF" "$LANG_FILE"
@@ -5215,13 +5628,14 @@ cmd_tools() {
         echo -e "  ${BLUE}[服务管理]${NC}"
         echo -e "  ${GREEN}6.${NC} 端口管理 (Ports)"
         echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
+        echo -e "  ${GREEN}8.${NC} $(msg xray_restart_title)"
         echo ""
         echo -e "  ${BLUE}[其他]${NC}"
-        echo -e "  ${GREEN}8.${NC} 安装独立工具命令"
+        echo -e "  ${GREEN}9.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-8]: "
+        echo -n "  $(msg menu_choice) [0-9]: "
         read -r choice
 
         case "$choice" in
@@ -5232,7 +5646,8 @@ cmd_tools() {
             5) cmd_timesync ;;
             6) cmd_ports ;;
             7) cmd_logs ;;
-            8)
+            8) cmd_xray_restart ;;
+            9)
                 install_standalone_tools
                 echo ""
                 read -rp "$(msg menu_press_enter)"
@@ -5394,6 +5809,7 @@ show_help() {
     echo "  swap        Swap management"
     echo "  fail2ban    Fail2ban management"
     echo "  timesync    System time synchronization (NTP/Chrony)"
+    echo "  xray-restart  Schedule periodic Xray restart (systemd timer or cron)"
     echo ""
     echo "Other:"
     echo "  menu        Show interactive menu"
@@ -5413,6 +5829,13 @@ show_help() {
     echo "  sspwd=xxx     Specify password (auto-generated if not set)"
     echo "  sspt=xxx      Specify Shadowsocks port"
     echo "  xhttp=true    (deprecated) Same as proto=both"
+    echo ""
+    echo "Periodic Xray restart (optional, non-interactive):"
+    echo "  restart=daily   Daily restart (04:00)"
+    echo "  restart=12h     Every 12 hours"
+    echo "  restart=6h      Every 6 hours"
+    echo "  restart=weekly  Weekly restart (Sun 04:00)"
+    echo "  restart=no      Skip the restart schedule prompt"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
@@ -5531,6 +5954,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_timesync
+        ;;
+    xray-restart|restart-schedule)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_xray_restart
         ;;
     ports)
         check_lock_for_write_ops
