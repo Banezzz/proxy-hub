@@ -155,6 +155,9 @@ safe_read_config_value() {
     # Note: Cannot use IFS='=' because values may contain '=' (e.g., base64 padding)
     local line
     while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip trailing CR (handles CRLF files / xray output with \r)
+        line="${line%$'\r'}"
+
         # Skip comments and empty lines
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$line" ]] && continue
@@ -166,6 +169,10 @@ safe_read_config_value() {
 
         # Match exact key
         if [[ "$k" == "$key" ]]; then
+            # Trim leading/trailing whitespace defensively
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+
             # Security: reject values containing dangerous characters
             # Allow: alphanumeric, dash, underscore, dot, slash, colon, equals, plus, at, brackets
             # Reject: backticks, $, ;, |, &, newlines, etc.
@@ -1351,9 +1358,9 @@ msg() {
     fi
 }
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 is_root() { [[ "${EUID}" -eq 0 ]]; }
 
@@ -2367,14 +2374,24 @@ choose_ports() {
 gen_reality_keys() {
     log_info "$(msg gen_keys)"
     local KEYS
-    KEYS="$("$XRAY_BIN" x25519)"
+    # tr -d '\r' 防止部分 xray 输出 CRLF 行尾导致密钥末尾混入 \r,
+    # 进而被 safe_read_config_value 的字符白名单判定为 "unsafe value".
+    KEYS="$("$XRAY_BIN" x25519 | tr -d '\r')"
 
-    # 提取私钥 (支持 "PrivateKey: xxx" 格式)
-    PRIVATE_KEY="$(echo "$KEYS" | awk -F'[: ]+' '/PrivateKey|Private key/ {print $2}')"
+    # 提取私钥 (支持 "PrivateKey: xxx" 或 "Private key: xxx" 格式)
+    # 注意: 旧版 "Private key:" 经 [: ]+ 分割后 $2 是 "key", 需取 $3
+    PRIVATE_KEY="$(echo "$KEYS" | awk -F'[: ]+' '
+        /^PrivateKey[[:space:]]*:/ { print $2; exit }
+        /^Private[[:space:]]+key[[:space:]]*:/ { print $3; exit }
+    ')"
 
-    # 提取公钥 (支持 "Password: xxx" 或 "PublicKey: xxx" 格式)
+    # 提取公钥 (支持 "Password: xxx", "PublicKey: xxx" 或 "Public key: xxx" 格式)
     # 某些 xray 版本输出 "Password" 而不是 "Public key"
-    PUBLIC_KEY="$(echo "$KEYS" | awk -F'[: ]+' '/Password|Public key|PublicKey/ {print $2}')"
+    PUBLIC_KEY="$(echo "$KEYS" | awk -F'[: ]+' '
+        /^Password[[:space:]]*:/ { print $2; exit }
+        /^PublicKey[[:space:]]*:/ { print $2; exit }
+        /^Public[[:space:]]+key[[:space:]]*:/ { print $3; exit }
+    ')"
 
     SHORT_ID="$(openssl rand -hex 4)"
 
