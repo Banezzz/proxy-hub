@@ -2378,19 +2378,34 @@ gen_reality_keys() {
     # 进而被 safe_read_config_value 的字符白名单判定为 "unsafe value".
     KEYS="$("$XRAY_BIN" x25519 | tr -d '\r')"
 
-    # 提取私钥 (支持 "PrivateKey: xxx" 或 "Private key: xxx" 格式)
-    # 注意: 旧版 "Private key:" 经 [: ]+ 分割后 $2 是 "key", 需取 $3
-    PRIVATE_KEY="$(echo "$KEYS" | awk -F'[: ]+' '
-        /^PrivateKey[[:space:]]*:/ { print $2; exit }
-        /^Private[[:space:]]+key[[:space:]]*:/ { print $3; exit }
+    # 提取私钥. 兼容多种 xray 版本输出标签:
+    #   "PrivateKey: xxx"          (现代版本)
+    #   "Private key: xxx"         (旧版本)
+    #   "PrivateKey (Private): xxx" (新版本带括号备注)
+    # 不依赖字段切分, 直接取第一个 ':' 之后的内容并裁剪空白.
+    PRIVATE_KEY="$(echo "$KEYS" | awk '
+        /^(PrivateKey|Private[[:space:]]+key)([[:space:]]*\([^)]*\))?[[:space:]]*:/ {
+            idx = index($0, ":")
+            val = substr($0, idx + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+            print val
+            exit
+        }
     ')"
 
-    # 提取公钥 (支持 "Password: xxx", "PublicKey: xxx" 或 "Public key: xxx" 格式)
-    # 某些 xray 版本输出 "Password" 而不是 "Public key"
-    PUBLIC_KEY="$(echo "$KEYS" | awk -F'[: ]+' '
-        /^Password[[:space:]]*:/ { print $2; exit }
-        /^PublicKey[[:space:]]*:/ { print $2; exit }
-        /^Public[[:space:]]+key[[:space:]]*:/ { print $3; exit }
+    # 提取公钥. 兼容多种 xray 版本输出标签:
+    #   "Password: xxx"            (中期版本)
+    #   "PublicKey: xxx"           (现代版本)
+    #   "Public key: xxx"          (旧版本)
+    #   "Password (PublicKey): xxx" (最新版本带括号备注)
+    PUBLIC_KEY="$(echo "$KEYS" | awk '
+        /^(Password|PublicKey|Public[[:space:]]+key)([[:space:]]*\([^)]*\))?[[:space:]]*:/ {
+            idx = index($0, ":")
+            val = substr($0, idx + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+            print val
+            exit
+        }
     ')"
 
     SHORT_ID="$(openssl rand -hex 4)"
