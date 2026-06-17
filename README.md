@@ -464,6 +464,10 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ## 更新日志
 
+### v5.1.1
+- 修复「更新节点 IP」只按首个节点判断是否变更，导致换 IP 前已存在的旧节点
+  不被同步（分享链接仍显示旧 IP）的问题，改为逐节点独立比较与更新
+
 ### v5.1.0
 - 新增 **AnyTLS** 与 **AnyTLS + REALITY** 协议支持（基于 sing-box）
 - 每个 AnyTLS 节点生成独立、随机化的 padding scheme，握手时自动下发给客户端
