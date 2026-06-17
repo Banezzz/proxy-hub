@@ -204,7 +204,7 @@ safe_load_node_config() {
     # Reset all variables first
     NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
     PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
-    SS_METHOD="" SS_PASSWORD=""
+    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD=""
 
     # Load each value safely
     NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")
@@ -222,6 +222,7 @@ safe_load_node_config() {
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
     SS_METHOD=$(safe_read_config_value "$file" "SS_METHOD")
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
+    ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
 
     return 0
 }
@@ -368,6 +369,76 @@ build_shadowsocks_inbound() {
         }'
 }
 
+# Build AnyTLS inbound JSON (sing-box) using jq (prevents injection)
+# Usage: build_anytls_inbound NAME PORT PASSWORD PADDING MODE SNI PRIVKEY SHORTID CERT KEY
+#   MODE = reality | tls
+#   For MODE=reality: SNI/PRIVKEY/SHORTID required, CERT/KEY ignored
+#   For MODE=tls:     SNI/CERT/KEY required (self-signed), PRIVKEY/SHORTID ignored
+build_anytls_inbound() {
+    local name="$1"
+    local port="$2"
+    local password="$3"
+    local padding="$4"
+    local mode="$5"
+    local sni="$6"
+    local privkey="$7"
+    local shortid="$8"
+    local cert="$9"
+    local key="${10}"
+
+    # Validate port
+    port=$(get_validated_port "$port" true) || return 1
+
+    # 构建 TLS 块（reality 伪装 或 自签名证书）
+    local tls_json
+    if [[ "$mode" == "reality" ]]; then
+        tls_json=$(jq -n \
+            --arg sni "$sni" \
+            --arg priv "$privkey" \
+            --arg sid "$shortid" \
+            '{
+                "enabled": true,
+                "server_name": $sni,
+                "reality": {
+                    "enabled": true,
+                    "handshake": {"server": $sni, "server_port": 443},
+                    "private_key": $priv,
+                    "short_id": [$sid]
+                }
+            }') || return 1
+    else
+        tls_json=$(jq -n \
+            --arg sni "$sni" \
+            --arg cert "$cert" \
+            --arg key "$key" \
+            '{
+                "enabled": true,
+                "server_name": $sni,
+                "certificate_path": $cert,
+                "key_path": $key
+            }') || return 1
+    fi
+
+    # padding scheme 为字符串数组（每行一条规则）；服务端会在握手时
+    # 通过 cmdUpdatePaddingScheme 自动下发给客户端，无需客户端额外配置。
+    jq -n \
+        --arg tag "${name}_anytls" \
+        --argjson port "$port" \
+        --arg name "$name" \
+        --arg password "$password" \
+        --arg padding "$padding" \
+        --argjson tls "$tls_json" \
+        '{
+            "type": "anytls",
+            "tag": $tag,
+            "listen": "::",
+            "listen_port": $port,
+            "users": [{"name": $name, "password": $password}],
+            "padding_scheme": ($padding | split("\n") | map(select(length > 0))),
+            "tls": $tls
+        }'
+}
+
 # Optional encryption for sensitive config values
 # Usage: encrypt_value PLAINTEXT
 # Returns: base64-encoded encrypted value with "U2FsdGVk" prefix (OpenSSL magic)
@@ -423,6 +494,13 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_GEODATA_DIR="/usr/local/share/xray"
 SERVICE="xray"
+
+# sing-box（用于 AnyTLS / AnyTLS + REALITY 协议，Xray 暂不支持 AnyTLS）
+SINGBOX_BIN="/usr/local/bin/sing-box"
+SINGBOX_DIR="/usr/local/etc/sing-box"
+SINGBOX_CONF="/usr/local/etc/sing-box/config.json"
+SINGBOX_CERT_DIR="/usr/local/etc/sing-box/certs"
+SINGBOX_SERVICE="sing-box"
 
 # 缓存配置（放在 /root 下更安全）
 CACHE_FILE="/root/.sni_latency_cache"
@@ -1557,18 +1635,18 @@ install_deps() {
     local required_packages
     case "$PKG_MANAGER" in
         apt)
-            required_packages=(curl unzip openssl ca-certificates iproute2 qrencode jq cron)
+            required_packages=(curl unzip tar openssl ca-certificates iproute2 qrencode jq cron)
             ;;
         dnf|yum)
-            required_packages=(curl unzip openssl ca-certificates iproute qrencode jq cronie)
+            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq cronie)
             ;;
         apk)
             # Alpine Linux 特殊包名
             # libqrencode-tools 提供 qrencode 命令
-            required_packages=(curl unzip openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq)
+            required_packages=(curl unzip tar openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq)
             ;;
         *)
-            required_packages=(curl unzip openssl ca-certificates iproute qrencode jq)
+            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq)
             ;;
     esac
 
@@ -1716,6 +1794,125 @@ start_pre() {
 OPENRC_SERVICE
 
     chmod 755 /etc/init.d/xray
+}
+
+# ============== sing-box 安装（AnyTLS 支持） ==============
+
+# 创建 sing-box systemd 服务
+create_singbox_systemd_service() {
+    cat > /etc/systemd/system/sing-box.service <<'UNIT'
+[Unit]
+Description=sing-box service (AnyTLS)
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# 创建 sing-box OpenRC 服务（Alpine）
+create_singbox_openrc_service() {
+    cat > /etc/init.d/sing-box <<'OPENRC_SERVICE'
+#!/sbin/openrc-run
+
+name="sing-box"
+description="sing-box service (AnyTLS)"
+
+command="/usr/local/bin/sing-box"
+command_args="run -c /usr/local/etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+
+depend() {
+    need net
+    after firewall
+}
+OPENRC_SERVICE
+    chmod 755 /etc/init.d/sing-box
+}
+
+# 安装 sing-box（下载官方预编译二进制，适用于所有发行版包括 Alpine）
+# AnyTLS 协议需要 sing-box >= 1.12.0
+install_singbox() {
+    if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
+        log_info "sing-box already installed, skipping..."
+        return 0
+    fi
+
+    log_info "Installing sing-box (required for AnyTLS)..."
+
+    local arch sb_arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)   sb_arch="amd64" ;;
+        aarch64|arm64)  sb_arch="arm64" ;;
+        armv7l|armv7)   sb_arch="armv7" ;;
+        i686|i386)      sb_arch="386" ;;
+        *)
+            log_error "Unsupported architecture for sing-box: $arch"
+            return 1
+            ;;
+    esac
+
+    # 获取最新版本号（安全的 API 解析）
+    local tag version
+    tag=$(fetch_github_release_tag "SagerNet/sing-box")
+    if [[ -z "$tag" ]]; then
+        log_error "Failed to get sing-box latest version"
+        return 1
+    fi
+    version="${tag#v}"
+
+    log_info "Installing sing-box ${tag} (${sb_arch})..."
+
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${version}-linux-${sb_arch}.tar.gz"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    if ! secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
+        log_error "Failed to download sing-box from $download_url"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if ! tar -xzf "${tmp_dir}/sing-box.tar.gz" -C "$tmp_dir" 2>/dev/null; then
+        log_error "Failed to extract sing-box archive"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    local extracted_bin
+    extracted_bin=$(find "$tmp_dir" -type f -name sing-box 2>/dev/null | head -1)
+    if [[ -z "$extracted_bin" ]]; then
+        log_error "sing-box binary not found in archive"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    mkdir -p "$SINGBOX_DIR" /usr/local/bin
+    install -m 755 "$extracted_bin" "$SINGBOX_BIN"
+    rm -rf "$tmp_dir"
+
+    # 创建服务（systemd 或 OpenRC）
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        create_singbox_openrc_service
+    else
+        create_singbox_systemd_service
+    fi
+
+    log_info "sing-box ${tag} installed successfully"
+    return 0
 }
 
 # ============== GeoData 安装 ==============
@@ -2126,6 +2323,10 @@ XHTTP_PATH=""
 SS_METHOD=""
 SS_PASSWORD=""
 
+# AnyTLS 相关变量（协议类型: anytls, anytls_reality）
+ANYTLS_PASSWORD=""
+ANYTLS_PADDING_B64=""
+
 # Shadowsocks 支持的加密方式
 SS_METHODS_2022=(
     "2022-blake3-aes-256-gcm"
@@ -2148,8 +2349,10 @@ prompt_protocol_type() {
     echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
     echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
     echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
+    echo -e "  ${GREEN}5.${NC} AnyTLS                   ${GRAY}(sing-box, 自签名证书)${NC}"
+    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY         ${GRAY}(sing-box, 抗封锁, 推荐)${NC}"
     echo ""
-    echo -n "  请选择 [1-4] (默认 1): "
+    echo -n "  请选择 [1-6] (默认 1): "
     } >/dev/tty
 
     local choice
@@ -2167,6 +2370,14 @@ prompt_protocol_type() {
         4)
             PROTOCOL_TYPE="shadowsocks"
             log_info "已选择: Shadowsocks 2022"
+            ;;
+        5)
+            PROTOCOL_TYPE="anytls"
+            log_info "已选择: AnyTLS"
+            ;;
+        6)
+            PROTOCOL_TYPE="anytls_reality"
+            log_info "已选择: AnyTLS + REALITY"
             ;;
         *)
             PROTOCOL_TYPE="vision"
@@ -2334,6 +2545,24 @@ choose_ports() {
         return 0
     fi
 
+    # AnyTLS 端口
+    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        if [[ -n "${atpt:-}" ]]; then
+            PORT="$atpt"
+        elif [[ -n "${vlpt:-}" ]]; then
+            PORT="$vlpt"
+        else
+            local default_at_port
+            default_at_port=$(gen_random_free_port)
+            PORT=$(prompt_port "AnyTLS 端口" "$default_at_port")
+        fi
+        log_info "AnyTLS 端口: $PORT"
+        XHTTP_PORT=""
+        XHTTP_PATH=""
+        echo "" >/dev/tty
+        return 0
+    fi
+
     # Vision 端口（如果需要）
     if [[ "$PROTOCOL_TYPE" == "vision" || "$PROTOCOL_TYPE" == "both" ]]; then
         if [[ -n "${vlpt:-}" ]]; then
@@ -2424,6 +2653,81 @@ gen_reality_keys() {
     fi
 
     log_info "Keys generated successfully"
+}
+
+# 生成 AnyTLS 密码（32 个十六进制字符 = 128-bit，URI 安全，无需百分号编码）
+gen_anytls_password() {
+    ANYTLS_PASSWORD="${atpwd:-$(openssl rand -hex 16)}"
+    log_info "AnyTLS 密码已生成"
+}
+
+# 生成随机化的 AnyTLS padding scheme（多行字符串，仅输出到 stdout）
+#
+# AnyTLS 通过 padding scheme 在协议层随机化数据包长度，以对抗基于
+# 包长度分布的被动流量识别。官方默认方案是公开且固定的（容易被指纹库收录），
+# 因此这里为每个节点生成独立、随机的方案。服务端方案会在握手时通过
+# cmdUpdatePaddingScheme 自动下发给客户端（当客户端 padding-md5 不一致时），
+# 所以无需客户端做任何额外配置即可生效。
+#
+# 格式: 第一行 stop=N 表示对前 N 个包（0..N-1）应用 padding；
+#       随后每行 idx=seg[,seg...]，seg 为 "min-max"（区间随机长度）或 "c"（checkpoint）。
+gen_anytls_padding() {
+    local stop=$(( RANDOM % 5 + 4 ))   # stop ∈ [4,8]
+    local -a lines
+    lines+=("stop=${stop}")
+
+    # 包 0 为认证包，使用较小的固定长度（模拟 TLS 握手记录）
+    local p0=$(( RANDOM % 70 + 30 ))   # 30..99
+    lines+=("0=${p0}-${p0}")
+
+    local i s segs lo span hi line
+    for (( i = 1; i < stop; i++ )); do
+        segs=$(( RANDOM % 4 + 1 ))     # 每个包 1..4 个分段
+        line="${i}="
+        for (( s = 0; s < segs; s++ )); do
+            lo=$(( RANDOM % 500 + 100 ))   # 100..599
+            span=$(( RANDOM % 700 + 200 )) # 200..899
+            hi=$(( lo + span ))
+            (( hi > 1400 )) && hi=1400     # 控制在 ~MTU 以内，更贴近真实流量
+            if (( s == 0 )); then
+                line+="${lo}-${hi}"
+            elif (( RANDOM % 2 == 0 )); then
+                line+=",c,${lo}-${hi}"     # 以一定概率插入 checkpoint
+            else
+                line+=",${lo}-${hi}"
+            fi
+        done
+        lines+=("$line")
+    done
+
+    printf '%s\n' "${lines[@]}"
+}
+
+# 为 plain AnyTLS 生成自签名证书（客户端使用 insecure=1 连接）
+# Usage: gen_selfsigned_cert NAME CN
+gen_selfsigned_cert() {
+    local name="$1"
+    local cn="${2:-www.bing.com}"
+    mkdir -p "$SINGBOX_CERT_DIR"
+    chmod 700 "$SINGBOX_CERT_DIR"
+    local cert_path="$SINGBOX_CERT_DIR/${name}.crt"
+    local key_path="$SINGBOX_CERT_DIR/${name}.key"
+
+    openssl ecparam -genkey -name prime256v1 -out "$key_path" 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" \
+        -subj "/CN=${cn}" 2>/dev/null
+    chmod 600 "$key_path" "$cert_path"
+}
+
+# 统计 AnyTLS 节点数量
+anytls_node_count() {
+    local count=0 f t
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        [[ "$t" == "anytls" || "$t" == "anytls_reality" ]] && ((count++))
+    done
+    echo "$count"
 }
 
 # 验证 IPv4 地址格式
@@ -3028,6 +3332,30 @@ validate_xray_config() {
     return 0
 }
 
+# 验证 sing-box 配置文件有效性
+validate_singbox_config() {
+    if [[ ! -f "$SINGBOX_CONF" ]]; then
+        log_error "sing-box config not found: $SINGBOX_CONF"
+        return 1
+    fi
+    if [[ ! -s "$SINGBOX_CONF" ]]; then
+        log_error "sing-box config is empty"
+        return 1
+    fi
+    if ! jq . "$SINGBOX_CONF" > /dev/null 2>&1; then
+        log_error "sing-box config contains invalid JSON"
+        return 1
+    fi
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        local test_output
+        if ! test_output=$("$SINGBOX_BIN" check -c "$SINGBOX_CONF" 2>&1); then
+            log_error "sing-box config check failed: $test_output"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 write_config() {
     mkdir -p /usr/local/etc/xray
 
@@ -3066,6 +3394,11 @@ write_config() {
             else
                 n_protocol_type="vision"
             fi
+        fi
+
+        # AnyTLS 节点由 sing-box 处理，Xray 配置中跳过
+        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" ]]; then
+            continue
         fi
 
         # 跳过无效节点（VLESS 需要 UUID，Shadowsocks 需要密码）
@@ -3231,6 +3564,139 @@ EOF
     return 0
 }
 
+# 根据所有 AnyTLS 节点生成 sing-box 配置文件
+write_singbox_config() {
+    mkdir -p "$SINGBOX_DIR"
+
+    local inbounds_json="[]"
+
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+
+        local n_proto
+        n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
+        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" ]] || continue
+
+        local n_name n_port n_sni n_priv n_sid n_pw n_pad_b64 n_pad
+        n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
+        n_port=$(safe_read_config_value "$node_file" "PORT")
+        n_sni=$(safe_read_config_value "$node_file" "SNI")
+        n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
+        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
+        n_pad_b64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
+
+        # 解密可能加密的敏感值
+        n_priv=$(decrypt_value "$n_priv")
+        n_pw=$(decrypt_value "$n_pw")
+
+        [[ -z "$n_pw" ]] && continue
+
+        local validated_port
+        validated_port=$(get_validated_port "$n_port" true)
+        if [[ -z "$validated_port" ]]; then
+            log_warn "Invalid AnyTLS port for node '$n_name', skipping"
+            continue
+        fi
+
+        # 还原 padding scheme（base64 -> 多行文本）；缺失时即时生成一个随机方案
+        n_pad=""
+        if [[ -n "$n_pad_b64" ]]; then
+            n_pad=$(echo "$n_pad_b64" | base64 -d 2>/dev/null)
+        fi
+        [[ -z "$n_pad" ]] && n_pad=$(gen_anytls_padding)
+
+        local inbound
+        if [[ "$n_proto" == "anytls_reality" ]]; then
+            inbound=$(build_anytls_inbound "$n_name" "$validated_port" "$n_pw" "$n_pad" \
+                "reality" "$n_sni" "$n_priv" "$n_sid" "" "")
+        else
+            local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
+            local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
+            # 确保自签名证书存在
+            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+                gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}"
+            fi
+            inbound=$(build_anytls_inbound "$n_name" "$validated_port" "$n_pw" "$n_pad" \
+                "tls" "${n_sni:-www.bing.com}" "" "" "$cert_path" "$key_path")
+        fi
+
+        if [[ -z "$inbound" ]]; then
+            log_error "Failed to build AnyTLS inbound for node '$n_name'"
+            return 1
+        fi
+
+        local new_inbounds
+        if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$inbound" '. += [$inbound]' 2>&1); then
+            inbounds_json="$new_inbounds"
+        else
+            log_error "Failed to add AnyTLS inbound for node '$n_name': $new_inbounds"
+            return 1
+        fi
+    done
+
+    local config_json
+    if ! config_json=$(jq -n \
+        --argjson inbounds "$inbounds_json" \
+        '{
+            "log": {"level": "warn", "timestamp": true},
+            "inbounds": $inbounds,
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+        }' 2>&1); then
+        log_error "Failed to assemble sing-box config: $config_json"
+        return 1
+    fi
+
+    echo "$config_json" > "$SINGBOX_CONF"
+    chmod 600 "$SINGBOX_CONF"
+
+    if ! validate_singbox_config; then
+        log_error "Generated sing-box config is invalid"
+        return 1
+    fi
+
+    return 0
+}
+
+# 同步 sing-box 状态：有 AnyTLS 节点则（安装并）写配置、启动服务；
+# 没有则停止并禁用服务。在添加/删除节点后调用。
+singbox_sync() {
+    local count
+    count=$(anytls_node_count)
+
+    if [[ "$count" -eq 0 ]]; then
+        # 没有 AnyTLS 节点，停止 sing-box（如果存在）
+        if [[ -f "$SINGBOX_BIN" ]]; then
+            service_stop "$SINGBOX_SERVICE"
+            service_disable "$SINGBOX_SERVICE"
+        fi
+        rm -f "$SINGBOX_CONF" 2>/dev/null
+        return 0
+    fi
+
+    # 有 AnyTLS 节点，确保 sing-box 已安装
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        if ! install_singbox; then
+            log_error "Failed to install sing-box"
+            return 1
+        fi
+    fi
+
+    if ! write_singbox_config; then
+        return 1
+    fi
+
+    service_enable "$SINGBOX_SERVICE"
+    service_restart "$SINGBOX_SERVICE"
+
+    sleep 1
+    if ! service_is_active "$SINGBOX_SERVICE"; then
+        log_warn "sing-box service may not have started correctly."
+    fi
+    return 0
+}
+
 # 检查 WARP 是否运行
 check_warp_running() {
     (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) 2>/dev/null
@@ -3252,11 +3718,13 @@ save_env() {
     local save_uuid="$UUID"
     local save_private_key="$PRIVATE_KEY"
     local save_ss_password="${SS_PASSWORD:-}"
+    local save_anytls_password="${ANYTLS_PASSWORD:-}"
 
     if is_encryption_enabled; then
         save_uuid=$(encrypt_value "$UUID")
         save_private_key=$(encrypt_value "$PRIVATE_KEY")
         [[ -n "$save_ss_password" ]] && save_ss_password=$(encrypt_value "$SS_PASSWORD")
+        [[ -n "$save_anytls_password" ]] && save_anytls_password=$(encrypt_value "$ANYTLS_PASSWORD")
     fi
 
     cat > "$node_file" <<ENV
@@ -3275,6 +3743,8 @@ XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
+ANYTLS_PASSWORD=$save_anytls_password
+ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 ENV
     chmod 600 "$node_file"
 
@@ -3330,6 +3800,31 @@ get_ss_link() {
     echo "ss://${userinfo}@${ip_formatted}:${PORT}#${node_label}"
 }
 
+# 生成 AnyTLS 分享链接
+# 格式: anytls://PASSWORD@host:port/?sni=...[&insecure=1 | &pbk=...&sid=...&fp=chrome]#name
+get_anytls_link() {
+    local ip="$1"
+    local node_label="$2"
+    local ip_formatted="$ip"
+
+    # IPv6 需要方括号
+    if [[ "$ip" == *:* ]]; then
+        ip_formatted="[$ip]"
+    fi
+
+    # 密码为十六进制字符串，URI 安全，无需百分号编码
+    local pw="${ANYTLS_PASSWORD}"
+    local sni="${SNI:-www.bing.com}"
+
+    if [[ "${PROTOCOL_TYPE}" == "anytls_reality" ]]; then
+        # REALITY 伪装：携带公钥/short-id/指纹
+        echo "anytls://${pw}@${ip_formatted}:${PORT}/?sni=${sni}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&fp=chrome#${node_label}"
+    else
+        # 自签名证书：客户端需允许不安全连接
+        echo "anytls://${pw}@${ip_formatted}:${PORT}/?sni=${sni}&insecure=1#${node_label}"
+    fi
+}
+
 # 向后兼容的获取分享链接函数
 get_share_link() {
     local node_file
@@ -3344,6 +3839,10 @@ get_share_link() {
     if [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
         get_ss_link "$ip" "${node_label}_SS"
+    elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]] && [[ -n "${ANYTLS_PASSWORD:-}" ]]; then
+        # AnyTLS 节点
+        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
+        get_anytls_link "$ip" "${node_label}_AnyTLS"
     elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
         # XHTTP-only 节点
         get_xhttp_link "$ip" "${node_label}_XHTTP"
@@ -3428,6 +3927,40 @@ show_info() {
             echo ""
             echo -e "  ${YELLOW}Shadowsocks:${NC}"
             echo -e "  $(get_ss_link "$SERVER_IPV6" "${hostname}_SS_v6")"
+        fi
+    elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
+        # AnyTLS 节点显示
+        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
+        echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
+        echo -e "  ${BLUE}Password:${NC}    ${ANYTLS_PASSWORD:-N/A}"
+        if [[ "$proto_type" == "anytls_reality" ]]; then
+            echo -e "  ${BLUE}SNI:${NC}         $SNI"
+            echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
+            echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+            echo -e "  ${BLUE}协议类型:${NC}    AnyTLS + REALITY"
+        else
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}"
+            echo -e "  ${BLUE}协议类型:${NC}    AnyTLS (自签名证书, insecure)"
+        fi
+        echo ""
+
+        # AnyTLS IPv4 链接
+        if [[ -n "${SERVER_IPV4:-}" ]]; then
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv4_links):${NC}"
+            echo ""
+            echo -e "  ${YELLOW}AnyTLS:${NC}"
+            echo -e "  $(get_anytls_link "$SERVER_IPV4" "${hostname}_AnyTLS_v4")"
+        fi
+
+        # AnyTLS IPv6 链接
+        if [[ -n "${SERVER_IPV6:-}" ]]; then
+            echo ""
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv6_links):${NC}"
+            echo ""
+            echo -e "  ${YELLOW}AnyTLS:${NC}"
+            echo -e "  $(get_anytls_link "$SERVER_IPV6" "${hostname}_AnyTLS_v6")"
         fi
     else
         # VLESS 节点显示
@@ -3527,11 +4060,13 @@ cmd_install() {
 
     # 选择协议类型（除非通过环境变量指定）
     if [[ -n "${proto:-}" ]]; then
-        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss
+        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality
         case "$proto" in
             xhttp) PROTOCOL_TYPE="xhttp" ;;
             both) PROTOCOL_TYPE="both" ;;
             shadowsocks|ss) PROTOCOL_TYPE="shadowsocks" ;;
+            anytls) PROTOCOL_TYPE="anytls" ;;
+            anytls-reality|anytls_reality|anytlsreality) PROTOCOL_TYPE="anytls_reality" ;;
             *) PROTOCOL_TYPE="vision" ;;
         esac
         log_info "协议类型: $PROTOCOL_TYPE"
@@ -3573,6 +4108,36 @@ cmd_install() {
         PUBLIC_KEY=""
         PRIVATE_KEY=""
         SHORT_ID=""
+    elif [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        # AnyTLS 安装流程（基于 sing-box）
+        install_singbox || { log_error "sing-box 安装失败"; return 1; }
+
+        # SNI: REALITY 节点需要真实可达域名；plain 节点仅作为标签/证书 CN
+        if [[ -n "${reym:-}" ]]; then
+            SNI="$reym"
+            log_info "$(msg using_sni): $SNI"
+        elif [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+            rm -f "$CACHE_FILE" 2>/dev/null
+            select_best_sni
+        else
+            SNI="www.bing.com"
+        fi
+
+        choose_ports
+
+        # 生成密码与随机化 padding scheme
+        gen_anytls_password
+        ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
+        log_info "已生成随机化 AnyTLS padding scheme"
+
+        if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+            gen_reality_keys
+        else
+            UUID=""
+            PUBLIC_KEY=""
+            PRIVATE_KEY=""
+            SHORT_ID=""
+        fi
     else
         # VLESS 安装流程
         # 安装时清除 SNI 缓存，强制重新测试
@@ -3595,23 +4160,41 @@ cmd_install() {
 
     save_env
 
-    # 生成配置文件，如果失败则回滚
-    if ! write_config; then
-        log_error "Failed to generate Xray config, rolling back..."
-        # 删除刚保存的节点配置
-        local node_file
-        node_file=$(get_node_file "$CURRENT_NODE_NAME")
-        rm -f "$node_file" 2>/dev/null
-        return 1
-    fi
+    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        # AnyTLS 节点：由 sing-box 处理
+        # plain AnyTLS 需要自签名证书
+        if [[ "$PROTOCOL_TYPE" == "anytls" ]]; then
+            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+        fi
 
-    service_enable xray
-    service_restart xray
+        if ! singbox_sync; then
+            log_error "Failed to configure sing-box, rolling back..."
+            local node_file
+            node_file=$(get_node_file "$CURRENT_NODE_NAME")
+            rm -f "$node_file" 2>/dev/null
+            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+            singbox_sync  # 重新同步以反映回滚
+            return 1
+        fi
+    else
+        # 生成 Xray 配置文件，如果失败则回滚
+        if ! write_config; then
+            log_error "Failed to generate Xray config, rolling back..."
+            # 删除刚保存的节点配置
+            local node_file
+            node_file=$(get_node_file "$CURRENT_NODE_NAME")
+            rm -f "$node_file" 2>/dev/null
+            return 1
+        fi
 
-    # 验证服务启动成功
-    sleep 1
-    if ! service_is_active xray; then
-        log_warn "Xray service may not have started correctly. Run 'xray health' to check."
+        service_enable xray
+        service_restart xray
+
+        # 验证服务启动成功
+        sleep 1
+        if ! service_is_active xray; then
+            log_warn "Xray service may not have started correctly. Run 'xray health' to check."
+        fi
     fi
 
     log_info "$(msg install_complete)"
@@ -3689,6 +4272,12 @@ cmd_list() {
         if [[ "$proto" == "shadowsocks" ]]; then
             echo -e "     Port: $display_port | Method: ${SS_METHOD:-N/A}"
             echo -e "     Password: ${SS_PASSWORD:0:12}..."
+        elif [[ "$proto" == "anytls" || "$proto" == "anytls_reality" ]]; then
+            local at_label="AnyTLS"
+            [[ "$proto" == "anytls_reality" ]] && at_label="AnyTLS + REALITY"
+            echo -e "     Port: $display_port | Type: $at_label"
+            echo -e "     Password: ${ANYTLS_PASSWORD:0:12}..."
+            [[ "$proto" == "anytls_reality" ]] && echo -e "     SNI: $SNI"
         else
             echo -e "     Port: $display_port | SNI: $SNI"
             echo -e "     UUID: ${UUID:0:8}..."
@@ -3714,6 +4303,15 @@ cmd_status() {
         echo -e "  Xray: ${GREEN}● Running${NC}"
     else
         echo -e "  Xray: ${RED}○ Stopped${NC}"
+    fi
+
+    # sing-box（AnyTLS）状态：仅在已安装时显示
+    if [[ -f "$SINGBOX_BIN" ]]; then
+        if service_is_active "$SINGBOX_SERVICE"; then
+            echo -e "  sing-box (AnyTLS): ${GREEN}● Running${NC}"
+        else
+            echo -e "  sing-box (AnyTLS): ${RED}○ Stopped${NC}"
+        fi
     fi
 
     local node_count
@@ -3780,6 +4378,11 @@ cmd_regenerate() {
         return 1
     fi
 
+    # 同步 sing-box（AnyTLS）配置
+    if ! singbox_sync; then
+        log_warn "sing-box config sync failed"
+    fi
+
     # 清理备份
     rm -f "${XRAY_CONF}.bak" 2>/dev/null
     return 0
@@ -3805,13 +4408,18 @@ cmd_remove() {
     fi
 
     rm -f "$node_file"
+    # 清理可能存在的 AnyTLS 自签名证书
+    rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
     log_info "Node '$CURRENT_NODE_NAME' removed"
 
     # 重新生成 xray 配置
     write_config
     service_restart xray
 
-    log_info "Xray config updated"
+    # 同步 sing-box（AnyTLS）配置：无 AnyTLS 节点时会自动停止服务
+    singbox_sync
+
+    log_info "Config updated"
 }
 
 cmd_uninstall() {
@@ -3838,6 +4446,18 @@ cmd_uninstall() {
             rm -f "$tmp_installer"
         fi
     fi
+
+    # 卸载 sing-box（AnyTLS）
+    if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
+        service_stop "$SINGBOX_SERVICE"
+        service_disable "$SINGBOX_SERVICE"
+        rm -f "$SINGBOX_BIN"
+        rm -rf "$SINGBOX_DIR"
+        rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box
+        rm -f /var/log/sing-box.log
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
     log_info "$(msg uninstall_complete)"
 }
 
@@ -3891,6 +4511,16 @@ cmd_health() {
         all_ok=false
     fi
 
+    # 1b. 检查 sing-box（AnyTLS）服务状态（仅当存在 AnyTLS 节点时校验）
+    if [[ "$(anytls_node_count)" -gt 0 ]]; then
+        if service_is_active "$SINGBOX_SERVICE"; then
+            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS)"
+        else
+            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS)"
+            all_ok=false
+        fi
+    fi
+
     # 2. 检查节点数量
     local node_count
     node_count=$(count_nodes)
@@ -3940,6 +4570,15 @@ cmd_health() {
                 echo -e "    ${GREEN}✓${NC} XHTTP port $n_xhttp_port is listening"
             else
                 echo -e "    ${RED}✗${NC} XHTTP port $n_xhttp_port is not listening"
+                all_ok=false
+            fi
+        fi
+
+        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" ]] && [[ -n "$n_port" ]]; then
+            if ss -lnt | grep -qE ":${n_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} AnyTLS port $n_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} AnyTLS port $n_port is not listening"
                 all_ok=false
             fi
         fi
@@ -5849,8 +6488,9 @@ show_help() {
     echo ""
     echo "Optional parameters (for install):"
     echo "  name=xxx      Specify node name"
-    echo "  reym=xxx      Specify SNI domain (VLESS only)"
-    echo "  proto=xxx     Protocol type: vision, xhttp, both, or shadowsocks"
+    echo "  reym=xxx      Specify SNI domain (VLESS / AnyTLS+REALITY)"
+    echo "  proto=xxx     Protocol type: vision, xhttp, both, shadowsocks,"
+    echo "                anytls, or anytls-reality"
     echo "  vlpt=xxx      Specify Vision port (for vision/both)"
     echo "  xhpt=xxx      Specify XHTTP port (for xhttp/both)"
     echo "  uuid=xxx      Specify UUID (VLESS only)"
@@ -5861,6 +6501,11 @@ show_help() {
     echo "  sspwd=xxx     Specify password (auto-generated if not set)"
     echo "  sspt=xxx      Specify Shadowsocks port"
     echo "  xhttp=true    (deprecated) Same as proto=both"
+    echo ""
+    echo "AnyTLS parameters (powered by sing-box; Xray does not support AnyTLS):"
+    echo "  atpt=xxx      Specify AnyTLS port"
+    echo "  atpwd=xxx     Specify AnyTLS password (auto-generated if not set)"
+    echo "                Padding scheme is randomized per node and auto-pushed to clients"
     echo ""
     echo "Periodic Xray restart (optional, non-interactive):"
     echo "  restart=daily   Daily restart (04:00)"
@@ -5875,6 +6520,8 @@ show_help() {
     echo "  name=hk1 bash $0 install                   # Add Vision node with name"
     echo "  name=jp1 proto=xhttp bash $0 install       # Add XHTTP only node"
     echo "  name=sg1 proto=both bash $0 install        # Add Vision + XHTTP node"
+    echo "  name=at1 proto=anytls bash $0 install      # Add AnyTLS node (self-signed)"
+    echo "  name=ar1 proto=anytls-reality bash $0 install  # Add AnyTLS + REALITY node"
     echo "  bash $0 tools                              # System tools menu"
     echo "  bash $0 ports                              # Port management"
     echo "  bash $0 logs                               # Log viewer"
