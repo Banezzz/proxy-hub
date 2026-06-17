@@ -8,6 +8,12 @@
 - **VLESS + Vision + REALITY** - TCP 传输，推荐
 - **VLESS + XHTTP + REALITY** - XHTTP 传输，更好的伪装
 - **Shadowsocks 2022** - 高性能 SS 协议，支持多种加密方式
+- **AnyTLS** - 基于 sing-box 的抗 "TLS in TLS" 检测协议，自签名证书
+- **AnyTLS + REALITY** - AnyTLS 叠加 REALITY 伪装，抗封锁能力更强（推荐）
+
+> AnyTLS 由 sing-box 提供（Xray 暂不支持 AnyTLS），脚本会在添加 AnyTLS 节点时
+> 自动安装并管理 sing-box，与 Xray 各自独立运行、互不影响。每个 AnyTLS 节点都会
+> 生成**独立、随机化的 padding scheme**，服务端在握手时自动下发给客户端，无需客户端额外配置。
 
 ### 核心功能
 - **多节点支持** - 同时运行多个节点，独立配置
@@ -99,6 +105,8 @@ chmod +x proxy-hub.sh
   2. VLESS + XHTTP + REALITY   (XHTTP 传输)
   3. 两个都安装               (生成两个端口)
   4. Shadowsocks 2022         (SS 协议, 高性能)
+  5. AnyTLS                   (sing-box, 自签名证书)
+  6. AnyTLS + REALITY         (sing-box, 抗封锁, 推荐)
 ```
 
 ### Shadowsocks 加密方式
@@ -152,6 +160,12 @@ name=sg1 proto=both vlpt=443 xhpt=8443 ./proxy-hub.sh install
 # Shadowsocks 2022 节点
 name=us1 proto=shadowsocks sspt=8388 ./proxy-hub.sh install
 
+# AnyTLS 节点 (自签名证书)
+name=at1 proto=anytls atpt=8443 ./proxy-hub.sh install
+
+# AnyTLS + REALITY 节点 (推荐)
+name=ar1 proto=anytls-reality atpt=443 reym=www.microsoft.com ./proxy-hub.sh install
+
 # 指定 UUID (VLESS)
 uuid=your-custom-uuid ./proxy-hub.sh install
 
@@ -164,11 +178,13 @@ name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `name` | 节点名称 | `name=hk1` |
-| `proto` | 协议类型 | `proto=vision/xhttp/both/shadowsocks` |
+| `proto` | 协议类型 | `proto=vision/xhttp/both/shadowsocks/anytls/anytls-reality` |
 | `vlpt` | Vision 端口 | `vlpt=443` |
 | `xhpt` | XHTTP 端口 | `xhpt=8443` |
 | `sspt` | Shadowsocks 端口 | `sspt=8388` |
-| `reym` | SNI 域名 | `reym=www.microsoft.com` |
+| `atpt` | AnyTLS 端口 | `atpt=8443` |
+| `atpwd` | AnyTLS 密码 (默认随机) | `atpwd=xxxxxxxx` |
+| `reym` | SNI 域名 (VLESS / AnyTLS+REALITY) | `reym=www.microsoft.com` |
 | `uuid` | 自定义 UUID | `uuid=xxx-xxx-xxx` |
 
 ## 系统工具
@@ -344,6 +360,38 @@ ShortID: xxxxxxxx
 密码: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
+### AnyTLS
+
+```
+协议: AnyTLS
+地址: your.server.ip
+端口: 8443
+密码: xxxxxxxxxxxxxxxx
+SNI: www.bing.com
+允许不安全 (insecure): 是   # 自签名证书
+```
+
+分享链接格式：`anytls://密码@地址:端口/?sni=域名&insecure=1#名称`
+
+### AnyTLS + REALITY
+
+```
+协议: AnyTLS
+地址: your.server.ip
+端口: 443
+密码: xxxxxxxxxxxxxxxx
+SNI: www.microsoft.com
+PublicKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ShortID: xxxxxxxx
+Fingerprint: chrome
+```
+
+分享链接格式：`anytls://密码@地址:端口/?sni=域名&pbk=公钥&sid=ShortID&fp=chrome#名称`
+
+> AnyTLS 需要支持该协议的客户端：[sing-box](https://github.com/SagerNet/sing-box)、
+> [mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo)、NekoBox 等。
+> 旧版 v2rayN/v2rayNG（仅 Xray 内核）不支持 AnyTLS。
+
 ### 推荐客户端
 
 | 平台 | 客户端 |
@@ -415,6 +463,12 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 是的，所有节点配置在同一个 Xray 配置文件中作为多个 inbounds，共用一个 Xray 进程。
 
 ## 更新日志
+
+### v5.1.0
+- 新增 **AnyTLS** 与 **AnyTLS + REALITY** 协议支持（基于 sing-box）
+- 每个 AnyTLS 节点生成独立、随机化的 padding scheme，握手时自动下发给客户端
+- sing-box 按需自动安装/卸载，与 Xray 独立运行（systemd / OpenRC 双支持）
+- 节点列表、状态、健康检查、二维码、分享链接均已适配 AnyTLS
 
 ### v5.0.0
 - 项目重命名为 Proxy Hub
