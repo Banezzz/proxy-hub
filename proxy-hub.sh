@@ -4679,73 +4679,67 @@ cmd_update_ip() {
     [[ -n "$current_ipv6" ]] && echo -e "  ${BLUE}$(msg update_ip_current) IPv6:${NC} $current_ipv6"
     echo ""
 
-    # 读取第一个节点的存储 IP 作为比较基准
-    local stored_ipv4="" stored_ipv6=""
-    for node_file in "$NODES_DIR"/*.env; do
-        [[ -f "$node_file" ]] || continue
-        stored_ipv4=$(safe_read_config_value "$node_file" "SERVER_IPV4")
-        # 向后兼容：如果没有 SERVER_IPV4，使用 SERVER_IP
-        [[ -z "$stored_ipv4" ]] && stored_ipv4=$(safe_read_config_value "$node_file" "SERVER_IP")
-        stored_ipv6=$(safe_read_config_value "$node_file" "SERVER_IPV6")
-        break
-    done
-
-    [[ -n "$stored_ipv4" ]] && echo -e "  ${BLUE}$(msg update_ip_stored) IPv4:${NC} $stored_ipv4"
-    [[ -n "$stored_ipv6" ]] && echo -e "  ${BLUE}$(msg update_ip_stored) IPv6:${NC} ${stored_ipv6:-N/A}"
-    echo ""
-
-    # 比较 IP 是否变更
-    local ipv4_changed=false ipv6_changed=false
-
-    if [[ -n "$current_ipv4" ]] && [[ "$current_ipv4" != "$stored_ipv4" ]]; then
-        ipv4_changed=true
-    fi
-    if [[ -n "$current_ipv6" ]] && [[ "$current_ipv6" != "$stored_ipv6" ]]; then
-        ipv6_changed=true
-    fi
-
-    if ! $ipv4_changed && ! $ipv6_changed; then
-        echo -e "  ${GREEN}✓${NC} $(msg update_ip_no_change)"
-        echo ""
-        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-        return 0
-    fi
-
-    # 显示变更详情
-    echo -e "  ${YELLOW}⚠${NC} $(msg update_ip_changed)"
-    $ipv4_changed && echo -e "    IPv4: ${RED}$stored_ipv4${NC} → ${GREEN}$current_ipv4${NC}"
-    $ipv6_changed && echo -e "    IPv6: ${RED}${stored_ipv6:-N/A}${NC} → ${GREEN}$current_ipv6${NC}"
-    echo ""
-
-    # 更新所有节点的 .env 文件
+    # 逐节点对比并更新各自存储的 IP。
+    #
+    # 旧实现以"第一个节点"的存储 IP 作为全局基准来判断是否变更：当基准节点
+    # 恰好已经是新 IP（例如在换 IP 之后才新增的节点排在最前）时，会被误判为
+    # "无变化"而提前返回，导致换 IP 之前就存在的旧节点不会被同步，其分享链接
+    # 仍显示旧 IP。这里改为对每个节点用其自身存储的 IP 单独比较与更新。
     log_info "$(msg update_ip_updating)"
     local updated_count=0
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
-        local n_name
+        local n_name n_v4 n_v6 n_changed detail
         n_name=$(basename "$node_file" .env)
+        n_v4=$(safe_read_config_value "$node_file" "SERVER_IPV4")
+        # 向后兼容：没有 SERVER_IPV4 时回退到 SERVER_IP
+        [[ -z "$n_v4" ]] && n_v4=$(safe_read_config_value "$node_file" "SERVER_IP")
+        n_v6=$(safe_read_config_value "$node_file" "SERVER_IPV6")
+        n_changed=false
+        detail=""
 
-        if $ipv4_changed && [[ -n "$current_ipv4" ]]; then
-            # 更新 SERVER_IP（向后兼容字段）
+        # IPv4：仅当检测到当前 IPv4 且与该节点存储值不同时才更新
+        if [[ -n "$current_ipv4" ]] && [[ "$current_ipv4" != "$n_v4" ]]; then
             if grep -q "^SERVER_IP=" "$node_file"; then
                 sed -i "s|^SERVER_IP=.*|SERVER_IP=${current_ipv4}|" "$node_file"
+            else
+                echo "SERVER_IP=${current_ipv4}" >> "$node_file"
             fi
-            # 更新 SERVER_IPV4
             if grep -q "^SERVER_IPV4=" "$node_file"; then
                 sed -i "s|^SERVER_IPV4=.*|SERVER_IPV4=${current_ipv4}|" "$node_file"
+            else
+                echo "SERVER_IPV4=${current_ipv4}" >> "$node_file"
             fi
+            detail+="\n    IPv4: ${RED}${n_v4:-N/A}${NC} → ${GREEN}${current_ipv4}${NC}"
+            n_changed=true
         fi
 
-        if $ipv6_changed && [[ -n "$current_ipv6" ]]; then
+        # IPv6：同理
+        if [[ -n "$current_ipv6" ]] && [[ "$current_ipv6" != "$n_v6" ]]; then
             if grep -q "^SERVER_IPV6=" "$node_file"; then
                 sed -i "s|^SERVER_IPV6=.*|SERVER_IPV6=${current_ipv6}|" "$node_file"
+            else
+                echo "SERVER_IPV6=${current_ipv6}" >> "$node_file"
             fi
+            detail+="\n    IPv6: ${RED}${n_v6:-N/A}${NC} → ${GREEN}${current_ipv6}${NC}"
+            n_changed=true
         fi
 
-        echo -e "  ${GREEN}✓${NC} $(msg update_ip_node_updated): $n_name"
-        updated_count=$((updated_count + 1))
+        if $n_changed; then
+            echo -e "  ${GREEN}✓${NC} $(msg update_ip_node_updated): ${n_name}${detail}"
+            updated_count=$((updated_count + 1))
+        fi
     done
+
+    # 所有节点的 IP 均已是最新，无需任何更新
+    if [[ $updated_count -eq 0 ]]; then
+        echo ""
+        echo -e "  ${GREEN}✓${NC} $(msg update_ip_no_change)"
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        return 0
+    fi
 
     echo ""
     log_info "$(msg update_ip_done) ($updated_count)"
