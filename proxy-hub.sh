@@ -1107,6 +1107,7 @@ msg() {
             "config_not_found") echo "Configuration not found, please install first" ;;
             "run_as_root") echo "Please run this script as root" ;;
             "node_info") echo "VLESS Reality Vision Node Info" ;;
+            "node_info_suffix") echo "Node Info" ;;
             "server_addr") echo "Server Address" ;;
             "port") echo "Port" ;;
             "share_link") echo "Share Link" ;;
@@ -1289,6 +1290,7 @@ msg() {
             "config_not_found") echo "未找到配置文件，请先运行安装" ;;
             "run_as_root") echo "请使用 root 用户运行此脚本" ;;
             "node_info") echo "VLESS Reality Vision 节点信息" ;;
+            "node_info_suffix") echo "节点信息" ;;
             "server_addr") echo "服务器地址" ;;
             "port") echo "端口" ;;
             "share_link") echo "分享链接" ;;
@@ -3875,6 +3877,20 @@ show_qrcode() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+# 在 63 宽的标题框内居中输出（近似处理 CJK 双宽字符：显示宽度≈(字符数+字节数)/2）
+_center_title() {
+    local text="$1"
+    local total=63 chars bytes width pad pad_str
+    chars=$(printf '%s' "$text" | wc -m 2>/dev/null || echo 0)
+    bytes=$(printf '%s' "$text" | wc -c 2>/dev/null || echo 0)
+    [[ "${chars:-0}" -le 0 ]] && chars=${#text}
+    width=$(( (chars + bytes) / 2 ))
+    pad=$(( (total - width) / 2 ))
+    (( pad < 0 )) && pad=0
+    pad_str=$(printf '%*s' "$pad" '')
+    echo -e "${GREEN}${pad_str}${text}${NC}"
+}
+
 show_info() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
@@ -3884,12 +3900,26 @@ show_info() {
     local hostname
     hostname=$(hostname 2>/dev/null || echo "server")
 
+    # 协议类型与人类可读名称（用于标题与协议字段）
+    local proto_type="${PROTOCOL_TYPE:-both}"
+    local proto_label
+    case "$proto_type" in
+        vision)          proto_label="VLESS Vision + REALITY" ;;
+        xhttp)           proto_label="VLESS XHTTP + REALITY" ;;
+        both)            proto_label="VLESS Vision + XHTTP + REALITY" ;;
+        shadowsocks)     proto_label="Shadowsocks 2022" ;;
+        anytls)          proto_label="AnyTLS" ;;
+        anytls_reality)  proto_label="AnyTLS + REALITY" ;;
+        *)               proto_label="$proto_type" ;;
+    esac
+
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                     $(msg node_info)${NC}"
+    _center_title "${proto_label}  $(msg node_info_suffix)"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "  ${BLUE}Node Name:${NC}   ${NODE_NAME:-$CURRENT_NODE_NAME}"
+    echo -e "  ${BLUE}协议类型:${NC}    $proto_label"
     if [[ -n "${SERVER_IPV4:-}" ]]; then
         echo -e "  ${BLUE}IPv4:${NC}        $SERVER_IPV4"
     fi
@@ -3900,14 +3930,12 @@ show_info() {
         echo -e "  ${BLUE}$(msg server_addr):${NC} ${SERVER_IP:-N/A}"
     fi
 
-    local proto_type="${PROTOCOL_TYPE:-both}"
-
     # Shadowsocks 节点显示不同信息
     if [[ "$proto_type" == "shadowsocks" ]]; then
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
         echo -e "  ${BLUE}Method:${NC}      ${SS_METHOD:-N/A}"
         echo -e "  ${BLUE}Password:${NC}    ${SS_PASSWORD:-N/A}"
-        echo -e "  ${BLUE}协议类型:${NC}    Shadowsocks"
+        echo -e "  ${BLUE}Network:${NC}     tcp,udp"
         echo ""
 
         # Shadowsocks IPv4 链接
@@ -3933,14 +3961,31 @@ show_info() {
         ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
         echo -e "  ${BLUE}Password:${NC}    ${ANYTLS_PASSWORD:-N/A}"
+        echo -e "  ${BLUE}Transport:${NC}   AnyTLS (sing-box)"
         if [[ "$proto_type" == "anytls_reality" ]]; then
+            echo -e "  ${BLUE}Security:${NC}    reality"
             echo -e "  ${BLUE}SNI:${NC}         $SNI"
             echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
             echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
-            echo -e "  ${BLUE}协议类型:${NC}    AnyTLS + REALITY"
+            echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         else
-            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}"
-            echo -e "  ${BLUE}协议类型:${NC}    AnyTLS (自签名证书, insecure)"
+            echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}  ${GRAY}(证书 CN / cert CN)${NC}"
+            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(客户端需允许不安全连接)${NC}"
+        fi
+
+        # Padding scheme（base64 解码后展示）：每个节点随机生成，握手时自动下发给客户端
+        local at_pad_b64 at_pad_text
+        at_pad_b64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
+        if [[ -n "$at_pad_b64" ]]; then
+            at_pad_text=$(echo "$at_pad_b64" | base64 -d 2>/dev/null)
+        fi
+        if [[ -n "${at_pad_text:-}" ]]; then
+            echo -e "  ${BLUE}Padding:${NC}     ${GRAY}(随机化, 握手时自动下发客户端, 无需客户端配置)${NC}"
+            local pline
+            while IFS= read -r pline; do
+                [[ -n "$pline" ]] && echo -e "      ${GRAY}${pline}${NC}"
+            done <<< "$at_pad_text"
         fi
         echo ""
 
@@ -3964,18 +4009,19 @@ show_info() {
         fi
     else
         # VLESS 节点显示
-        # 根据协议类型显示端口
+        # 根据协议类型显示端口（含传输层细节）
         if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
-            echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT"
+            echo -e "  ${BLUE}$(msg vision_port):${NC}  $PORT  ${GRAY}(network=tcp, flow=xtls-rprx-vision)${NC}"
         fi
         if [[ "$proto_type" == "xhttp" || "$proto_type" == "both" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
-            echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT"
+            echo -e "  ${BLUE}$(msg xhttp_port):${NC}   $XHTTP_PORT  ${GRAY}(network=xhttp, path=${XHTTP_PATH:-/})${NC}"
         fi
         echo -e "  ${BLUE}UUID:${NC}        $UUID"
+        echo -e "  ${BLUE}Security:${NC}    reality"
         echo -e "  ${BLUE}SNI:${NC}         $SNI"
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
-        echo -e "  ${BLUE}协议类型:${NC}    $proto_type"
+        echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 
         # IPv4 链接
