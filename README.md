@@ -464,6 +464,14 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ## 更新日志
 
+### v5.2.0
+- 按需安装代理内核：在选择协议类型之后才安装对应内核
+  （VLESS/Shadowsocks → Xray，AnyTLS → sing-box），不再默认安装 Xray
+- AnyTLS + REALITY 的密钥改用 sing-box 生成，AnyTLS 节点完全无需 Xray
+- 不再默认下载 GeoIP/GeoSite 数据库；默认路由用显式私网 CIDR 替代
+  `geoip:private`（保留拦截内网/环回的安全策略），仅在启用 WARP 分流时
+  才按需下载 GeoSite 数据库
+
 ### v5.1.1
 - 修复「更新节点 IP」只按首个节点判断是否变更，导致换 IP 前已存在的旧节点
   不被同步（分享链接仍显示旧 IP）的问题，改为逐节点独立比较与更新

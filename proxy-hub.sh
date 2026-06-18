@@ -1919,6 +1919,15 @@ install_singbox() {
 
 # ============== GeoData 安装 ==============
 
+# 按需确保 GeoIP/GeoSite 数据库存在（仅 WARP 分流的 geosite 规则需要）。
+# 已存在则跳过，避免无谓的重复下载。
+ensure_geodata() {
+    if [[ -f "$XRAY_GEODATA_DIR/geoip.dat" ]] && [[ -f "$XRAY_GEODATA_DIR/geosite.dat" ]]; then
+        return 0
+    fi
+    install_geodata
+}
+
 install_geodata() {
     log_info "$(msg install_geodata)"
 
@@ -2605,9 +2614,18 @@ choose_ports() {
 gen_reality_keys() {
     log_info "$(msg gen_keys)"
     local KEYS
-    # tr -d '\r' 防止部分 xray 输出 CRLF 行尾导致密钥末尾混入 \r,
+    # tr -d '\r' 防止部分内核输出 CRLF 行尾导致密钥末尾混入 \r,
     # 进而被 safe_read_config_value 的字符白名单判定为 "unsafe value".
-    KEYS="$("$XRAY_BIN" x25519 | tr -d '\r')"
+    # 优先使用已安装的 xray (x25519)，否则回退到 sing-box (generate reality-keypair)。
+    # 两者输出的 X25519 密钥格式互相兼容，AnyTLS 节点因此无需安装 xray。
+    if [[ -x "$XRAY_BIN" ]]; then
+        KEYS="$("$XRAY_BIN" x25519 | tr -d '\r')"
+    elif [[ -x "$SINGBOX_BIN" ]]; then
+        KEYS="$("$SINGBOX_BIN" generate reality-keypair | tr -d '\r')"
+    else
+        log_error "需要 xray 或 sing-box 来生成 REALITY 密钥"
+        return 1
+    fi
 
     # 提取私钥. 兼容多种 xray 版本输出标签:
     #   "PrivateKey: xxx"          (现代版本)
@@ -3514,7 +3532,7 @@ write_config() {
 {
   "domainStrategy": "IPIfNonMatch",
   "rules": [
-    {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+    {"type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
     {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
   ]
 }
@@ -4085,9 +4103,10 @@ cmd_install() {
 
     log_info "$(msg installing)"
 
+    # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
+    # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
+    # GeoIP/GeoSite 数据库不再默认下载，仅在启用 WARP 分流时才按需获取。
     install_deps
-    install_xray
-    install_geodata
 
     # 交互式输入节点名称（或使用环境变量 name=xxx）
     if [[ -n "${name:-}" ]]; then
@@ -4125,6 +4144,17 @@ cmd_install() {
     else
         prompt_protocol_type
     fi
+
+    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS 用 sing-box
+    # （sing-box 在下方 AnyTLS 分支中安装，便于复用安装失败的回滚处理）
+    case "$PROTOCOL_TYPE" in
+        anytls|anytls_reality)
+            : # sing-box 在 AnyTLS 分支中安装
+            ;;
+        *)
+            install_xray || { log_error "Xray 安装失败"; return 1; }
+            ;;
+    esac
 
     # Shadowsocks 和 VLESS 的安装流程不同
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
@@ -4876,6 +4906,8 @@ warp_toggle_netflix() {
         rm -f /root/.warp_netflix
         log_info "Netflix routing disabled"
     else
+        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库
+        ensure_geodata
         touch /root/.warp_netflix
         log_info "Netflix routing enabled"
     fi
@@ -4895,6 +4927,8 @@ warp_toggle_ai() {
         rm -f /root/.warp_ai
         log_info "AI services routing disabled"
     else
+        # 分流规则使用 geosite:openai/anthropic，需要 GeoSite 数据库
+        ensure_geodata
         touch /root/.warp_ai
         log_info "AI services routing enabled"
     fi
