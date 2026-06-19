@@ -1131,6 +1131,9 @@ msg() {
             "sni_top_results") echo "Top 5 Fastest Domains" ;;
             "sni_auto_select") echo "Auto select best" ;;
             "sni_manual_input") echo "Enter custom domain" ;;
+            "sni_custom_test") echo "Test custom domains (comma-separated)" ;;
+            "sni_custom_test_hint") echo "Enter domains to test, comma-separated (e.g. a.com,b.com,c.com)" ;;
+            "sni_custom_test_done") echo "Custom domain test done, select from the results above" ;;
             "sni_choice_prompt") echo "Your choice" ;;
             "sni_no_results") echo "No test results available" ;;
             "sni_use_default") echo "Use default" ;;
@@ -1314,6 +1317,9 @@ msg() {
             "sni_top_results") echo "延迟最低的 5 个域名" ;;
             "sni_auto_select") echo "自动选择最佳" ;;
             "sni_manual_input") echo "输入自定义域名" ;;
+            "sni_custom_test") echo "测试自定义域名（逗号分隔多个）" ;;
+            "sni_custom_test_hint") echo "输入要测试的域名，用逗号分隔（如 a.com,b.com,c.com）" ;;
+            "sni_custom_test_done") echo "自定义域名测试完成，请从上方结果中选择" ;;
             "sni_choice_prompt") echo "请选择" ;;
             "sni_no_results") echo "没有可用的测试结果" ;;
             "sni_use_default") echo "使用默认" ;;
@@ -3194,95 +3200,164 @@ select_best_sni() {
 # 让用户选择 SNI 的交互函数
 # 参数1: top_domains 数组名称
 # 参数2: top_latencies 数组名称
-prompt_sni_choice() {
-    local -n _top_domains=$1 2>/dev/null || true
-    local -n _top_latencies=$2 2>/dev/null || true
-    local has_results=false
-
-    if [[ ${#_top_domains[@]} -gt 0 ]] 2>/dev/null; then
-        has_results=true
-    fi
+# 测试用户手动输入的逗号分隔域名列表，把排序后的结果写入传入的两个数组
+# 用法: _run_custom_sni_test OUT_DOMAINS_ARR OUT_LATENCIES_ARR
+_run_custom_sni_test() {
+    local -n _out_domains=$1
+    local -n _out_lats=$2
 
     {
     echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                     $(msg sni_selection_title)${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-
-    if $has_results; then
-        echo -e "  ${BLUE}$(msg sni_top_results):${NC}"
-        echo ""
-        local i=1
-        for idx in "${!_top_domains[@]}"; do
-            printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${_top_domains[$idx]}" "${_top_latencies[$idx]}"
-            ((i++))
-        done
-        echo ""
-        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-        echo ""
-        echo -e "  ${GREEN}A.${NC} $(msg sni_auto_select) (${_top_domains[0]})"
-        echo -e "  ${GREEN}M.${NC} $(msg sni_manual_input)"
-        echo ""
-        echo -n "  $(msg sni_choice_prompt) [A/1-5/M]: "
-    else
-        echo -e "  ${YELLOW}$(msg sni_no_results)${NC}"
-        echo ""
-        echo -e "  ${GREEN}D.${NC} $(msg sni_use_default) (www.tesla.com)"
-        echo -e "  ${GREEN}M.${NC} $(msg sni_manual_input)"
-        echo ""
-        echo -n "  $(msg sni_choice_prompt) [D/M]: "
-    fi
+    echo -e "  ${CYAN}$(msg sni_custom_test_hint)${NC}"
+    echo -n "  > "
     } >/dev/tty
 
-    read -r choice </dev/tty
+    local raw
+    read -r raw </dev/tty
 
-    # 处理用户选择
-    choice=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
+    # 按逗号分隔解析，逐个清洗并校验域名格式
+    local -a parts=() domains=()
+    IFS=',' read -ra parts <<< "$raw"
+    local part
+    for part in "${parts[@]}"; do
+        part=$(echo "$part" | sed 's#^https\?://##; s#/.*$##' | tr -d '[:space:]')
+        [[ -n "$part" ]] || continue
+        if [[ "$part" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
+            domains+=("$part")
+        else
+            log_warn "$(msg sni_invalid_format): $part"
+        fi
+    done
 
-    if $has_results; then
-        case "$choice" in
-            A|"")
-                # 自动选择最佳
-                SNI="${_top_domains[0]}"
-                log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${_top_latencies[0]}ms)"
-                ;;
-            1|2|3|4|5)
-                # 从 Top 5 中选择
-                local idx=$((choice - 1))
-                if [[ $idx -lt ${#_top_domains[@]} ]]; then
-                    SNI="${_top_domains[$idx]}"
-                    log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${_top_latencies[$idx]}ms)"
-                else
-                    SNI="${_top_domains[0]}"
-                    log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${_top_latencies[0]}ms)"
-                fi
-                ;;
-            M)
-                # 手动输入
-                prompt_custom_sni
-                ;;
-            *)
-                # 默认自动选择
-                SNI="${_top_domains[0]}"
-                log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${_top_latencies[0]}ms)"
-                ;;
-        esac
-    else
-        case "$choice" in
-            D|"")
-                SNI="www.tesla.com"
-                log_info "$(msg sni_use_default): ${SNI}"
-                ;;
-            M)
-                prompt_custom_sni
-                ;;
-            *)
-                SNI="www.tesla.com"
-                log_info "$(msg sni_use_default): ${SNI}"
-                ;;
-        esac
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        log_warn "$(msg sni_empty_input)"
+        return 1
     fi
+
+    # 仅测试这些自定义域名：临时替换 SNI_LIST，不读取也不写入内置缓存
+    declare -A _lat
+    local _saved_list=("${SNI_LIST[@]}")
+    SNI_LIST=("${domains[@]}")
+    test_domains_parallel _lat
+    SNI_LIST=("${_saved_list[@]}")
+
+    if [[ ${#_lat[@]} -eq 0 ]]; then
+        log_warn "$(msg sni_custom_unreachable)"
+        return 1
+    fi
+
+    # 排序取延迟最低的前 5 个，写回输出数组供选择
+    _out_domains=()
+    _out_lats=()
+    local lat dom
+    while IFS=' ' read -r lat dom; do
+        _out_domains+=("$dom")
+        _out_lats+=("$lat")
+    done < <(for dom in "${!_lat[@]}"; do echo "${_lat[$dom]} $dom"; done | sort -n | head -5)
+
+    log_info "$(msg sni_custom_test_done)"
+    return 0
+}
+
+prompt_sni_choice() {
+    local -n _in_domains=$1 2>/dev/null || true
+    local -n _in_latencies=$2 2>/dev/null || true
+    # 拷贝到本地可变数组；选择"测试自定义域名"后会用自定义结果替换它们
+    local -a td=() tl=()
+    if [[ ${#_in_domains[@]} -gt 0 ]] 2>/dev/null; then
+        td=("${_in_domains[@]}")
+        tl=("${_in_latencies[@]}")
+    fi
+
+    while true; do
+        local has_results=false
+        [[ ${#td[@]} -gt 0 ]] && has_results=true
+
+        {
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg sni_selection_title)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+
+        if $has_results; then
+            echo -e "  ${BLUE}$(msg sni_top_results):${NC}"
+            echo ""
+            local i=1 idx
+            for idx in "${!td[@]}"; do
+                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
+                ((i++))
+            done
+            echo ""
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo ""
+            echo -e "  ${GREEN}A.${NC} $(msg sni_auto_select) (${td[0]})"
+            echo -e "  ${GREEN}M.${NC} $(msg sni_manual_input)"
+            echo -e "  ${GREEN}C.${NC} $(msg sni_custom_test)"
+            echo ""
+            echo -n "  $(msg sni_choice_prompt) [A/1-5/M/C]: "
+        else
+            echo -e "  ${YELLOW}$(msg sni_no_results)${NC}"
+            echo ""
+            echo -e "  ${GREEN}D.${NC} $(msg sni_use_default) (www.tesla.com)"
+            echo -e "  ${GREEN}M.${NC} $(msg sni_manual_input)"
+            echo -e "  ${GREEN}C.${NC} $(msg sni_custom_test)"
+            echo ""
+            echo -n "  $(msg sni_choice_prompt) [D/M/C]: "
+        fi
+        } >/dev/tty
+
+        local choice
+        read -r choice </dev/tty
+        choice=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
+
+        if $has_results; then
+            case "$choice" in
+                A|"")
+                    SNI="${td[0]}"
+                    log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${tl[0]}ms)"
+                    return ;;
+                [1-9]|[1-9][0-9])
+                    local idx=$((choice - 1))
+                    if [[ $idx -ge 0 && $idx -lt ${#td[@]} ]]; then
+                        SNI="${td[$idx]}"
+                        log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${tl[$idx]}ms)"
+                    else
+                        SNI="${td[0]}"
+                        log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${tl[0]}ms)"
+                    fi
+                    return ;;
+                M)
+                    prompt_custom_sni
+                    return ;;
+                C)
+                    # 测试自定义域名列表，并用结果替换候选集后重新展示
+                    _run_custom_sni_test td tl || true
+                    continue ;;
+                *)
+                    SNI="${td[0]}"
+                    log_info "$(msg sni_selected): ${SNI} ($(msg latency): ${tl[0]}ms)"
+                    return ;;
+            esac
+        else
+            case "$choice" in
+                D|"")
+                    SNI="www.tesla.com"
+                    log_info "$(msg sni_use_default): ${SNI}"
+                    return ;;
+                M)
+                    prompt_custom_sni
+                    return ;;
+                C)
+                    _run_custom_sni_test td tl || true
+                    continue ;;
+                *)
+                    SNI="www.tesla.com"
+                    log_info "$(msg sni_use_default): ${SNI}"
+                    return ;;
+            esac
+        fi
+    done
 }
 
 # 提示用户输入自定义 SNI
