@@ -4188,15 +4188,14 @@ cmd_install() {
         # AnyTLS 安装流程（基于 sing-box）
         install_singbox || { log_error "sing-box 安装失败"; return 1; }
 
-        # SNI: REALITY 节点需要真实可达域名；plain 节点仅作为标签/证书 CN
+        # SNI: REALITY 节点需要真实可达域名；plain 节点的 SNI 仅作伪装/证书 CN，
+        # 但同样支持「测速选择 + 自定义」，与 REALITY 逻辑一致。
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
-        elif [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        else
             rm -f "$CACHE_FILE" 2>/dev/null
             select_best_sni
-        else
-            SNI="www.bing.com"
         fi
 
         choose_ports
@@ -4496,6 +4495,179 @@ cmd_remove() {
     singbox_sync
 
     log_info "Config updated"
+}
+
+# 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
+cmd_edit() {
+    select_node || return 1
+    local node_file
+    node_file=$(get_node_file "$CURRENT_NODE_NAME")
+    safe_load_node_config "$node_file"
+
+    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
+    ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
+    UUID=$(decrypt_value "$UUID")
+    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
+    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
+    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
+
+    local proto_type="${PROTOCOL_TYPE:-vision}"
+    local changed=false
+    local sni_changed=false
+
+    while true; do
+        {
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}        编辑节点 / Edit Node: ${CURRENT_NODE_NAME} [${proto_type}]${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        case "$proto_type" in
+            vision)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 Reality 密钥对"
+                ;;
+            xhttp)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / XHTTP Port      ${GRAY}(${XHTTP_PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 Reality 密钥对"
+                echo -e "  ${GREEN}5.${NC} 重新生成 XHTTP path        ${GRAY}(${XHTTP_PATH})${NC}"
+                ;;
+            both)
+                echo -e "  ${GREEN}1.${NC} 修改 Vision 端口           ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 XHTTP 端口            ${GRAY}(${XHTTP_PORT})${NC}"
+                echo -e "  ${GREEN}3.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}5.${NC} 重新生成 Reality 密钥对"
+                ;;
+            shadowsocks)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改加密方式 / Method      ${GRAY}(${SS_METHOD})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                ;;
+            anytls|anytls_reality)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI                   ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 重新生成 padding scheme"
+                [[ "$proto_type" == "anytls_reality" ]] && echo -e "  ${GREEN}5.${NC} 重新生成 Reality 密钥对"
+                ;;
+            *)
+                log_error "未知协议类型: $proto_type"
+                return 1
+                ;;
+        esac
+        echo -e "  ${GREEN}0.${NC} 完成并应用 / Save & apply"
+        echo ""
+        echo -n "  选择要修改的项 / Select [0-5]: "
+        } >/dev/tty
+
+        local c
+        read -r c </dev/tty
+
+        case "${proto_type}:${c}" in
+            *:0) break ;;
+
+            # ---- 端口 ----
+            xhttp:1)
+                XHTTP_PORT=$(prompt_port "新 XHTTP 端口 / New port" "${XHTTP_PORT}")
+                changed=true ;;
+            both:1)
+                PORT=$(prompt_port "新 Vision 端口 / New port" "${PORT}" "${XHTTP_PORT:-0}")
+                changed=true ;;
+            both:2)
+                XHTTP_PORT=$(prompt_port "新 XHTTP 端口 / New port" "${XHTTP_PORT}" "${PORT:-0}")
+                changed=true ;;
+            vision:1|shadowsocks:1|anytls:1|anytls_reality:1)
+                PORT=$(prompt_port "新端口 / New port" "${PORT}")
+                changed=true ;;
+
+            # ---- SNI（测速 + 自定义）----
+            vision:2|xhttp:2|both:3|anytls:2|anytls_reality:2)
+                rm -f "$CACHE_FILE" 2>/dev/null
+                select_best_sni
+                sni_changed=true
+                changed=true ;;
+
+            # ---- UUID ----
+            vision:3|xhttp:3|both:4)
+                UUID=$(cat /proc/sys/kernel/random/uuid)
+                log_info "新 UUID: $UUID"
+                changed=true ;;
+
+            # ---- Reality 密钥对 ----
+            vision:4|xhttp:4|both:5|anytls_reality:5)
+                if gen_reality_keys; then
+                    log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
+                    changed=true
+                fi ;;
+
+            # ---- XHTTP path ----
+            xhttp:5)
+                XHTTP_PATH="/$(openssl rand -hex 4)"
+                log_info "新 path: $XHTTP_PATH"
+                changed=true ;;
+
+            # ---- Shadowsocks 加密方式（同时重新生成匹配长度的密码）----
+            shadowsocks:2)
+                prompt_ss_method
+                gen_ss_password
+                log_warn "加密方式已变更，密码已随之重新生成"
+                changed=true ;;
+
+            # ---- 密码（SS / AnyTLS）----
+            shadowsocks:3)
+                gen_ss_password
+                log_info "密码已重新生成"
+                changed=true ;;
+            anytls:3|anytls_reality:3)
+                gen_anytls_password
+                changed=true ;;
+
+            # ---- AnyTLS padding ----
+            anytls:4|anytls_reality:4)
+                ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
+                log_info "padding scheme 已重新随机生成"
+                changed=true ;;
+
+            *)
+                log_warn "无效选择 / invalid choice"
+                sleep 1 ;;
+        esac
+    done
+
+    if ! $changed; then
+        log_info "未做任何修改 / No changes"
+        return 0
+    fi
+
+    # 写回 .env（save_env 会按当前全局变量重写该节点配置）
+    save_env
+
+    # 重新生成对应内核配置并重启
+    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
+        # plain AnyTLS 改了 SNI：重新生成自签名证书（CN 跟随新 SNI）
+        if [[ "$proto_type" == "anytls" ]] && $sni_changed; then
+            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+        fi
+        if ! singbox_sync; then
+            log_error "应用失败：sing-box 配置无效，请检查参数"
+            return 1
+        fi
+    else
+        if ! write_config; then
+            log_error "应用失败：Xray 配置无效，请检查参数"
+            return 1
+        fi
+        service_restart xray
+    fi
+
+    log_info "节点已更新 / Node updated"
+    show_info
 }
 
 cmd_uninstall() {
@@ -6426,6 +6598,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${GREEN}4.${NC} $(msg menu_status)  [$status_icon] (${node_count} nodes)                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}5.${NC} List Nodes / 列出节点                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}6.${NC} Remove Node / 删除节点                                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${GREEN}E.${NC} Edit Node / 编辑节点                                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}7.${NC} $(msg menu_restart)                                            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}8.${NC} $(msg menu_test_sni)                                      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${GREEN}9.${NC} $(msg menu_health)                                             ${CYAN}║${NC}"
@@ -6446,7 +6619,7 @@ show_menu() {
 main_menu() {
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,I,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,T,L,U]: "
         read -r choice
         echo ""
 
@@ -6496,6 +6669,11 @@ main_menu() {
                 echo ""
                 read -rp "$(msg menu_press_enter)"
                 ;;
+            [Ee])
+                cmd_edit
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Ii])
                 cmd_update_ip
                 echo ""
@@ -6539,6 +6717,7 @@ show_help() {
     echo "  status      Show service status"
     echo "  health      Run health check"
     echo "  remove      Remove a node"
+    echo "  edit        Edit an existing node (port/SNI/password/keys...)"
     echo "  restart     Restart service"
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
@@ -6653,6 +6832,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_remove
+        ;;
+    edit)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_edit
         ;;
     restart)
         check_lock_for_write_ops
