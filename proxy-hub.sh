@@ -1144,6 +1144,7 @@ msg() {
             "sni_custom_ok") echo "Domain is reachable" ;;
             "sni_custom_unreachable") echo "Domain may be unreachable, but will use it anyway" ;;
             "sni_invalid_format") echo "Invalid domain format" ;;
+            "anytls_sni_note") echo "Note: for plain AnyTLS the SNI is only TLS camouflage (self-signed cert, client uses insecure); latency results are for reference only." ;;
             # 新功能翻译
             "menu_tools") echo "System Tools" ;;
             "menu_warp") echo "WARP Routing" ;;
@@ -1228,8 +1229,8 @@ msg() {
             "update_ip_complete") echo "IP update complete! New share links will use the updated IP." ;;
             "update_ip_detect_fail") echo "Failed to detect current public IP" ;;
             # Xray 定时重启
-            "xray_restart_title") echo "Xray Periodic Restart" ;;
-            "xray_restart_prompt") echo "Enable periodic Xray restart? (recommended for long-running stability)" ;;
+            "xray_restart_title") echo "Proxy Service Periodic Restart" ;;
+            "xray_restart_prompt") echo "Enable periodic restart of the proxy service(s)? (recommended for long-running stability)" ;;
             "xray_restart_choose") echo "Choose restart schedule" ;;
             "xray_restart_default") echo "default" ;;
             "xray_restart_daily") echo "Daily at 04:00" ;;
@@ -1240,8 +1241,8 @@ msg() {
             "xray_restart_cron_hint") echo "Format: 'minute hour day month weekday' (e.g. '0 3 * * *')" ;;
             "xray_restart_cron_prompt") echo "Enter cron expression" ;;
             "xray_restart_cron_invalid") echo "Invalid cron expression, falling back to daily" ;;
-            "xray_restart_enabled") echo "Xray periodic restart enabled" ;;
-            "xray_restart_disabled") echo "Xray periodic restart disabled" ;;
+            "xray_restart_enabled") echo "Proxy service periodic restart enabled" ;;
+            "xray_restart_disabled") echo "Proxy service periodic restart disabled" ;;
             "xray_restart_not_enabled") echo "Periodic restart is not currently enabled" ;;
             "xray_restart_already") echo "Periodic restart already enabled" ;;
             "xray_restart_setup_failed") echo "Failed to set up periodic restart (crontab or systemd unavailable)" ;;
@@ -1330,6 +1331,7 @@ msg() {
             "sni_custom_ok") echo "域名可访问" ;;
             "sni_custom_unreachable") echo "域名可能无法访问，但仍会使用" ;;
             "sni_invalid_format") echo "域名格式无效" ;;
+            "anytls_sni_note") echo "提示：单独 AnyTLS 的 SNI 仅作 TLS 伪装（自签证书，客户端用 insecure），测速结果仅供参考。" ;;
             # 新功能翻译
             "menu_tools") echo "系统工具" ;;
             "menu_warp") echo "WARP 分流" ;;
@@ -1414,8 +1416,8 @@ msg() {
             "update_ip_complete") echo "IP 更新完成！分享链接将使用新的 IP 地址。" ;;
             "update_ip_detect_fail") echo "无法检测当前公网 IP" ;;
             # Xray 定时重启
-            "xray_restart_title") echo "Xray 定时重启" ;;
-            "xray_restart_prompt") echo "是否启用 Xray 定时重启？（长期运行建议启用）" ;;
+            "xray_restart_title") echo "代理服务定时重启" ;;
+            "xray_restart_prompt") echo "是否启用代理服务定时重启？（长期运行建议启用）" ;;
             "xray_restart_choose") echo "请选择重启频率" ;;
             "xray_restart_default") echo "默认" ;;
             "xray_restart_daily") echo "每日一次 (04:00)" ;;
@@ -1426,8 +1428,8 @@ msg() {
             "xray_restart_cron_hint") echo "格式: '分 时 日 月 周'（例如 '0 3 * * *' 表示每日 03:00）" ;;
             "xray_restart_cron_prompt") echo "请输入 cron 表达式" ;;
             "xray_restart_cron_invalid") echo "cron 表达式无效，已回退到默认（每日）" ;;
-            "xray_restart_enabled") echo "已启用 Xray 定时重启" ;;
-            "xray_restart_disabled") echo "已禁用 Xray 定时重启" ;;
+            "xray_restart_enabled") echo "已启用代理服务定时重启" ;;
+            "xray_restart_disabled") echo "已禁用代理服务定时重启" ;;
             "xray_restart_not_enabled") echo "当前未启用定时重启" ;;
             "xray_restart_already") echo "已启用定时重启" ;;
             "xray_restart_setup_failed") echo "定时重启配置失败（crontab 或 systemd 不可用）" ;;
@@ -2032,12 +2034,12 @@ install_xray_restart_systemd() {
 
     cat > "$XRAY_RESTART_SYSTEMD_SERVICE" <<EOF
 [Unit]
-Description=Restart Xray service (proxy-hub)
-After=xray.service
+Description=Restart proxy cores (proxy-hub)
+After=xray.service sing-box.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl restart xray.service
+ExecStart=/bin/sh -c 'for u in xray sing-box; do systemctl try-restart "\$u".service 2>/dev/null; done; true'
 EOF
 
     cat > "$XRAY_RESTART_SYSTEMD_TIMER" <<EOF
@@ -2069,11 +2071,12 @@ install_xray_restart_cron() {
         return 1
     fi
 
+    # 重启所有在用的代理内核（Xray 和/或 sing-box），而不仅是 Xray
     local restart_cmd
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        restart_cmd="rc-service xray restart"
+        restart_cmd="/bin/sh -c 'for s in xray sing-box; do [ -e /etc/init.d/\$s ] && rc-service \$s restart; done'"
     else
-        restart_cmd="systemctl restart xray"
+        restart_cmd="/bin/sh -c 'for u in xray sing-box; do systemctl try-restart \"\$u\".service 2>/dev/null; done'"
     fi
 
     local cron_line="$cron_expr $restart_cmd >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
@@ -4270,6 +4273,7 @@ cmd_install() {
             log_info "$(msg using_sni): $SNI"
         else
             rm -f "$CACHE_FILE" 2>/dev/null
+            [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
             select_best_sni
         fi
 
@@ -4663,6 +4667,7 @@ cmd_edit() {
             # ---- SNI（测速 + 自定义）----
             vision:2|xhttp:2|both:3|anytls:2|anytls_reality:2)
                 rm -f "$CACHE_FILE" 2>/dev/null
+                [[ "$proto_type" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
                 select_best_sni
                 sni_changed=true
                 changed=true ;;

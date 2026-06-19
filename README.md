@@ -464,6 +464,12 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ## 更新日志
 
+### v5.5.0
+- 修复：创建 AnyTLS / AnyTLS+REALITY 节点后，定时重启功能实际重启的服务。
+  定时重启改为重启「所有在用的代理内核」(Xray 和/或 sing-box)，AnyTLS 节点
+  不再错误地只重启 Xray；相关提示文案也从「Xray」改为「代理服务」
+- 单独 AnyTLS 选择 SNI 时新增提示：SNI 仅作 TLS 伪装（自签证书），测速仅供参考
+
 ### v5.4.0
 - SNI 选择时新增「测试自定义域名」(`C`)：可输入逗号分隔的多个域名
   （如 `a.com,b.com,c.com`），仅对这些域名测速，并从结果中选择 SNI
