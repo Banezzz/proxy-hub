@@ -464,6 +464,11 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ## 更新日志
 
+### v5.4.0
+- SNI 选择时新增「测试自定义域名」(`C`)：可输入逗号分隔的多个域名
+  （如 `a.com,b.com,c.com`），仅对这些域名测速，并从结果中选择 SNI
+- 内置 117 域名测速结果之外的补充手段，安装与编辑节点时均可用
+
 ### v5.3.0
 - 新增「编辑节点」功能（菜单 `E` / 命令 `edit`）：节点创建后可修改参数
   - VLESS：端口、SNI/dest（测速或自定义）、重新生成 UUID / Reality 密钥对、XHTTP path
