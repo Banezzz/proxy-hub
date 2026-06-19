@@ -464,6 +464,13 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ## 更新日志
 
+### v5.3.0
+- 新增「编辑节点」功能（菜单 `E` / 命令 `edit`）：节点创建后可修改参数
+  - VLESS：端口、SNI/dest（测速或自定义）、重新生成 UUID / Reality 密钥对、XHTTP path
+  - Shadowsocks：端口、加密方式、重新生成密码
+  - AnyTLS / AnyTLS+REALITY：端口、SNI、重新生成密码 / padding / Reality 密钥对
+- 单独 AnyTLS（自签证书）现已支持自定义 SNI：创建与编辑均可「测速选择 + 手动输入」
+
 ### v5.2.0
 - 按需安装代理内核：在选择协议类型之后才安装对应内核
   （VLESS/Shadowsocks → Xray，AnyTLS → sing-box），不再默认安装 Xray
