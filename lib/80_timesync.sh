@@ -488,20 +488,33 @@ prompt_timesync_for_ss2022() {
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${YELLOW}⚠${NC}  $(msg timesync_ss2022_hint)"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-    # 容器环境且无权限: 自动运行时间校验而非安装
-    if is_container_env && ! check_time_capability; then
-        echo ""
-        echo -e "  $(msg timesync_container_no_host)"
-        echo ""
-        timesync_check
-        return
-    fi
-
     echo ""
-    echo -n "  [y/N]: "
-    read -r answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        timesync_install
+
+    # 容器环境且无权限: 只允许校验或跳过，绝不尝试修改宿主机时钟。
+    if is_container_env && ! check_time_capability; then
+        echo -e "  $(msg timesync_container_no_host)"
+        echo -e "  ${GREEN}1.${NC} $(msg timesync_check)"
+        echo -e "  ${RED}0.${NC} $(msg timesync_skip)"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-1]: "
+        local answer
+        read -r answer
+        if [[ "$answer" == "1" ]]; then
+            timesync_check
+        fi
+        return 0
     fi
+
+    echo -e "  ${GREEN}1.${NC} $(msg timesync_install)"
+    echo -e "  ${GREEN}2.${NC} $(msg timesync_check)"
+    echo -e "  ${RED}0.${NC} $(msg timesync_skip)"
+    echo ""
+    echo -n "  $(msg menu_choice) [0-2]: "
+    local answer
+    read -r answer
+    case "$answer" in
+        1) timesync_install ;;
+        2) timesync_check ;;
+        *) return 0 ;;
+    esac
 }

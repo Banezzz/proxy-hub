@@ -848,7 +848,7 @@ msg() {
             "timesync_removing") echo "Removing time sync service..." ;;
             "timesync_removed") echo "Time sync service removed" ;;
             "timesync_already") echo "Time sync service is already installed" ;;
-            "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Install time sync now? (y/n)" ;;
+            "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Choose how to verify or enable synchronization." ;;
             "timesync_env") echo "Environment" ;;
             "timesync_container_warn") echo "Container environment detected - time sync may not work" ;;
             "timesync_container_type") echo "Container type" ;;
@@ -872,6 +872,7 @@ msg() {
             "timesync_offset_fail") echo "Failed to fetch remote time. Check network connectivity." ;;
             "timesync_container_no_host") echo "No host access? You can only verify time, not change it." ;;
             "timesync_seconds") echo "seconds" ;;
+            "timesync_skip") echo "Skip" ;;
             "update_ip") echo "Update Node IP" ;;
             "update_ip_detecting") echo "Detecting current public IP..." ;;
             "update_ip_current") echo "Current IP" ;;
@@ -1035,7 +1036,7 @@ msg() {
             "timesync_removing") echo "正在卸载时间同步服务..." ;;
             "timesync_removed") echo "时间同步服务已卸载" ;;
             "timesync_already") echo "时间同步服务已安装" ;;
-            "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，是否立即安装时间同步？(y/n)" ;;
+            "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，请选择校验或启用时间同步。" ;;
             "timesync_env") echo "运行环境" ;;
             "timesync_container_warn") echo "检测到容器环境 - 时间同步可能无法工作" ;;
             "timesync_container_type") echo "容器类型" ;;
@@ -1059,6 +1060,7 @@ msg() {
             "timesync_offset_fail") echo "无法获取远程时间，请检查网络连接。" ;;
             "timesync_container_no_host") echo "没有宿主机权限？只能校验时间，无法修改。" ;;
             "timesync_seconds") echo "秒" ;;
+            "timesync_skip") echo "跳过" ;;
             "update_ip") echo "更新节点 IP" ;;
             "update_ip_detecting") echo "正在检测当前公网 IP..." ;;
             "update_ip_current") echo "当前 IP" ;;
@@ -1112,8 +1114,24 @@ is_root() { [[ "${EUID}" -eq 0 ]]; }
 
 is_port_free() {
     local port="$1"
-    # 更精确的端口匹配：检查 :port 结尾，避免 80 匹配 8080
-    ! ss -lnt | awk '{print $4}' | grep -qE ":${port}$"
+    local transport="${2:-tcp}"
+    local tcp_busy=false udp_busy=false
+
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 1
+    case "$transport" in
+        tcp|udp|both) ;;
+        *) return 1 ;;
+    esac
+
+    # 更精确的端口匹配：检查 :port 结尾，避免 80 匹配 8080。
+    if [[ "$transport" == "tcp" || "$transport" == "both" ]]; then
+        ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$" && tcp_busy=true
+    fi
+    if [[ "$transport" == "udp" || "$transport" == "both" ]]; then
+        ss -lnu 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$" && udp_busy=true
+    fi
+
+    ! $tcp_busy && ! $udp_busy
 }
 
 # ============== 多节点管理 ==============
@@ -1224,6 +1242,9 @@ select_node() {
         if [[ "$proto" == "shadowsocks" ]]; then
             display_port="${PORT:-N/A}"
             display_info="Method: ${SS_METHOD:-N/A}"
+        elif [[ "$proto" == "hysteria2" ]]; then
+            display_port="${PORT:-N/A} (UDP)"
+            display_info="Hysteria2"
         elif [[ "$proto" == "xhttp" ]]; then
             display_port="${XHTTP_PORT:-N/A}"
             display_info="SNI: $SNI"

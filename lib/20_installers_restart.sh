@@ -166,13 +166,13 @@ OPENRC_SERVICE
     chmod 755 /etc/init.d/xray
 }
 
-# ============== sing-box 安装（AnyTLS 支持） ==============
+# ============== sing-box 安装（AnyTLS / Hysteria2 支持） ==============
 
 # 创建 sing-box systemd 服务
 create_singbox_systemd_service() {
     cat > /etc/systemd/system/sing-box.service <<'UNIT'
 [Unit]
-Description=sing-box service (AnyTLS)
+Description=sing-box service (AnyTLS / Hysteria2)
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 
@@ -195,7 +195,7 @@ create_singbox_openrc_service() {
 #!/sbin/openrc-run
 
 name="sing-box"
-description="sing-box service (AnyTLS)"
+description="sing-box service (AnyTLS / Hysteria2)"
 
 command="/usr/local/bin/sing-box"
 command_args="run -c /usr/local/etc/sing-box/config.json"
@@ -213,14 +213,14 @@ OPENRC_SERVICE
 }
 
 # 安装 sing-box（下载官方预编译二进制，适用于所有发行版包括 Alpine）
-# AnyTLS 协议需要 sing-box >= 1.12.0
+# AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
 install_singbox() {
     if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
         log_info "sing-box already installed, skipping..."
         return 0
     fi
 
-    log_info "Installing sing-box (required for AnyTLS)..."
+    log_info "Installing sing-box (required for AnyTLS / Hysteria2)..."
 
     local arch sb_arch
     arch=$(uname -m)
@@ -694,7 +694,7 @@ cmd_xray_restart() {
 
 # ============== 协议类型选择 ==============
 
-# 协议类型: vision, xhttp, both, shadowsocks
+# 协议类型: vision, xhttp, both, shadowsocks, anytls, anytls_reality, hysteria2
 PROTOCOL_TYPE="vision"
 XHTTP_PORT=""
 XHTTP_PATH=""
@@ -706,6 +706,9 @@ SS_PASSWORD=""
 # AnyTLS 相关变量（协议类型: anytls, anytls_reality）
 ANYTLS_PASSWORD=""
 ANYTLS_PADDING_B64=""
+
+# Hysteria2 相关变量（由 sing-box 承载）
+HY2_PASSWORD=""
 
 # Shadowsocks 支持的加密方式
 SS_METHODS_2022=(

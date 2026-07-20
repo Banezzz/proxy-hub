@@ -12,8 +12,9 @@ prompt_protocol_type() {
     echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
     echo -e "  ${GREEN}5.${NC} AnyTLS                   ${GRAY}(sing-box, 自签名证书)${NC}"
     echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY         ${GRAY}(sing-box, 抗封锁, 推荐)${NC}"
+    echo -e "  ${GREEN}7.${NC} Hysteria2                ${GRAY}(sing-box, QUIC/UDP)${NC}"
     echo ""
-    echo -n "  请选择 [1-6] (默认 1): "
+    echo -n "  请选择 [1-7] (默认 1): "
     } >/dev/tty
 
     local choice
@@ -39,6 +40,10 @@ prompt_protocol_type() {
         6)
             PROTOCOL_TYPE="anytls_reality"
             log_info "已选择: AnyTLS + REALITY"
+            ;;
+        7)
+            PROTOCOL_TYPE="hysteria2"
+            log_info "已选择: Hysteria2"
             ;;
         *)
             PROTOCOL_TYPE="vision"
@@ -106,6 +111,22 @@ gen_ss_password() {
     log_info "密码已生成"
 }
 
+# Hysteria2 authentication is embedded in config and URI output. Restrict it
+# to the URI-unreserved subset so user input cannot alter either structure.
+validate_hy2_password() {
+    [[ "$1" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]]
+}
+
+gen_hy2_password() {
+    local candidate="${hy2pwd:-$(openssl rand -hex 24)}"
+    if ! validate_hy2_password "$candidate"; then
+        log_error "Hysteria2 password must be 8-128 URI-safe characters (A-Z, a-z, 0-9, . _ ~ -)"
+        return 1
+    fi
+    HY2_PASSWORD="$candidate"
+    log_info "Hysteria2 密码已生成"
+}
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -113,10 +134,11 @@ gen_uuid() {
 # 生成一个可用的随机端口
 gen_random_free_port() {
     local exclude_port="${1:-0}"
+    local transport="${2:-tcp}"
     local port
     while true; do
         port="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-        if is_port_free "$port" && [[ "$port" != "$exclude_port" ]]; then
+        if is_port_free "$port" "$transport" && [[ "$port" != "$exclude_port" ]]; then
             echo "$port"
             return 0
         fi
@@ -129,6 +151,7 @@ prompt_port() {
     local prompt_msg="$1"
     local default_port="$2"
     local exclude_port="${3:-0}"
+    local transport="${4:-tcp}"
     local user_port
 
     while true; do
@@ -160,7 +183,7 @@ prompt_port() {
         fi
 
         # 检查端口是否被占用
-        if ! is_port_free "$user_port"; then
+        if ! is_port_free "$user_port" "$transport"; then
             echo -e "  ${YELLOW}端口 $user_port 已被占用，是否仍然使用? [y/N]: ${NC}" >/dev/tty
             read -r confirm </dev/tty
             if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
@@ -218,6 +241,25 @@ choose_ports() {
             PORT=$(prompt_port "AnyTLS 端口" "$default_at_port")
         fi
         log_info "AnyTLS 端口: $PORT"
+        XHTTP_PORT=""
+        XHTTP_PATH=""
+        echo "" >/dev/tty
+        return 0
+    fi
+
+    # Hysteria2 使用 QUIC/UDP，端口占用检查必须查询 UDP socket。
+    if [[ "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        if [[ -n "${hy2pt:-}" ]]; then
+            PORT="$hy2pt"
+        elif [[ -n "${vlpt:-}" ]]; then
+            PORT="$vlpt"
+        else
+            local default_hy2_port
+            default_hy2_port=$(gen_random_free_port 0 udp)
+            PORT=$(prompt_port "Hysteria2 端口 (UDP)" "$default_hy2_port" 0 udp)
+        fi
+        PORT=$(get_validated_port "$PORT") || return 1
+        log_info "Hysteria2 端口: $PORT (UDP)"
         XHTTP_PORT=""
         XHTTP_PATH=""
         echo "" >/dev/tty
@@ -396,6 +438,33 @@ anytls_node_count() {
         [[ -f "$f" ]] || continue
         t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
         [[ "$t" == "anytls" || "$t" == "anytls_reality" ]] && ((count++))
+    done
+    echo "$count"
+}
+
+# 统计由 sing-box 承载的节点数量（AnyTLS 与 Hysteria2）。
+singbox_node_count() {
+    local count=0 f t
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        case "$t" in
+            anytls|anytls_reality|hysteria2) ((count++)) ;;
+        esac
+    done
+    echo "$count"
+}
+
+# 统计由 Xray 承载的节点数量；未使用的内核不应影响健康状态。
+xray_node_count() {
+    local count=0 f t
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        case "$t" in
+            anytls|anytls_reality|hysteria2) ;;
+            *) ((count++)) ;;
+        esac
     done
     echo "$count"
 }

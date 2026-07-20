@@ -270,7 +270,7 @@ safe_read_config_value() {
 # Usage: safe_load_node_config FILE
 # Sets variables: NODE_NAME, PORT, UUID, SNI, PUBLIC_KEY, PRIVATE_KEY, SHORT_ID,
 #                 PROTOCOL_TYPE, XHTTP_PORT, XHTTP_PATH, SERVER_IP, SERVER_IPV4, SERVER_IPV6,
-#                 SS_METHOD, SS_PASSWORD
+#                 SS_METHOD, SS_PASSWORD, ANYTLS_PASSWORD, HY2_PASSWORD
 safe_load_node_config() {
     local file="$1"
 
@@ -279,7 +279,7 @@ safe_load_node_config() {
     # Reset all variables first
     NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
     PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
-    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD=""
+    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD="" HY2_PASSWORD=""
 
     # Load each value safely
     NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")
@@ -298,6 +298,7 @@ safe_load_node_config() {
     SS_METHOD=$(safe_read_config_value "$file" "SS_METHOD")
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
+    HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
 
     return 0
 }
@@ -514,6 +515,70 @@ build_anytls_inbound() {
         }'
 }
 
+# Validate a TLS server name before it is written to JSON or a share URI.
+# IPv4 literals are accepted; empty labels, URI delimiters, and overlong labels
+# are rejected. Hysteria2 uses this value as TLS SNI, so IPv6 literals are not
+# accepted here.
+validate_tls_server_name() {
+    local value="${1:-}"
+    local label
+    local -a labels=()
+
+    [[ -n "$value" && ${#value} -le 253 ]] || return 1
+    [[ "$value" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    [[ "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+
+    IFS='.' read -r -a labels <<<"$value"
+    for label in "${labels[@]}"; do
+        [[ -n "$label" && ${#label} -le 63 ]] || return 1
+        [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+
+# Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
+build_hysteria2_inbound() {
+    local name="$1"
+    local port="$2"
+    local password="$3"
+    local sni="$4"
+    local cert="$5"
+    local key="$6"
+
+    port=$(get_validated_port "$port" true) || return 1
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
+    validate_tls_server_name "$sni" || return 1
+    [[ -n "$cert" && -n "$key" ]] || return 1
+
+    jq -n \
+        --arg tag "${name}_hysteria2" \
+        --argjson port "$port" \
+        --arg name "$name" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg cert "$cert" \
+        --arg key "$key" \
+        '{
+            "type": "hysteria2",
+            "tag": $tag,
+            "listen": "::",
+            "listen_port": $port,
+            "users": [{"name": $name, "password": $password}],
+            "tls": {
+                "enabled": true,
+                "server_name": $sni,
+                "certificate_path": $cert,
+                "key_path": $key
+            },
+            "masquerade": {
+                "type": "proxy",
+                "url": "https://www.bing.com",
+                "rewrite_host": true
+            }
+        }'
+}
+
 # Optional encryption for sensitive config values
 # Usage: encrypt_value PLAINTEXT
 # Returns: base64-encoded encrypted value with "U2FsdGVk" prefix (OpenSSL magic)
@@ -570,7 +635,7 @@ XRAY_CONF="/usr/local/etc/xray/config.json"
 XRAY_GEODATA_DIR="/usr/local/share/xray"
 SERVICE="xray"
 
-# sing-box（用于 AnyTLS / AnyTLS + REALITY 协议，Xray 暂不支持 AnyTLS）
+# sing-box（用于 AnyTLS / AnyTLS + REALITY / Hysteria2）
 SINGBOX_BIN="/usr/local/bin/sing-box"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_CONF="/usr/local/etc/sing-box/config.json"

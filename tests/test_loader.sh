@@ -15,13 +15,11 @@ loader_tmp=$(mktemp -d "$loader_tmp_base/proxy-hub-test.loader.XXXXXXXX")
 register_cleanup_dir "$loader_tmp"
 
 mkdir -p -- \
-    "$loader_tmp/origin" \
     "$loader_tmp/assets" \
     "$loader_tmp/work" \
     "$loader_tmp/repo with spaces/lib" \
     "$loader_tmp/standalone-empty/lib" \
     "$loader_tmp/standalone-foreign/lib"
-git -C "$REPO_ROOT" show "$LEGACY_BASELINE_COMMIT:proxy-hub.sh" >"$loader_tmp/origin/proxy-hub.sh"
 cp -- "$REPO_ROOT/proxy-hub.sh" "$loader_tmp/repo with spaces/proxy-hub.sh"
 cp -- "$REPO_ROOT/proxy-hub.sh" "$loader_tmp/standalone-empty/proxy-hub.sh"
 cp -- "$REPO_ROOT/proxy-hub.sh" "$loader_tmp/standalone-foreign/proxy-hub.sh"
@@ -90,14 +88,11 @@ compare_result() {
 case_index=0
 for command_arg in help -h --help definitely-unknown; do
     ((case_index += 1))
-    origin_out="$loader_tmp/origin.$case_index.out"
-    origin_err="$loader_tmp/origin.$case_index.err"
     local_out="$loader_tmp/local.$case_index.out"
     local_err="$loader_tmp/local.$case_index.err"
     remote_out="$loader_tmp/remote.$case_index.out"
     remote_err="$loader_tmp/remote.$case_index.err"
 
-    origin_rc=$(run_sandbox "$origin_out" "$origin_err" /tmp bash /srv/origin/proxy-hub.sh "$command_arg")
     local_rc=$(run_sandbox "$local_out" "$local_err" /tmp bash /mnt/proxy-hub.sh "$command_arg")
 
     remote_rc=0
@@ -109,14 +104,17 @@ for command_arg in help -h --help definitely-unknown; do
         -- bash -c 'bash <(cat /mnt/proxy-hub.sh) "$1"' _ "$command_arg" \
         >"$remote_out" 2>"$remote_err" || remote_rc=$?
 
-    compare_result "$origin_rc" "$local_rc" "$origin_out" "$local_out" "$origin_err" "$local_err" "local-$command_arg"
-    compare_result "$origin_rc" "$remote_rc" "$origin_out" "$remote_out" "$origin_err" "$remote_err" "remote-$command_arg"
+    compare_result "$local_rc" "$remote_rc" "$local_out" "$remote_out" "$local_err" "$remote_err" "remote-$command_arg"
+    if [[ "$command_arg" == help ]]; then
+        assert_contains "$(<"$local_out")" "hysteria2 (hy2)" \
+            "current help must expose the Hysteria2 protocol"
+    fi
 done
-pass "help aliases and unknown-command behavior match the pinned historical baseline"
+pass "help aliases and unknown-command behavior match between split-source and remote bundle paths"
 
-origin_out="$loader_tmp/origin.path.out"
-origin_err="$loader_tmp/origin.path.err"
-origin_rc=$(run_sandbox "$origin_out" "$origin_err" /tmp bash /srv/origin/proxy-hub.sh help)
+reference_out="$loader_tmp/reference.path.out"
+reference_err="$loader_tmp/reference.path.err"
+reference_rc=$(run_sandbox "$reference_out" "$reference_err" /tmp bash /mnt/proxy-hub.sh help)
 
 for invocation in absolute space symlink; do
     actual_out="$loader_tmp/$invocation.out"
@@ -132,7 +130,8 @@ for invocation in absolute space symlink; do
             actual_rc=$(run_sandbox "$actual_out" "$actual_err" /tmp bash /srv/proxy-hub-link.sh help)
             ;;
     esac
-    compare_result "$origin_rc" "$actual_rc" "$origin_out" "$actual_out" "$origin_err" "$actual_err" "path-$invocation"
+    compare_result "$reference_rc" "$actual_rc" "$reference_out" "$actual_out" \
+        "$reference_err" "$actual_err" "path-$invocation"
 done
 pass "local loader resolves modules from arbitrary cwd, space-containing paths, and symlinks"
 
@@ -147,8 +146,8 @@ for standalone_case in standalone-empty standalone-foreign; do
         --chdir /tmp \
         -- bash "/srv/$standalone_case/proxy-hub.sh" help \
         >"$standalone_out" 2>"$standalone_err" || standalone_rc=$?
-    compare_result "$origin_rc" "$standalone_rc" \
-        "$origin_out" "$standalone_out" "$origin_err" "$standalone_err" "path-$standalone_case"
+    compare_result "$reference_rc" "$standalone_rc" \
+        "$reference_out" "$standalone_out" "$reference_err" "$standalone_err" "path-$standalone_case"
     assert_file "$loader_tmp/$standalone_case.curl.log"
 done
 pass "empty or unrelated adjacent lib directories keep standalone loader remote mode"
@@ -171,17 +170,12 @@ source_state_rc=0
 assert_eq "0" "$source_state_rc" "sourced loader caller-state preservation"
 pass "sourced local loader preserves caller args, nullglob, dotglob, and HUP trap"
 
-origin_zero_out="$loader_tmp/origin.zero.out"
-origin_zero_err="$loader_tmp/origin.zero.err"
 local_zero_out="$loader_tmp/local.zero.out"
 local_zero_err="$loader_tmp/local.zero.err"
 remote_zero_out="$loader_tmp/remote.zero.out"
 remote_zero_err="$loader_tmp/remote.zero.err"
 exact_curl_log="$loader_tmp/exact-curl.log"
 
-origin_zero_rc=0
-"${sandbox_base[@]}" --chdir /tmp -- bash -c 'printf "0\n" | bash /srv/origin/proxy-hub.sh' \
-    >"$origin_zero_out" 2>"$origin_zero_err" || origin_zero_rc=$?
 local_zero_rc=0
 "${sandbox_base[@]}" --chdir /tmp -- bash -c 'printf "0\n" | bash /mnt/proxy-hub.sh' \
     >"$local_zero_out" 2>"$local_zero_err" || local_zero_rc=$?
@@ -194,10 +188,8 @@ remote_zero_rc=0
     -- bash -c 'printf "0\n" | bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-hub.sh)' \
     >"$remote_zero_out" 2>"$remote_zero_err" || remote_zero_rc=$?
 
-compare_result "$origin_zero_rc" "$local_zero_rc" \
-    "$origin_zero_out" "$local_zero_out" "$origin_zero_err" "$local_zero_err" "zero-arg-local"
-compare_result "$origin_zero_rc" "$remote_zero_rc" \
-    "$origin_zero_out" "$remote_zero_out" "$origin_zero_err" "$remote_zero_err" "zero-arg-remote"
+compare_result "$local_zero_rc" "$remote_zero_rc" \
+    "$local_zero_out" "$remote_zero_out" "$local_zero_err" "$remote_zero_err" "zero-arg-remote"
 pass "zero-argument local and exact documented remote commands enter and exit the interactive menu"
 
 pty_local_out="$loader_tmp/local.pty.out"
