@@ -93,8 +93,8 @@ write_config() {
             fi
         fi
 
-        # AnyTLS 节点由 sing-box 处理，Xray 配置中跳过
-        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" ]]; then
+        # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
+        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
             continue
         fi
 
@@ -261,7 +261,7 @@ EOF
     return 0
 }
 
-# 根据所有 AnyTLS 节点生成 sing-box 配置文件
+# 根据所有 AnyTLS / Hysteria2 节点生成 sing-box 配置文件
 write_singbox_config() {
     mkdir -p "$SINGBOX_DIR"
 
@@ -272,7 +272,7 @@ write_singbox_config() {
 
         local n_proto
         n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
-        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" ]] || continue
+        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" || "$n_proto" == "hysteria2" ]] || continue
 
         local n_name n_port n_sni n_priv n_sid n_pw n_pad_b64 n_pad
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
@@ -280,7 +280,11 @@ write_singbox_config() {
         n_sni=$(safe_read_config_value "$node_file" "SNI")
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
         n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
-        n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
+        if [[ "$n_proto" == "hysteria2" ]]; then
+            n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
+        else
+            n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
+        fi
         n_pad_b64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
 
         # 解密可能加密的敏感值
@@ -292,22 +296,35 @@ write_singbox_config() {
         local validated_port
         validated_port=$(get_validated_port "$n_port" true)
         if [[ -z "$validated_port" ]]; then
-            log_warn "Invalid AnyTLS port for node '$n_name', skipping"
+            log_warn "Invalid sing-box port for node '$n_name', skipping"
             continue
         fi
 
-        # 还原 padding scheme（base64 -> 多行文本）；缺失时即时生成一个随机方案
-        n_pad=""
-        if [[ -n "$n_pad_b64" ]]; then
-            n_pad=$(echo "$n_pad_b64" | base64 -d 2>/dev/null)
-        fi
-        [[ -z "$n_pad" ]] && n_pad=$(gen_anytls_padding)
-
         local inbound
+        if [[ "$n_proto" == "hysteria2" ]]; then
+            local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
+            local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
+            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+                gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
+            fi
+            if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
+                log_error "Failed to build Hysteria2 inbound for node '$n_name'"
+                return 1
+            fi
+        else
+            # 还原 AnyTLS padding scheme；缺失时即时生成随机方案。
+            n_pad=""
+            if [[ -n "$n_pad_b64" ]]; then
+                n_pad=$(echo "$n_pad_b64" | base64 -d 2>/dev/null)
+            fi
+            [[ -z "$n_pad" ]] && n_pad=$(gen_anytls_padding)
+        fi
+
         if [[ "$n_proto" == "anytls_reality" ]]; then
             inbound=$(build_anytls_inbound "$n_name" "$validated_port" "$n_pw" "$n_pad" \
                 "reality" "$n_sni" "$n_priv" "$n_sid" "" "")
-        else
+        elif [[ "$n_proto" == "anytls" ]]; then
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
             # 确保自签名证书存在
@@ -319,7 +336,7 @@ write_singbox_config() {
         fi
 
         if [[ -z "$inbound" ]]; then
-            log_error "Failed to build AnyTLS inbound for node '$n_name'"
+            log_error "Failed to build $n_proto inbound for node '$n_name'"
             return 1
         fi
 
@@ -327,7 +344,7 @@ write_singbox_config() {
         if new_inbounds=$(echo "$inbounds_json" | jq --argjson inbound "$inbound" '. += [$inbound]' 2>&1); then
             inbounds_json="$new_inbounds"
         else
-            log_error "Failed to add AnyTLS inbound for node '$n_name': $new_inbounds"
+            log_error "Failed to add $n_proto inbound for node '$n_name': $new_inbounds"
             return 1
         fi
     done
@@ -356,11 +373,11 @@ write_singbox_config() {
     return 0
 }
 
-# 同步 sing-box 状态：有 AnyTLS 节点则（安装并）写配置、启动服务；
+# 同步 sing-box 状态：有 AnyTLS / Hysteria2 节点则（安装并）写配置、启动服务；
 # 没有则停止并禁用服务。在添加/删除节点后调用。
 singbox_sync() {
     local count
-    count=$(anytls_node_count)
+    count=$(singbox_node_count)
 
     if [[ "$count" -eq 0 ]]; then
         # 没有 AnyTLS 节点，停止 sing-box（如果存在）
@@ -385,11 +402,15 @@ singbox_sync() {
     fi
 
     service_enable "$SINGBOX_SERVICE"
-    service_restart "$SINGBOX_SERVICE"
+    if ! service_restart "$SINGBOX_SERVICE"; then
+        log_error "sing-box service restart failed"
+        return 1
+    fi
 
     sleep 1
     if ! service_is_active "$SINGBOX_SERVICE"; then
-        log_warn "sing-box service may not have started correctly."
+        log_error "sing-box service failed to become active"
+        return 1
     fi
     return 0
 }
@@ -416,12 +437,14 @@ save_env() {
     local save_private_key="$PRIVATE_KEY"
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
+    local save_hy2_password="${HY2_PASSWORD:-}"
 
     if is_encryption_enabled; then
         save_uuid=$(encrypt_value "$UUID")
         save_private_key=$(encrypt_value "$PRIVATE_KEY")
         [[ -n "$save_ss_password" ]] && save_ss_password=$(encrypt_value "$SS_PASSWORD")
         [[ -n "$save_anytls_password" ]] && save_anytls_password=$(encrypt_value "$ANYTLS_PASSWORD")
+        [[ -n "$save_hy2_password" ]] && save_hy2_password=$(encrypt_value "$HY2_PASSWORD")
     fi
 
     cat > "$node_file" <<ENV
@@ -442,6 +465,7 @@ SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
+HY2_PASSWORD=$save_hy2_password
 ENV
     chmod 600 "$node_file"
 
@@ -522,6 +546,19 @@ get_anytls_link() {
     fi
 }
 
+# 生成 Hysteria2 分享链接。密码被限制在 URI-unreserved 字符集内。
+get_hy2_link() {
+    local ip="$1"
+    local node_label="$2"
+    local ip_formatted="$ip"
+
+    if [[ "$ip" == *:* ]]; then
+        ip_formatted="[$ip]"
+    fi
+
+    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
+}
+
 # 向后兼容的获取分享链接函数
 get_share_link() {
     local node_file
@@ -529,11 +566,14 @@ get_share_link() {
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
-    local ip="${SERVER_IPV4:-$SERVER_IP}"
+    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
     local proto_type="${PROTOCOL_TYPE:-vision}"
 
     # 根据协议类型返回对应的链接
-    if [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
+    if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
+        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        get_hy2_link "$ip" "${node_label}_Hysteria2"
+    elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
         get_ss_link "$ip" "${node_label}_SS"
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]] && [[ -n "${ANYTLS_PASSWORD:-}" ]]; then
@@ -551,6 +591,41 @@ get_share_link() {
         get_xhttp_link "$ip" "${node_label}_XHTTP"
     else
         echo ""
+    fi
+}
+
+# 显示当前节点的全部二维码。get_share_link 保持单链接兼容契约；only
+# the presentation path expands a `both` node into Vision + XHTTP.
+show_node_qrcodes() {
+    local node_file
+    node_file=$(get_node_file "$CURRENT_NODE_NAME")
+    safe_load_node_config "$node_file" || return 1
+
+    local node_label="${NODE_NAME:-RV-Reality}"
+    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
+    local proto_type="${PROTOCOL_TYPE:-vision}"
+    local shown=0 link
+
+    if [[ "$proto_type" == "both" ]]; then
+        if [[ -n "${PORT:-}" ]]; then
+            show_qrcode "$(get_vision_link "$ip" "${node_label}_Vision")"
+            ((++shown))
+        fi
+        if [[ -n "${XHTTP_PORT:-}" ]]; then
+            show_qrcode "$(get_xhttp_link "$ip" "${node_label}_XHTTP")"
+            ((++shown))
+        fi
+    else
+        link=$(get_share_link)
+        if [[ -n "$link" ]]; then
+            show_qrcode "$link"
+            shown=1
+        fi
+    fi
+
+    if [[ "$shown" -eq 0 ]]; then
+        log_error "没有可用的节点链接 / No usable node link"
+        return 1
     fi
 }
 
@@ -605,6 +680,7 @@ show_info() {
         shadowsocks)     proto_label="Shadowsocks 2022" ;;
         anytls)          proto_label="AnyTLS" ;;
         anytls_reality)  proto_label="AnyTLS + REALITY" ;;
+        hysteria2)       proto_label="Hysteria2" ;;
         *)               proto_label="$proto_type" ;;
     esac
 
@@ -650,6 +726,30 @@ show_info() {
             echo ""
             echo -e "  ${YELLOW}Shadowsocks:${NC}"
             echo -e "  $(get_ss_link "$SERVER_IPV6" "${hostname}_SS_v6")"
+        fi
+    elif [[ "$proto_type" == "hysteria2" ]]; then
+        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
+        echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
+        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
+        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
+        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+        echo ""
+
+        if [[ -n "${SERVER_IPV4:-}" ]]; then
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv4_links):${NC}"
+            echo ""
+            echo -e "  ${YELLOW}Hysteria2:${NC}"
+            echo -e "  $(get_hy2_link "$SERVER_IPV4" "${hostname}_Hysteria2_v4")"
+        fi
+        if [[ -n "${SERVER_IPV6:-}" ]]; then
+            echo ""
+            echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "${GREEN}$(msg ipv6_links):${NC}"
+            echo ""
+            echo -e "  ${YELLOW}Hysteria2:${NC}"
+            echo -e "  $(get_hy2_link "$SERVER_IPV6" "${hostname}_Hysteria2_v6")"
         fi
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
         # AnyTLS 节点显示
@@ -761,11 +861,7 @@ show_info() {
     if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]] && [[ -n "${SERVER_IP:-}" ]]; then
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg share_link):${NC}"
-        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
-            echo -e "${YELLOW}$(get_vision_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}")${NC}"
-        elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
-            echo -e "${YELLOW}$(get_xhttp_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}_XHTTP")${NC}"
-        fi
+        echo -e "${YELLOW}$(get_share_link)${NC}"
     fi
 
     echo ""

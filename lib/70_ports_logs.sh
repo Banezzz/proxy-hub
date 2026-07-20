@@ -22,37 +22,87 @@ check_port_status() {
 }
 
 # 开放端口 (跨系统支持)
+# Usage: open_firewall_port PORT [tcp|udp|both]
+# 未安装或未启用任何防火墙时视为无需处理；任一活跃后端配置失败则返回非零。
 open_firewall_port() {
-    local port="$1"
+    local port="${1:-}"
+    local transport="${2:-both}"
+    local failed=0 netfilter_changed=0 firewalld_changed=0
+    local protocol backend rule_present ufw_status
+    local -a protocols=()
 
-    # iptables (if available)
-    if command -v iptables &>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    validate_port "$port" || return 1
+    case "$transport" in
+        tcp|udp) protocols=("$transport") ;;
+        both) protocols=(tcp udp) ;;
+        *)
+            printf '%s\n' "Invalid firewall transport: $transport (expected tcp, udp, or both)" >&2
+            return 1
+            ;;
+    esac
 
-        # IPv6
-        if [[ -f /proc/net/if_inet6 ]] && command -v ip6tables &>/dev/null; then
-            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-            ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    # iptables/ip6tables 没有统一的 enabled 状态；命令存在即尝试管理。
+    # -C 区分已有规则，避免重复 -I 导致规则无限堆叠。
+    for backend in iptables ip6tables; do
+        command -v "$backend" >/dev/null 2>&1 || continue
+        if [[ "$backend" == "ip6tables" && ! -f /proc/net/if_inet6 ]]; then
+            continue
         fi
 
-        # 持久化 (如果有 netfilter-persistent)
-        if command -v netfilter-persistent &>/dev/null; then
-            netfilter-persistent save 2>/dev/null || true
+        for protocol in "${protocols[@]}"; do
+            rule_present=0
+            "$backend" -C INPUT -p "$protocol" --dport "$port" -j ACCEPT \
+                >/dev/null 2>&1 && rule_present=1
+            if ((rule_present == 0)); then
+                if "$backend" -I INPUT -p "$protocol" --dport "$port" -j ACCEPT \
+                    >/dev/null 2>&1; then
+                    netfilter_changed=1
+                else
+                    failed=1
+                fi
+            fi
+        done
+    done
+
+    # 仅在本次新增了 netfilter 规则时持久化；重复调用不反复 save。
+    if ((netfilter_changed == 1)) && command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || failed=1
+    fi
+
+    # firewall-cmd --state 成功表示 firewalld 当前活跃。
+    if command -v firewall-cmd >/dev/null 2>&1 \
+        && firewall-cmd --state >/dev/null 2>&1; then
+        for protocol in "${protocols[@]}"; do
+            if ! firewall-cmd --permanent --query-port="${port}/${protocol}" \
+                >/dev/null 2>&1; then
+                if firewall-cmd --permanent --add-port="${port}/${protocol}" \
+                    >/dev/null 2>&1; then
+                    firewalld_changed=1
+                else
+                    failed=1
+                fi
+            fi
+        done
+        if ((firewalld_changed == 1)); then
+            firewall-cmd --reload >/dev/null 2>&1 || failed=1
         fi
     fi
 
-    # firewalld (if available)
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="${port}/tcp" 2>/dev/null || true
-        firewall-cmd --permanent --add-port="${port}/udp" 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
+    # ufw 自身会对已有 allow 规则去重；显式携带传输层协议。
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw_status=$(ufw status 2>/dev/null); then
+            if printf '%s\n' "$ufw_status" | grep -q '^Status:[[:space:]]*active'; then
+                for protocol in "${protocols[@]}"; do
+                    ufw allow "${port}/${protocol}" >/dev/null 2>&1 || failed=1
+                done
+            fi
+        else
+            # 安装了 ufw 但无法读取状态，不能安全当作“未启用”。
+            failed=1
+        fi
     fi
 
-    # ufw (if available)
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port" 2>/dev/null || true
-    fi
+    ((failed == 0))
 }
 
 # 获取当前端口配置

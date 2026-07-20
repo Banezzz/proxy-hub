@@ -1,6 +1,7 @@
 # Proxy Hub
 
-一键部署多协议代理节点的自动化脚本，支持 VLESS Reality、Shadowsocks 2022、多节点管理、WARP 分流、系统优化工具和多语言界面。
+一键部署多协议代理节点的自动化脚本，支持 VLESS Reality、Shadowsocks 2022、
+AnyTLS、Hysteria2、多节点管理、WARP 分流、系统优化工具和多语言界面。
 
 ## 特性
 
@@ -10,17 +11,20 @@
 - **Shadowsocks 2022** - 高性能 SS 协议，支持多种加密方式
 - **AnyTLS** - 基于 sing-box 的抗 "TLS in TLS" 检测协议，自签名证书
 - **AnyTLS + REALITY** - AnyTLS 叠加 REALITY 伪装，抗封锁能力更强（推荐）
+- **Hysteria2** - 基于 sing-box 的 QUIC/UDP 协议，适合高延迟或不稳定链路
 
-> AnyTLS 由 sing-box 提供（Xray 暂不支持 AnyTLS），脚本会在添加 AnyTLS 节点时
-> 自动安装并管理 sing-box，与 Xray 各自独立运行、互不影响。每个 AnyTLS 节点都会
-> 生成**独立、随机化的 padding scheme**，服务端在握手时自动下发给客户端，无需客户端额外配置。
+> AnyTLS 与 Hysteria2 由 sing-box 提供；VLESS 与 Shadowsocks 由 Xray 提供。
+> 脚本按节点类型安装、生成并同步对应内核的配置。每个 AnyTLS 节点都会生成
+> **独立、随机化的 padding scheme**；Hysteria2 使用独立密码和自签名 TLS 证书，
+> 客户端分享链接会带 `insecure=1`。
 
 ### 核心功能
 - **多节点支持** - 同时运行多个节点，独立配置
 - **双栈链接** - 自动检测并生成 IPv4/IPv6 分享链接
 - **动态 SNI** - 自动测试 117 个域名，选择最低延迟 SNI
 - **并行测试** - 30 并发测试，5-10 秒完成（原需 4+ 分钟）
-- **二维码** - 自动生成分享二维码
+- **二维码** - 自动生成分享二维码；`both` 节点分别显示 Vision 与 XHTTP 两个二维码
+- **安装验收** - 服务健康后才按 TCP/UDP 类型放行本机端口并报告安装成功；失败自动回滚新节点
 
 ### 系统优化工具
 - **WARP 分流** - Netflix/AI 服务智能分流
@@ -133,6 +137,7 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
   4. Shadowsocks 2022         (SS 协议, 高性能)
   5. AnyTLS                   (sing-box, 自签名证书)
   6. AnyTLS + REALITY         (sing-box, 抗封锁, 推荐)
+  7. Hysteria2                (sing-box, QUIC/UDP)
 ```
 
 ### Shadowsocks 加密方式
@@ -192,6 +197,9 @@ name=at1 proto=anytls atpt=8443 ./proxy-hub.sh install
 # AnyTLS + REALITY 节点 (推荐)
 name=ar1 proto=anytls-reality atpt=443 reym=www.microsoft.com ./proxy-hub.sh install
 
+# Hysteria2 节点 (QUIC/UDP)
+name=hy1 proto=hysteria2 hy2pt=8443 ./proxy-hub.sh install
+
 # 指定 UUID (VLESS)
 uuid=your-custom-uuid ./proxy-hub.sh install
 
@@ -204,12 +212,15 @@ name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `name` | 节点名称 | `name=hk1` |
-| `proto` | 协议类型 | `proto=vision/xhttp/both/shadowsocks/anytls/anytls-reality` |
+| `proto` | 协议类型 | `proto=vision/xhttp/both/shadowsocks/anytls/anytls-reality/hysteria2` |
 | `vlpt` | Vision 端口 | `vlpt=443` |
 | `xhpt` | XHTTP 端口 | `xhpt=8443` |
 | `sspt` | Shadowsocks 端口 | `sspt=8388` |
 | `atpt` | AnyTLS 端口 | `atpt=8443` |
 | `atpwd` | AnyTLS 密码 (默认随机) | `atpwd=xxxxxxxx` |
+| `hy2pt` | Hysteria2 UDP 端口 | `hy2pt=8443` |
+| `hy2pwd` | Hysteria2 密码（默认随机，8-128 位 URI 安全字符） | `hy2pwd=xxxxxxxx` |
+| `hy2sni` | Hysteria2 TLS SNI（默认 `www.bing.com`） | `hy2sni=edge.example.com` |
 | `reym` | SNI 域名 (VLESS / AnyTLS+REALITY) | `reym=www.microsoft.com` |
 | `uuid` | 自定义 UUID | `uuid=xxx-xxx-xxx` |
 
@@ -265,6 +276,20 @@ TCP 拥塞控制优化：
 
 **注意**: 修改 SSH 端口前，请确保已在云服务商控制台放行新端口！
 
+节点安装成功后，脚本会按协议传输类型放行本机防火墙：VLESS/AnyTLS 使用 TCP，
+Hysteria2 使用 UDP，Shadowsocks 使用 TCP 和 UDP。云服务商安全组不在来宾系统的
+控制范围内，仍需在控制台放行相同端口和传输类型。
+
+### SS2022 时间同步提示
+
+Shadowsocks 2022 对系统时间较敏感。节点安装完成后可选择：
+
+- 安装并启用时间同步；
+- 只通过 HTTP 校验时间准确度；
+- 跳过。
+
+在没有宿主机时间权限的容器中，只提供“校验”和“跳过”，不会尝试修改宿主机时钟。
+
 ### 日志查看
 
 ```bash
@@ -308,6 +333,9 @@ name=jp1 proto=xhttp ./proxy-hub.sh install
 
 # 命令行添加 Shadowsocks 节点
 name=ss1 proto=shadowsocks sspt=8388 ./proxy-hub.sh install
+
+# 命令行添加 Hysteria2 节点
+name=hy1 proto=hysteria2 hy2pt=8443 ./proxy-hub.sh install
 ```
 
 ### 查看所有节点
@@ -341,7 +369,7 @@ name=ss1 proto=shadowsocks sspt=8388 ./proxy-hub.sh install
 - **Bash**: 4.3+（脚本会自动检测）
 - **架构**: x86_64, aarch64
 - **权限**: root 用户
-- **网络**: 需要访问 GitHub 下载 Xray
+- **网络**: 需要访问 GitHub 下载 Xray 或 sing-box
 
 ## 客户端配置
 
@@ -418,6 +446,20 @@ Fingerprint: chrome
 > [mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo)、NekoBox 等。
 > 旧版 v2rayN/v2rayNG（仅 Xray 内核）不支持 AnyTLS。
 
+### Hysteria2
+
+```
+协议: Hysteria2
+地址: your.server.ip
+端口: 8443 (UDP)
+密码: xxxxxxxxxxxxxxxx
+SNI: www.bing.com
+允许不安全 (insecure): 是   # 自签名证书
+```
+
+分享链接使用 `hysteria2://` scheme。客户端和云安全组都必须允许对应 UDP 端口；
+仅开放同号 TCP 端口不能建立 Hysteria2 连接。
+
 ### 推荐客户端
 
 | 平台 | 客户端 |
@@ -434,6 +476,9 @@ Fingerprint: chrome
 |------|------|
 | Xray 程序 | `/usr/local/bin/xray` |
 | Xray 配置 | `/usr/local/etc/xray/config.json` |
+| sing-box 程序 | `/usr/local/bin/sing-box` |
+| sing-box 配置 | `/usr/local/etc/sing-box/config.json` |
+| sing-box 证书 | `/usr/local/etc/sing-box/certs/` |
 | GeoIP 数据 | `/usr/local/share/xray/geoip.dat` |
 | GeoSite 数据 | `/usr/local/share/xray/geosite.dat` |
 | 节点配置目录 | `/root/reality_nodes/` |
@@ -486,9 +531,20 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 ### Q: 多节点共用一个 Xray 进程吗？
 
-是的，所有节点配置在同一个 Xray 配置文件中作为多个 inbounds，共用一个 Xray 进程。
+VLESS 与 Shadowsocks 节点在同一个 Xray 配置中作为多个 inbounds；AnyTLS 与
+Hysteria2 节点在同一个 sing-box 配置中作为多个 inbounds。两个内核独立运行，
+脚本会按现有节点类型同步和重启需要的服务。
 
 ## 更新日志
+
+### v5.6.0
+- 新增 Hysteria2 节点，复用现有 sing-box 服务和安全配置生成路径，支持
+  `proto=hysteria2`/`hy2`、`hy2pt`、`hy2pwd`、IPv4/IPv6 分享链接与二维码
+- 修复 `both` 节点二维码只显示 Vision：安装完成和 `qr` 命令现在分别显示 Vision、
+  XHTTP 两个二维码，同时继续使用安全节点配置加载
+- SS2022 安装后改为时间同步菜单；无时钟权限的容器只提供准确度检查与跳过
+- 安装流程在代理服务健康后按 transport 放行本机防火墙；启动失败会输出诊断、
+  删除本次节点并重建原有内核配置，不再显示误导性的安装成功和二维码
 
 ### v5.5.0
 - 修复：创建 AnyTLS / AnyTLS+REALITY 节点后，定时重启功能实际重启的服务。

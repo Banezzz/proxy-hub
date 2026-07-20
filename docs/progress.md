@@ -1,5 +1,33 @@
 # 变更记录
 
+## 2026-07-21 — 整合远端节点与安装可靠性改进
+
+- 将远端 Hysteria2 功能适配到模块化架构，并改为复用现有 sing-box，而不是安装
+  独立 hysteria 二进制或创建每节点 service。新增 `hysteria2`/`hy2` 协议选择、
+  `hy2pt`/`hy2pwd` 参数、安全节点 schema、UDP 端口选择、sing-box inbound、
+  IPv4/IPv6 信息、分享链接、二维码、列表、状态、健康检查和删除/卸载同步。
+- 修复 `both` 节点仅显示 Vision 二维码：安装完成和 `qr` 命令共用安全二维码分派，
+  分别输出 Vision 与 XHTTP，且不恢复旧分支直接 source 节点 env 的注入风险。
+- 将 SS2022 安装后的 y/n 提示改为“安装时间同步、只检查准确度、跳过”菜单；
+  无时钟权限的容器仅提供检查和跳过，并保留明确的权限说明。
+- 安装完成语义收紧为服务健康门：Xray 或 sing-box 配置通过校验并成功启动后，才按
+  协议 transport 放行本机端口并显示成功信息。Vision/XHTTP/AnyTLS 用 TCP，
+  Hysteria2 用 UDP，Shadowsocks 用 TCP+UDP；服务失败会输出诊断、移除本次节点并
+  重建原有配置，避免留下“已安装但不可用”的节点。
+
+影响范围：协议选择、节点 env schema、Xray/sing-box 配置聚合、安装成功/回滚语义、
+本机防火墙、二维码与 SS2022 安装后交互。既有 VLESS、Shadowsocks、AnyTLS 节点文件
+保持兼容；Hysteria2 新增 `HY2_PASSWORD` 键。
+
+兼容性：`get_share_link` 继续返回单链接，`both` 的双输出只发生在二维码入口；
+Hysteria2 使用自签名证书，客户端需接受 `insecure=1`。本机放行不能替代云厂商
+安全组，Hysteria2 必须额外开放 UDP 而非同号 TCP。
+
+验证方式：协议/节点 schema 单元测试，sing-box 混合 AnyTLS+Hysteria2 配置测试，
+二维码协议矩阵，SS2022 主机/容器菜单矩阵，TCP/UDP 防火墙分派与 Xray/sing-box
+启动失败回滚测试；随后重建 manifest/dist，运行仓库完整测试、`bash -n` 和
+`git diff --check`。
+
 ## 2026-07-20 — 拆分单文件入口
 
 - 将约 7,000 行的单文件实现按安全状态、运行平台、安装器、网络配置、节点命令

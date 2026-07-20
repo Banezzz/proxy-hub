@@ -31,20 +31,47 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | 变量 | 契约 |
 | --- | --- |
 | `name` | 节点名称 |
-| `proto` | `vision`, `xhttp`, `both`, `shadowsocks`/`ss`, `anytls`, `anytls-reality` |
+| `proto` | `vision`, `xhttp`, `both`, `shadowsocks`/`ss`, `anytls`, `anytls-reality`, `hysteria2`/`hy2` |
 | `xhttp` | 兼容参数；`true`/`1`/`y` 等同 `proto=both` |
 | `reym` | SNI 域名 |
 | `vlpt` | Vision 端口 |
 | `xhpt` | XHTTP 端口 |
 | `sspt` | Shadowsocks 端口 |
 | `atpt` | AnyTLS 端口 |
+| `hy2pt` | Hysteria2 UDP 端口 |
 | `uuid` | VLESS UUID |
 | `ssmethod` | Shadowsocks method |
 | `sspwd` | Shadowsocks 密码 |
 | `atpwd` | AnyTLS 密码 |
+| `hy2pwd` | Hysteria2 密码；8-128 位 URI 安全字符，不传时随机生成 |
+| `hy2sni` | Hysteria2 TLS SNI；不传时使用 `www.bing.com` |
 | `restart` | `daily`, `12h`, `6h`, `weekly`, `no` 及既有布尔别名 |
 
 变量名为既有的小写 shell 环境变量，拆分不能改名或转换为只接受命令行 flag。
+
+## 协议运行时契约
+
+| `PROTOCOL_TYPE` | 内核 | 监听 transport | 安装后本机防火墙 |
+| --- | --- | --- | --- |
+| `vision` | Xray | TCP | `PORT/tcp` |
+| `xhttp` | Xray | TCP | `XHTTP_PORT/tcp` |
+| `both` | Xray | TCP | `PORT/tcp` 与 `XHTTP_PORT/tcp` |
+| `shadowsocks` | Xray | TCP+UDP | `PORT/tcp` 与 `PORT/udp` |
+| `anytls`, `anytls_reality` | sing-box | TCP | `PORT/tcp` |
+| `hysteria2` | sing-box | UDP/QUIC | `PORT/udp` |
+
+AnyTLS 与 Hysteria2 聚合到同一个 `/usr/local/etc/sing-box/config.json` 和 sing-box
+service；Hysteria2 不引入独立二进制或每节点 service。Hysteria2 使用逐节点自签名
+证书，分享链接使用 `hysteria2://` 并包含 `insecure=1`。云平台安全组不属于本机
+防火墙契约，调用方仍须按上表开放外部入口。
+
+## 交互输出契约
+
+- `qr` 与安装完成后的二维码使用同一安全节点加载和协议分派路径。
+- `vision`、`xhttp`、Shadowsocks、AnyTLS、Hysteria2 各显示一个二维码；`both`
+  分别显示 Vision 和 XHTTP 两个二维码。`get_share_link` 继续保持单链接兼容行为。
+- SS2022 安装后的时间同步提示在普通环境提供 `1=安装`、`2=检查`、`0=跳过`；
+  无时钟权限的容器只提供 `1=检查`、`0=跳过`。跳过、空输入和无效输入无副作用。
 
 ## Loader 环境变量
 
@@ -130,10 +157,12 @@ HTTPS 和同源 checksum 只证明所下载字节的一致性，不能独立认�
 NODE_NAME SERVER_IP SERVER_IPV4 SERVER_IPV6 PORT UUID SNI
 PUBLIC_KEY PRIVATE_KEY SHORT_ID PROTOCOL_TYPE XHTTP_PORT XHTTP_PATH
 SS_METHOD SS_PASSWORD ANYTLS_PASSWORD ANYTLS_PADDING_B64
+HY2_PASSWORD
 ```
 
-旧配置没有 `PROTOCOL_TYPE` 时继续按现有端口字段推断协议；加密字段继续兼容明文
-和现有 OpenSSL 格式。
+旧配置没有 `PROTOCOL_TYPE` 时继续按现有端口字段推断协议；`UUID`、私钥、SS/AnyTLS/
+Hysteria2 密码等敏感字段继续兼容明文和现有 OpenSSL 格式。节点文件只能通过安全
+配置读取器加载，禁止直接 source。
 
 ## 错误语义
 
@@ -141,6 +170,10 @@ SS_METHOD SS_PASSWORD ANYTLS_PASSWORD ANYTLS_PADDING_B64
 - 下载失败、hash mismatch、远程 trailer 错误、本地 manifest 错误和缺少 hash
   工具均返回非零。
 - 业务命令的既有退出码和 stdout/stderr 分流保持不变。
+- 节点安装只有在目标内核配置生成/校验成功、服务重启且健康检查通过后才输出成功、
+  分享链接和二维码，并在这之后按协议 transport 放行本机防火墙。
+- 配置或服务健康门失败时返回非零，移除本次节点并重建此前节点的内核配置；失败
+  诊断写 stderr，且不得继续输出安装成功信息。
 
 ## 写操作锁契约
 

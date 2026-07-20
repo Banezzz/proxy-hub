@@ -1,3 +1,96 @@
+show_proxy_service_failure_logs() {
+    local service_name="$1"
+    local fallback_log="${2:-}"
+    local output=""
+
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        [[ -n "$fallback_log" ]] && output=$(tail -n 30 "$fallback_log" 2>/dev/null || true)
+    else
+        output=$(journalctl -u "$service_name" --no-pager -n 30 2>/dev/null || true)
+    fi
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "----- $service_name (last 30 lines) -----" >&2
+        printf '%s\n' "$output" >&2
+    fi
+}
+
+# Remove only the candidate node and prove that the previous core state can be
+# rebuilt. A failed rollback remains a hard failure instead of being hidden.
+rollback_candidate_node() {
+    local protocol="$1"
+    local node_name="$2"
+    local node_file
+    node_file=$(get_node_file "$node_name")
+
+    rm -f "$node_file" 2>/dev/null
+    rm -f "$SINGBOX_CERT_DIR/${node_name}.crt" "$SINGBOX_CERT_DIR/${node_name}.key" 2>/dev/null
+
+    case "$protocol" in
+        anytls|anytls_reality|hysteria2)
+            if ! singbox_sync; then
+                log_error "Rollback failed while restoring sing-box state"
+                return 1
+            fi
+            ;;
+        *)
+            if ! write_config; then
+                log_error "Rollback failed while rebuilding Xray config"
+                return 1
+            fi
+            if [[ "$(xray_node_count)" -gt 0 ]]; then
+                if ! service_restart xray || ! service_is_active xray; then
+                    log_error "Rollback failed while restoring Xray service"
+                    return 1
+                fi
+            else
+                service_stop xray
+            fi
+            ;;
+    esac
+}
+
+# Open only the transports used by a node. Firewall tooling is best-effort
+# because cloud security groups and host policy may be managed externally, but
+# every active-backend failure is surfaced to the operator.
+open_node_firewall_ports() {
+    local protocol="$1"
+
+    case "$protocol" in
+        hysteria2)
+            open_firewall_port "$PORT" udp || \
+                log_warn "Could not automatically open UDP port $PORT"
+            ;;
+        shadowsocks)
+            open_firewall_port "$PORT" both || \
+                log_warn "Could not automatically open TCP/UDP port $PORT"
+            ;;
+        anytls|anytls_reality|vision)
+            if [[ -n "${PORT:-}" ]]; then
+                open_firewall_port "$PORT" tcp || \
+                    log_warn "Could not automatically open TCP port $PORT"
+            fi
+            ;;
+        xhttp)
+            if [[ -n "${XHTTP_PORT:-}" ]]; then
+                open_firewall_port "$XHTTP_PORT" tcp || \
+                    log_warn "Could not automatically open TCP port $XHTTP_PORT"
+            fi
+            ;;
+        both)
+            if [[ -n "${PORT:-}" ]]; then
+                open_firewall_port "$PORT" tcp || \
+                    log_warn "Could not automatically open TCP port $PORT"
+            fi
+            if [[ -n "${XHTTP_PORT:-}" ]]; then
+                open_firewall_port "$XHTTP_PORT" tcp || \
+                    log_warn "Could not automatically open TCP port $XHTTP_PORT"
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
 cmd_install() {
     if ! is_root; then
         log_error "$(msg run_as_root)"
@@ -13,13 +106,17 @@ cmd_install() {
 
     # 交互式输入节点名称（或使用环境变量 name=xxx）
     if [[ -n "${name:-}" ]]; then
-        CURRENT_NODE_NAME="$name"
+        CURRENT_NODE_NAME=$(printf '%s' "$name" | tr -cd 'a-zA-Z0-9_-')
+        if [[ -z "$CURRENT_NODE_NAME" || "$CURRENT_NODE_NAME" != "$name" ]]; then
+            log_error "Node name may contain only letters, numbers, underscore, and dash"
+            return 1
+        fi
         # 如果名称已存在，添加后缀
         local base_name="$CURRENT_NODE_NAME"
         local counter=1
         while node_exists "$CURRENT_NODE_NAME"; do
             CURRENT_NODE_NAME="${base_name}_${counter}"
-            ((counter++))
+            ((++counter))
         done
     else
         CURRENT_NODE_NAME=$(prompt_node_name)
@@ -28,13 +125,14 @@ cmd_install() {
 
     # 选择协议类型（除非通过环境变量指定）
     if [[ -n "${proto:-}" ]]; then
-        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality
+        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality/hysteria2
         case "$proto" in
             xhttp) PROTOCOL_TYPE="xhttp" ;;
             both) PROTOCOL_TYPE="both" ;;
             shadowsocks|ss) PROTOCOL_TYPE="shadowsocks" ;;
             anytls) PROTOCOL_TYPE="anytls" ;;
             anytls-reality|anytls_reality|anytlsreality) PROTOCOL_TYPE="anytls_reality" ;;
+            hysteria2|hy2) PROTOCOL_TYPE="hysteria2" ;;
             *) PROTOCOL_TYPE="vision" ;;
         esac
         log_info "协议类型: $PROTOCOL_TYPE"
@@ -48,11 +146,10 @@ cmd_install() {
         prompt_protocol_type
     fi
 
-    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS 用 sing-box
-    # （sing-box 在下方 AnyTLS 分支中安装，便于复用安装失败的回滚处理）
+    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS / Hysteria2 用 sing-box。
     case "$PROTOCOL_TYPE" in
-        anytls|anytls_reality)
-            : # sing-box 在 AnyTLS 分支中安装
+        anytls|anytls_reality|hysteria2)
+            : # sing-box 在对应协议分支中安装
             ;;
         *)
             install_xray || { log_error "Xray 安装失败"; return 1; }
@@ -87,6 +184,27 @@ cmd_install() {
         PUBLIC_KEY=""
         PRIVATE_KEY=""
         SHORT_ID=""
+        ANYTLS_PASSWORD=""
+        ANYTLS_PADDING_B64=""
+        HY2_PASSWORD=""
+    elif [[ "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        install_singbox || { log_error "sing-box 安装失败"; return 1; }
+        gen_hy2_password || return 1
+        SNI="${hy2sni:-www.bing.com}"
+        if ! validate_tls_server_name "$SNI"; then
+            log_error "Invalid Hysteria2 TLS SNI: $SNI"
+            return 1
+        fi
+        choose_ports || return 1
+
+        UUID=""
+        PUBLIC_KEY=""
+        PRIVATE_KEY=""
+        SHORT_ID=""
+        SS_METHOD=""
+        SS_PASSWORD=""
+        ANYTLS_PASSWORD=""
+        ANYTLS_PADDING_B64=""
     elif [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
         # AnyTLS 安装流程（基于 sing-box）
         install_singbox || { log_error "sing-box 安装失败"; return 1; }
@@ -117,6 +235,7 @@ cmd_install() {
             PRIVATE_KEY=""
             SHORT_ID=""
         fi
+        HY2_PASSWORD=""
     else
         # VLESS 安装流程
         # 安装时清除 SNI 缓存，强制重新测试
@@ -132,6 +251,9 @@ cmd_install() {
         gen_uuid
         choose_ports
         gen_reality_keys
+        ANYTLS_PASSWORD=""
+        ANYTLS_PADDING_B64=""
+        HY2_PASSWORD=""
     fi
 
     # 检测双栈 IP
@@ -139,51 +261,61 @@ cmd_install() {
 
     save_env
 
-    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
-        # AnyTLS 节点：由 sing-box 处理
-        # plain AnyTLS 需要自签名证书
-        if [[ "$PROTOCOL_TYPE" == "anytls" ]]; then
-            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
+        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+            if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
+                log_error "Failed to generate TLS certificate, rolling back..."
+                rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+                    log_error "Manual recovery may be required for sing-box"
+                return 1
+            fi
         fi
 
         if ! singbox_sync; then
-            log_error "Failed to configure sing-box, rolling back..."
-            local node_file
-            node_file=$(get_node_file "$CURRENT_NODE_NAME")
-            rm -f "$node_file" 2>/dev/null
-            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
-            singbox_sync  # 重新同步以反映回滚
+            log_error "Failed to configure or start sing-box, rolling back..."
+            show_proxy_service_failure_logs "$SINGBOX_SERVICE" /var/log/sing-box.log
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+                log_error "Manual recovery may be required for sing-box"
             return 1
         fi
+
+        open_node_firewall_ports "$PROTOCOL_TYPE"
     else
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
             log_error "Failed to generate Xray config, rolling back..."
-            # 删除刚保存的节点配置
-            local node_file
-            node_file=$(get_node_file "$CURRENT_NODE_NAME")
-            rm -f "$node_file" 2>/dev/null
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+                log_error "Manual recovery may be required for Xray"
             return 1
         fi
 
         service_enable xray
-        service_restart xray
+        if ! service_restart xray; then
+            log_error "Xray service restart failed after install"
+            show_proxy_service_failure_logs xray /var/log/xray/error.log
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+                log_error "Manual recovery may be required for Xray"
+            return 1
+        fi
 
-        # 验证服务启动成功
         sleep 1
         if ! service_is_active xray; then
-            log_warn "Xray service may not have started correctly. Run 'xray health' to check."
+            log_error "Xray service failed to become active after install"
+            show_proxy_service_failure_logs xray /var/log/xray/error.log
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+                log_error "Manual recovery may be required for Xray"
+            return 1
         fi
+
+        open_node_firewall_ports "$PROTOCOL_TYPE"
     fi
 
     log_info "$(msg install_complete)"
 
     show_info
 
-    # 显示主要链接的二维码
-    local link
-    link=$(get_share_link)
-    show_qrcode "$link"
+    show_node_qrcodes
 
     # 询问是否启用定时重启 Xray（仅首次创建节点时提示，或通过环境变量 restart= 指定）
     prompt_xray_restart_on_install
@@ -208,9 +340,7 @@ cmd_qr() {
         $PKG_INSTALL qrencode >/dev/null 2>&1
     fi
 
-    local link
-    link=$(get_share_link)
-    show_qrcode "$link"
+    show_node_qrcodes
 }
 
 # 列出所有节点
@@ -240,6 +370,8 @@ cmd_list() {
         local proto="${PROTOCOL_TYPE:-vision}"
         if [[ "$proto" == "shadowsocks" ]]; then
             display_port="${PORT:-N/A}"
+        elif [[ "$proto" == "hysteria2" ]]; then
+            display_port="${PORT:-N/A} (UDP)"
         elif [[ "$proto" == "xhttp" ]]; then
             display_port="${XHTTP_PORT:-N/A}"
         elif [[ "$proto" == "both" ]]; then
@@ -251,6 +383,9 @@ cmd_list() {
         if [[ "$proto" == "shadowsocks" ]]; then
             echo -e "     Port: $display_port | Method: ${SS_METHOD:-N/A}"
             echo -e "     Password: ${SS_PASSWORD:0:12}..."
+        elif [[ "$proto" == "hysteria2" ]]; then
+            echo -e "     Port: $display_port | Type: Hysteria2"
+            echo -e "     Password: ${HY2_PASSWORD:0:12}..."
         elif [[ "$proto" == "anytls" || "$proto" == "anytls_reality" ]]; then
             local at_label="AnyTLS"
             [[ "$proto" == "anytls_reality" ]] && at_label="AnyTLS + REALITY"
@@ -265,7 +400,7 @@ cmd_list() {
             fi
         fi
         echo ""
-        ((i++))
+        ((++i))
     done
 
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -278,18 +413,19 @@ cmd_status() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
 
-    if service_is_active xray; then
-        echo -e "  Xray: ${GREEN}● Running${NC}"
-    else
-        echo -e "  Xray: ${RED}○ Stopped${NC}"
+    if [[ "$(xray_node_count)" -gt 0 ]]; then
+        if service_is_active xray; then
+            echo -e "  Xray: ${GREEN}● Running${NC}"
+        else
+            echo -e "  Xray: ${RED}○ Stopped${NC}"
+        fi
     fi
 
-    # sing-box（AnyTLS）状态：仅在已安装时显示
-    if [[ -f "$SINGBOX_BIN" ]]; then
+    if [[ "$(singbox_node_count)" -gt 0 ]]; then
         if service_is_active "$SINGBOX_SERVICE"; then
-            echo -e "  sing-box (AnyTLS): ${GREEN}● Running${NC}"
+            echo -e "  sing-box (AnyTLS/Hysteria2): ${GREEN}● Running${NC}"
         else
-            echo -e "  sing-box (AnyTLS): ${RED}○ Stopped${NC}"
+            echo -e "  sing-box (AnyTLS/Hysteria2): ${RED}○ Stopped${NC}"
         fi
     fi
 
@@ -303,9 +439,14 @@ cmd_status() {
         echo -e "  ${BLUE}Active connections:${NC}"
         for node_file in "$NODES_DIR"/*.env; do
             [[ -f "$node_file" ]] || continue
-            local n_name n_port
+            local n_name n_port n_proto
             n_name=$(basename "$node_file" .env)
-            n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
+            n_port=$(safe_read_config_value "$node_file" "PORT")
+            n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
+            if [[ "$n_proto" == "hysteria2" ]]; then
+                echo -e "    $n_name (UDP $n_port): Hysteria2"
+                continue
+            fi
             local conn_count
             conn_count=$(ss -tn state established "( sport = :${n_port} )" 2>/dev/null | tail -n +2 | wc -l)
             echo -e "    $n_name (Port $n_port): ${GREEN}${conn_count}${NC}"
@@ -313,53 +454,76 @@ cmd_status() {
     fi
 
     echo ""
-    service_status xray
+    [[ "$(xray_node_count)" -gt 0 ]] && service_status xray
+    [[ "$(singbox_node_count)" -gt 0 ]] && service_status "$SINGBOX_SERVICE"
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
 cmd_restart() {
-    service_restart xray
+    local restarted=false
+    if [[ "$(xray_node_count)" -gt 0 ]]; then
+        service_restart xray || return 1
+        restarted=true
+    fi
+    if [[ "$(singbox_node_count)" -gt 0 ]]; then
+        service_restart "$SINGBOX_SERVICE" || return 1
+        restarted=true
+    fi
+    if ! $restarted; then
+        log_error "No configured proxy nodes"
+        return 1
+    fi
     log_info "$(msg service_restarted)"
 }
 
 # 重新生成配置文件（用于修复配置问题）
 cmd_regenerate() {
-    log_info "Regenerating Xray config from node files..."
+    log_info "Regenerating proxy configs from node files..."
 
-    # 备份当前配置
-    if [[ -f "$XRAY_CONF" ]]; then
+    local xray_count
+    xray_count=$(xray_node_count)
+
+    # 仅在存在 Xray 节点时重建并验证 Xray；Hysteria2-only 不应依赖 Xray。
+    if [[ "$xray_count" -gt 0 && -f "$XRAY_CONF" ]]; then
         cp "$XRAY_CONF" "${XRAY_CONF}.bak"
         log_info "Backed up current config to ${XRAY_CONF}.bak"
     fi
 
-    # 重新生成配置
-    if write_config; then
-        log_info "Config regenerated successfully"
-        service_restart xray
-        sleep 1
-        if service_is_active xray; then
-            log_info "Xray service restarted successfully"
+    if [[ "$xray_count" -gt 0 ]]; then
+        if write_config; then
+            log_info "Xray config regenerated successfully"
+            if ! service_restart xray; then
+                log_error "Xray service restart failed. Restoring backup..."
+                [[ -f "${XRAY_CONF}.bak" ]] && mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+                service_restart xray >/dev/null 2>&1 || true
+                return 1
+            fi
+            sleep 1
+            if ! service_is_active xray; then
+                log_error "Xray service failed to start. Restoring backup..."
+                if [[ -f "${XRAY_CONF}.bak" ]]; then
+                    mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+                    service_restart xray >/dev/null 2>&1 || true
+                fi
+                return 1
+            fi
         else
-            log_error "Xray service failed to start. Restoring backup..."
+            log_error "Failed to regenerate Xray config"
             if [[ -f "${XRAY_CONF}.bak" ]]; then
+                log_info "Restoring backup config..."
                 mv "${XRAY_CONF}.bak" "$XRAY_CONF"
-                service_restart xray
             fi
             return 1
         fi
     else
-        log_error "Failed to regenerate config"
-        if [[ -f "${XRAY_CONF}.bak" ]]; then
-            log_info "Restoring backup config..."
-            mv "${XRAY_CONF}.bak" "$XRAY_CONF"
-        fi
-        return 1
+        service_stop xray
     fi
 
-    # 同步 sing-box（AnyTLS）配置
+    # 同步 sing-box（AnyTLS / Hysteria2）配置。
     if ! singbox_sync; then
-        log_warn "sing-box config sync failed"
+        log_error "sing-box config sync failed"
+        return 1
     fi
 
     # 清理备份
@@ -387,16 +551,14 @@ cmd_remove() {
     fi
 
     rm -f "$node_file"
-    # 清理可能存在的 AnyTLS 自签名证书
+    # 清理可能存在的 AnyTLS / Hysteria2 自签名证书
     rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
     log_info "Node '$CURRENT_NODE_NAME' removed"
 
-    # 重新生成 xray 配置
-    write_config
-    service_restart xray
-
-    # 同步 sing-box（AnyTLS）配置：无 AnyTLS 节点时会自动停止服务
-    singbox_sync
+    if ! cmd_regenerate; then
+        log_error "Node removed, but the remaining proxy configuration could not be applied"
+        return 1
+    fi
 
     log_info "Config updated"
 }
@@ -414,6 +576,7 @@ cmd_edit() {
     PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
     SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
     ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
+    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -459,6 +622,11 @@ cmd_edit() {
                 echo -e "  ${GREEN}4.${NC} 重新生成 padding scheme"
                 [[ "$proto_type" == "anytls_reality" ]] && echo -e "  ${GREEN}5.${NC} 重新生成 Reality 密钥对"
                 ;;
+            hysteria2)
+                echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                ;;
             *)
                 log_error "未知协议类型: $proto_type"
                 return 1
@@ -488,6 +656,9 @@ cmd_edit() {
             vision:1|shadowsocks:1|anytls:1|anytls_reality:1)
                 PORT=$(prompt_port "新端口 / New port" "${PORT}")
                 changed=true ;;
+            hysteria2:1)
+                PORT=$(prompt_port "新 UDP 端口 / New UDP port" "${PORT}" 0 udp)
+                changed=true ;;
 
             # ---- SNI（测速 + 自定义）----
             vision:2|xhttp:2|both:3|anytls:2|anytls_reality:2)
@@ -496,6 +667,18 @@ cmd_edit() {
                 select_best_sni
                 sni_changed=true
                 changed=true ;;
+            hysteria2:2)
+                local new_hy2_sni
+                echo -n "  TLS SNI [${SNI:-www.bing.com}]: " >/dev/tty
+                read -r new_hy2_sni </dev/tty
+                new_hy2_sni="${new_hy2_sni:-${SNI:-www.bing.com}}"
+                if validate_tls_server_name "$new_hy2_sni"; then
+                    SNI="$new_hy2_sni"
+                    sni_changed=true
+                    changed=true
+                else
+                    log_warn "Invalid TLS SNI"
+                fi ;;
 
             # ---- UUID ----
             vision:3|xhttp:3|both:4)
@@ -531,6 +714,10 @@ cmd_edit() {
             anytls:3|anytls_reality:3)
                 gen_anytls_password
                 changed=true ;;
+            hysteria2:3)
+                unset hy2pwd
+                gen_hy2_password
+                changed=true ;;
 
             # ---- AnyTLS padding ----
             anytls:4|anytls_reality:4)
@@ -553,22 +740,24 @@ cmd_edit() {
     save_env
 
     # 重新生成对应内核配置并重启
-    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
-        # plain AnyTLS 改了 SNI：重新生成自签名证书（CN 跟随新 SNI）
-        if [[ "$proto_type" == "anytls" ]] && $sni_changed; then
+    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
+        # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
+        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
             rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
-            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
         fi
         if ! singbox_sync; then
             log_error "应用失败：sing-box 配置无效，请检查参数"
             return 1
         fi
+        open_node_firewall_ports "$proto_type"
     else
         if ! write_config; then
             log_error "应用失败：Xray 配置无效，请检查参数"
             return 1
         fi
-        service_restart xray
+        service_restart xray || return 1
+        open_node_firewall_ports "$proto_type"
     fi
 
     log_info "节点已更新 / Node updated"
@@ -600,7 +789,7 @@ cmd_uninstall() {
         fi
     fi
 
-    # 卸载 sing-box（AnyTLS）
+    # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
         service_stop "$SINGBOX_SERVICE"
         service_disable "$SINGBOX_SERVICE"
@@ -656,20 +845,21 @@ cmd_health() {
 
     local all_ok=true
 
-    # 1. 检查 Xray 服务状态
-    if service_is_active xray; then
-        echo -e "  ${GREEN}✓${NC} Xray service is running"
-    else
-        echo -e "  ${RED}✗${NC} Xray service is not running"
-        all_ok=false
+    # 1. 仅检查实际被节点使用的代理内核。
+    if [[ "$(xray_node_count)" -gt 0 ]]; then
+        if service_is_active xray; then
+            echo -e "  ${GREEN}✓${NC} Xray service is running"
+        else
+            echo -e "  ${RED}✗${NC} Xray service is not running"
+            all_ok=false
+        fi
     fi
 
-    # 1b. 检查 sing-box（AnyTLS）服务状态（仅当存在 AnyTLS 节点时校验）
-    if [[ "$(anytls_node_count)" -gt 0 ]]; then
+    if [[ "$(singbox_node_count)" -gt 0 ]]; then
         if service_is_active "$SINGBOX_SERVICE"; then
-            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS)"
+            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS/Hysteria2)"
         else
-            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS)"
+            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS/Hysteria2)"
             all_ok=false
         fi
     fi
@@ -689,10 +879,10 @@ cmd_health() {
         [[ -f "$node_file" ]] || continue
         local n_name n_port n_sni n_xhttp_port n_protocol_type
         n_name=$(basename "$node_file" .env)
-        n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
-        n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
-        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
-        n_protocol_type=$(grep "^PROTOCOL_TYPE=" "$node_file" | cut -d= -f2)
+        n_port=$(safe_read_config_value "$node_file" "PORT")
+        n_sni=$(safe_read_config_value "$node_file" "SNI")
+        n_xhttp_port=$(safe_read_config_value "$node_file" "XHTTP_PORT")
+        n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -736,10 +926,20 @@ cmd_health() {
             fi
         fi
 
+        if [[ "$n_protocol_type" == "hysteria2" ]] && [[ -n "$n_port" ]]; then
+            if ss -lnu 2>/dev/null | grep -qE ":${n_port}([[:space:]]|$)"; then
+                echo -e "    ${GREEN}✓${NC} Hysteria2 UDP port $n_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} Hysteria2 UDP port $n_port is not listening"
+                all_ok=false
+            fi
+            continue
+        fi
+
         # 测试 SNI 连接
-        if timeout 3 openssl s_client -connect "${n_sni}:443" -servername "$n_sni" </dev/null &>/dev/null; then
+        if [[ -n "$n_sni" ]] && timeout 3 openssl s_client -connect "${n_sni}:443" -servername "$n_sni" </dev/null &>/dev/null; then
             echo -e "    ${GREEN}✓${NC} SNI ($n_sni) is reachable"
-        else
+        elif [[ -n "$n_sni" ]]; then
             echo -e "    ${YELLOW}!${NC} SNI ($n_sni) connection timeout"
         fi
     done
@@ -856,20 +1056,14 @@ cmd_update_ip() {
     [[ -n "$current_ipv6" ]] && SERVER_IPV6="$current_ipv6"
     SERVER_IP="${current_ipv4:-$SERVER_IP}"
 
-    # 重新生成 Xray 配置（分享链接使用 .env 中的 IP，配置本身不含 IP，但为安全起见重新生成）
+    # 重新同步所有实际使用的代理内核。
     log_info "$(msg update_ip_regen)"
-    if write_config; then
-        log_info "$(msg update_ip_restarting)"
-        service_restart xray
-        sleep 1
-        if service_is_active xray; then
-            echo ""
-            echo -e "  ${GREEN}✓${NC} $(msg update_ip_complete)"
-        else
-            log_error "Xray service failed to start after IP update"
-        fi
+    if cmd_regenerate; then
+        echo ""
+        echo -e "  ${GREEN}✓${NC} $(msg update_ip_complete)"
     else
-        log_error "Failed to regenerate config"
+        log_error "Failed to synchronize proxy config after IP update"
+        return 1
     fi
 
     echo ""
