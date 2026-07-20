@@ -1,5 +1,17 @@
 # 当前未解决事项
 
+## Xray journal payload 在无法取得 inode 时可能残留
+
+- 严重性：low
+- 影响范围：Xray 更新或崩溃恢复写入持久 transaction journal 的 pre-rename 阶段。
+- 触发条件：state 目录内 `mktemp` 已成功，但紧随其后的 `stat` 因瞬时 I/O 或文件系统
+  故障无法读取新 payload 的 device/inode 或 metadata。
+- 影响：私有 root-owned state 目录内可能留下一个随机名空 payload；它不复用固定名称、
+  不会阻塞同 token 的后续恢复，也不会被当作有效 journal。
+- 临时缓解：修复文件系统/I/O 故障后，确认没有 Xray lifecycle 操作运行；仅删除
+  `/var/lib/proxy-hub/xray/.xray-update-state.*.payload.*` 中不属于有效 journal、且 owner
+  与 inode 已人工核实的普通单链接文件。
+
 ## 云平台安全组仍需按 transport 人工放行
 
 - 严重性：low

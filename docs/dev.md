@@ -20,6 +20,7 @@ SHA 时，才保证 loader 与 bundle 来自同一版本。
 proxy-hub.sh (loader)
   ├─ local:  lib/00_security_state.sh
   │          lib/10_runtime_platform_ui.sh
+  │          lib/15_xray_release.sh
   │          lib/20_installers_restart.sh
   │          lib/30_provision_network.sh
   │          lib/40_config_share.sh
@@ -35,7 +36,8 @@ proxy-hub.sh (loader)
 | --- | --- |
 | `00_security_state.sh` | 锁、安全下载/配置读取、JSON builder、加密、全局状态与常量 |
 | `10_runtime_platform_ui.sh` | 生命周期、日志与输入 UI、包管理器/init/service 适配、i18n、节点目录 |
-| `20_installers_restart.sh` | Xray、sing-box、GeoData 安装与代理内核定时重启 |
+| `15_xray_release.sh` | Xray release 查询、选择、校验、安装/更新事务、备份与恢复 |
+| `20_installers_restart.sh` | sing-box、GeoData 安装、Xray service 衔接与代理内核定时重启 |
 | `30_provision_network.sh` | 协议选择、凭据/transport-aware 端口生成、IP、证书与 SNI 探测 |
 | `40_config_share.sh` | Xray/sing-box 配置渲染、校验、同步、节点持久化、分享链接与二维码 |
 | `50_node_commands.sh` | 节点 install/info/list/edit/remove/health/update 等命令编排 |
@@ -96,13 +98,93 @@ SS2022 安装完成后的提示从 y/n 改为显式菜单。普通主机及具�
 不产生新的防火墙规则。来宾系统无法修改云厂商安全组，仍需用户按相同 transport
 在控制台放行；该边界记录在 `docs/audits.md`。
 
+## Xray Release Management
+
+Xray target 由一个 resolver 统一决定，优先级固定为
+`XRAY_VERSION > XRAY_CHANNEL > stable`。大写环境变量优先，同时兼容小写
+`xray_version`/`xray_channel`；固定版本只接受受限版本语法，去除用户可选的前导
+`v` 后再规范为单个 `v` 前缀。`stable` 使用 GitHub `releases/latest`，
+`prerelease` 使用 releases 列表中最新的非 draft release，不把用户输入或 API JSON
+当作 shell 代码执行。
+
+普通节点安装与显式 release 变更是两条不同路径：已有 `$XRAY_BIN` 可执行且能报告
+版本时，普通 `install` 只报告该版本并继续，不查询目标、不升级也不降级；全新安装
+或 `xray-update` 才进入 release transaction。`xray-version` 是只读状态命令：本地
+版本始终优先展示，stable 或 prerelease 查询单独失败时只标记该远端状态不可用。
+安全决策在 lifecycle lock 内按 `ordinary-install`、`channel-update`、`fixed-update` 意图
+重新读取实际 target：ordinary 永远保留健康 binary，channel 只升级，只有 fixed 允许
+重装、降级或修复不可识别的普通 binary。
+
+release transaction 的顺序不可交换：
+
+1. 解析目标并映射架构；
+2. 在私有临时目录下载 release zip 和同一官方 release 的 SHA-256 digest；
+3. 强制校验 digest、zip 完整性、新 binary 可执行性和报告版本；
+4. 以新 binary 的现代 CLI 测试现有 Xray 配置，必要时回退到旧 CLI 形式；
+5. 检查目标目录空间，在 `/usr/local/bin` 同目录准备 `0755` staged binary；
+6. 记录旧服务是否 active，创建带版本和时间戳的旧 binary 备份；实际 cutover 先保留并
+   核验当前 target，再用 no-clobber hardlink 发布新 binary；
+7. 仅经 service adapter 启停并验证 systemd 或 OpenRC；
+8. 连续核对服务 active、主进程 PID 与其 executable identity，成功后清理 transaction，并只保留最近
+   3 个符合 `xray.bak-v*-YYYYMMDD-HHMMSS` 的脚本备份。
+
+release archive 的 listing/metadata 也在 timeout 与输出/成员数上限内解析，下载后的可用
+空间必须同时容纳仍存在的 zip 与独立 candidate。服务真正停止前重新读取 PID，并核对
+`/proc/PID/exe`、managed binary inode 与预检前 digest；同时扫描 `/proc/*/comm`，要求
+service MainPID 是唯一 Xray 进程。旧 binary 在创建 hardlink backup 前也做相同的过期
+状态检查；额外进程形成 sticky conflict，禁止删除 journal 或 transaction stages。
+临时父目录的完整 canonical ancestor chain 必须是 trusted-owner/private 或 root-owned
+sticky directory；创建的目录记录 owner 与
+device/inode，artifact 验证、执行和清理都以该 identity 为门，路径被替换时保留现场并
+失败关闭。激活前还会重新协调 service/process 状态，原本 inactive 却在预检期间启动的
+Xray 不会被静默留在旧 inode 上并误报新版本已运行。cutover 把当时实际存在的 target
+移动到本事务专属 staging 后再核验 digest；若它不是预检记录的旧 binary，则尝试恢复到
+原路径并失败关闭。新 binary 只在 canonical path 不存在时以 hardlink 发布，因此 fresh
+install 与 update 都不会覆盖在最后检查之后并发出现的 target。
+
+SHA-256 是激活前的强制门：官方 digest 缺失、解析不唯一、目标 zip 条目缺失或 hash
+不匹配都失败关闭，不能只依赖 HTTPS、解压成功或 binary 版本字符串。已有 Xray 的
+更新必须用新 binary 测试现有配置；全新安装尚无配置时才允许显式跳过该测试，且不能
+借此覆盖或删除旧配置。更新前服务未运行时，成功后保持原先的停止语义；原服务运行时，
+更新后必须恢复为 active。
+
+替换后的任何校验失败都使用已验证的旧 staging/backup 恢复，并按 transaction 开始时的运行状态恢复
+服务。函数内部隔离 `set -e` 敏感步骤，确保失败处理不会在 rollback 中途提前退出；
+临时 trap 捕获 INT/TERM/HUP，`Ctrl+C` 会先回滚再返回非零，且不会泄漏到脚本其他
+命令。`SIGKILL` 与断电不可捕获，因此 transaction marker、staged 状态和旧 binary
+备份必须持久保留；下一次 Xray 写操作在获取排他锁后先恢复/验证上一事务，再允许开始
+新事务。只读的 `xray-version` 不触发恢复。恢复只会移动或删除 journal 中记录为新
+binary 的 digest；canonical path 上不属于旧/新 digest 的外部 binary 必须原样保留，
+并保留 journal、staging 与 backup。自动恢复失败时输出不会覆盖该外部 binary 的人工
+处置指引，以及适用时引用具体备份路径的恢复命令。
+journal 已标记 `committed` 或 `rolled-back` 也不是无条件清理许可：前者必须证明
+canonical target 等于 new digest 且 mode 为 `0755`，后者必须证明它等于 old digest
+并保留 journal 记录的 mode（fresh rollback 则必须真正不存在）；两者都要求当前 UID
+拥有 binary。恢复源在 hardlink 前同时校验 owner、mode 与 digest，坏 stage 被跳过；
+symlink、目录、metadata/hash 失败和无法识别的运行态一律保留现场。`XRAY_BACKUP_KEEP` 在 recovery cleanup 和
+任何 Bash 算术前限制为安全的十进制范围。
+named backup 经 noclobber copy、digest、独立 inode 与 fsync 验证，不与 restore stage
+共享 inode。live commit、live rollback 和 persistent recovery 统一通过 terminal
+finalizer；所有 managed stage 先全量预检，再复验 target/journal 后删除。dangling
+journal symlink 从存在性检查开始即按冲突处理。
+journal 目录首次创建时同步 containing directory；恢复只信任私有 root-owned 目录中的
+`0600` 单链接、限长 journal。每次 journal 写入使用 state 目录内唯一 `mktemp` payload，
+发布前失败按 device/inode identity 清理，因此不会阻塞同 token 的恢复重试。journal rename 成功后立即绑定新 inode，即使后续 file 或
+directory fsync 失败，同一事务仍能发布 rolled-back 终态。commit journal fsync 到内存 committed 标记发布之间的信号
+被延迟记录，标记发布后按原状态退出，从而留下可幂等清理的 committed journal 而不回滚。
+
+Xray service 定义使用 managed marker 与同目录 fsync+rename；custom definition 不覆盖，
+已管理定义每次 ensure 都可修复并重试 systemd daemon reload。周期重启安装固定 helper，
+由 helper 校验并 append-open lifecycle lock FD、核对 inode 后才重启当前 active 的内核。
+OpenRC 无可用 pidfile 时，Xray MainPID fallback 复用 `/proc` process-set，不依赖 `pgrep`。
+
 ## Loader 的两条路径
 
 ### 本地仓库路径
 
 loader 通过 `BASH_SOURCE[0]` 定位自身目录。相邻 `lib/` 中出现 manifest 或任一
 预期模块名时，视为本地 Proxy Hub footprint：此时必须恰好包含 manifest 和预期
-的 10 个普通、非 symlink 模块，且 `lib/manifest.sha256` 匹配，才复制私有快照、
+的 11 个普通、非 symlink 模块，且 `lib/manifest.sha256` 匹配，才复制私有快照、
 按固定顺序组装并加载；部分/损坏 footprint 或额外文件会失败关闭。空的或仅含无关
 文件的 `lib/` 不算 footprint，单独下载的 loader 仍进入远程模式。完整 clone 可
 离线运行，也可修改模块后通过构建脚本刷新 manifest/dist。组装的 runtime 必须
@@ -145,14 +227,14 @@ bit 的共享临时目录；不满足条件时 loader 会在下载前失败关�
 ## Manifest 与 trailer 契约
 
 `lib/manifest.sha256` 是 loader、模块与 dist 产物之间的发布契约，不是自由
-格式注释。它固定为 14 行：
+格式注释。它固定为 15 行：
 
 ```text
 # proxy-hub-manifest-v1
 # api=1
 # build-id=HEX
 HEX  00_security_state.sh
-...其余 9 个有序模块...
+...其余 10 个有序模块...
 # proxy-hub-manifest-end-v1
 ```
 
@@ -170,7 +252,7 @@ bundle trailer 固定为末尾六行：
 # header-bytes=N header-sha256=HEX
 # body-bytes=N body-sha256=HEX
 # build-id=HEX
-# module-count=10
+# module-count=11
 # proxy-hub-bundle-end-v1
 ```
 
@@ -179,7 +261,7 @@ bundle trailer 固定为末尾六行：
 - `header-bytes`/`header-sha256` 绑定 bundle 的生成头；
 - `body-bytes`/`body-sha256` 绑定按 manifest 顺序拼接的模块正文；
 - `build-id` 必须与 `body-sha256` 完全相同；
-- `module-count` 当前必须是 `10`；
+- `module-count` 当前必须是 `11`；
 - 开始和结束 marker 必须占据六行 trailer 的首尾。
 
 manifest、模块源码、组装 body 和最终 bundle 都禁止 NUL 字节；构建、本地加载和
@@ -274,6 +356,8 @@ bash tests/test_loader.sh
 bash tests/test_loader_failures.sh
 bash tests/test_cleanup_lock.sh
 bash tests/test_ssh_rollback.sh
+bash tests/test_xray_release.sh
+bash tests/test_xray_transaction.sh
 git diff --check
 ```
 
@@ -310,6 +394,11 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
 - manifest/bundle 第一件或第二件替换失败，以及 TERM/HUP/INT cutover 回滚；
 - 两个不同源 generation 并发发布时不混装，以及 rollback/disposal 无法验证时
   保留不可自动回收的 uncertain release lock；
+- Xray 版本规范化、API 响应完整性、架构映射、环境变量优先级、升级/重装/降级决策；
+- Xray 更新的配置预检、运行/停止两种初始服务状态、成功原子替换，以及启动健康
+  检查失败后的旧 binary 恢复；
+- Xray 更新在停服后的 TERM 回滚，以及 activated 持久 journal 在下一次写操作中的
+  旧 binary、active 状态与事务残留恢复；
 - 生成 bundle 与历史基线 `8ca0766e66278ce22377ce81040a98c8159d9c6e` 加显式
   安全补丁的逐字等价性。该字节级门限覆盖
   未单独触发的只读/写命令 dispatch、协议实现和旧节点兼容代码，确保它们没有在
@@ -320,6 +409,11 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
 - 保留一个稳定根入口，避免用户迁移命令。
 - 本地使用拆分模块，远程使用单一 bundle，避免逐模块网络请求和跨版本混装。
 - 所有远程内容在 source 前完成下载与验证，失败时不产生业务副作用。
+- 普通节点安装不改变健康的现有 Xray；只有全新安装或显式 `xray-update` 解析 release。
+- Xray release 激活必须通过官方 SHA-256、binary 版本与现有配置三重门限；默认
+  stable，固定版本优先，prerelease 只在用户明确选择时启用。
+- Xray binary 的替换、service 状态与持久 transaction 恢复组成一个事务，不能只把
+  文件复制成功视为更新完成。
 - 继续兼容现有 Bash 全局函数/变量 ABI；本轮不同时重写为对象模型。
 - dist 是生成物，`lib/` 是事实源。
 

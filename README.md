@@ -44,6 +44,7 @@ AnyTLS、Hysteria2、多节点管理、WARP 分流、系统优化工具和多语
 - **安全配置加载** - 防止配置文件注入攻击
 - **IPv6 SSH 保护** - 防止禁用 IPv6 时断开连接
 - **包管理器检查** - 等待系统更新完成后再安装
+- **Xray 安全更新** - 强制校验官方 SHA-256，配置预检后原子替换；启动失败自动回滚
 
 ## 快速开始
 
@@ -114,7 +115,7 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
 ║   8. 测试 SNI 延迟                                             ║
 ║   9. 健康检查                                                  ║
 ╠═══════════════════════════════════════════════════════════════╣
-║   T. 系统工具 (WARP/BBR/Swap/Fail2ban/Ports/Logs)              ║
+║   T. 系统工具 (Xray/WARP/BBR/Swap/Fail2ban/Ports/Logs)         ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║   L. 切换语言                                                  ║
 ║   U. 卸载 (All)                                                ║
@@ -166,6 +167,10 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
 ./proxy-hub.sh test-sni    # 测试 SNI 延迟
 ./proxy-hub.sh uninstall   # 卸载所有节点和 Xray
 
+# Xray 版本管理
+./proxy-hub.sh xray-version  # 显示当前、stable 与含 prerelease 的最新版本
+./proxy-hub.sh xray-update   # 安全更新 Xray，失败自动回滚
+
 # 系统工具
 ./proxy-hub.sh tools       # 系统工具菜单
 ./proxy-hub.sh ports       # 端口管理
@@ -175,6 +180,33 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
 ./proxy-hub.sh swap        # Swap 管理
 ./proxy-hub.sh fail2ban    # Fail2ban 管理
 ```
+
+### Xray 版本管理
+
+版本选择按 `XRAY_VERSION > XRAY_CHANNEL > stable` 解析；大写变量优先，同时兼容
+已有的小写参数风格 `xray_version`、`xray_channel`。固定版本可以省略前导 `v`，
+脚本校验后统一为 Xray release tag：
+
+```bash
+# 查看本地版本、latest stable 与包括 prerelease 在内的 latest release
+bash proxy-hub.sh xray-version
+
+# 更新到 latest stable（默认）
+XRAY_CHANNEL=stable bash proxy-hub.sh xray-update
+
+# 更新到最新非 draft release，包括 prerelease
+XRAY_CHANNEL=prerelease bash proxy-hub.sh xray-update
+
+# 固定版本；26.7.11 与 v26.7.11 等价
+XRAY_VERSION=v26.7.11 bash proxy-hub.sh xray-update
+xray_version=26.7.11 bash proxy-hub.sh xray-update
+```
+
+普通 `install` 创建节点时，如果现有 Xray 可执行且版本可读取，脚本只报告当前版本，
+不会自动升级、降级或覆盖用户手动安装的 prerelease。只有全新安装或显式运行
+`xray-update` 才按上述目标选择执行 release 安装。
+取得 lifecycle lock 后脚本会重新读取实际版本：普通安装保留并发出现的健康版本，
+channel 更新只允许升级，只有固定版本请求可以重装或降级。
 
 ### 高级参数
 
@@ -225,6 +257,25 @@ name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 | `uuid` | 自定义 UUID | `uuid=xxx-xxx-xxx` |
 
 ## 系统工具
+
+### Xray Version / Update
+
+```bash
+./proxy-hub.sh xray-version
+./proxy-hub.sh xray-update
+```
+
+系统工具菜单中的 Xray 版本管理会先显示当前、stable、含 prerelease 的最新版本，
+并提供更新到 stable、更新到含 prerelease 的最新 release、安装指定版本等入口。
+更新包和官方 digest 均从同一个 Xray release 获取；官方 SHA-256 缺失、格式异常或
+不匹配时失败关闭。新二进制通过版本核对和现有配置测试后才会替换旧版本；cutover
+先保留并核验实际 target，再用同目录 no-clobber 操作发布 candidate；恢复时同时核对
+binary 的 SHA-256、owner 与 mode，并要求 service MainPID 是唯一 Xray 进程。脚本保留最近 3 份自建备份，并通过统一 service adapter 支持
+systemd 与 Alpine/OpenRC。
+
+可捕获的中断（包括 `Ctrl+C`）会在当前进程内触发回滚。`SIGKILL` 或断电无法执行
+shell trap，因此事务状态和旧 binary 备份会保留，由下一次 Xray 写操作先恢复并验证，
+再允许开始新的安装或更新；只读的 `xray-version` 不会修改该状态。
 
 ### WARP 分流
 
@@ -476,6 +527,7 @@ SNI: www.bing.com
 |------|------|
 | Xray 程序 | `/usr/local/bin/xray` |
 | Xray 配置 | `/usr/local/etc/xray/config.json` |
+| Xray 备份 | `/usr/local/bin/xray.bak-v*-YYYYMMDD-HHMMSS`（默认保留最近 3 份） |
 | sing-box 程序 | `/usr/local/bin/sing-box` |
 | sing-box 配置 | `/usr/local/etc/sing-box/config.json` |
 | sing-box 证书 | `/usr/local/etc/sing-box/certs/` |
@@ -529,6 +581,19 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 完全支持 Alpine Linux，使用 OpenRC 作为 init 系统，apk 作为包管理器。
 
+### Q: 添加节点会自动把 Xray 升级或降级到 stable 吗？
+
+不会。已有 Xray 可正常运行时，普通节点安装会保留当前版本。需要变更版本时，请显式
+运行 `xray-update` 并选择 stable、包括 prerelease 的 latest release 或固定版本。
+
+### Q: Xray 更新失败会影响现有节点吗？
+
+不会修改节点配置、UUID、Reality 密钥、SNI、端口或密码；原本运行的 Xray 在原子
+替换窗口内会短暂停服。更新前会用新 binary 测试现有 Xray 配置；替换或重启后的健康
+检查失败时自动恢复旧 binary 和原服务运行状态。若更新或崩溃恢复期间发现不属于该
+事务的外部 binary，脚本不会覆盖或删除它，并保留 journal、staging 与 backup 供人工确认。
+若自动回滚也失败，命令会高亮输出使用已保留备份进行人工恢复的准确命令。
+
 ### Q: 多节点共用一个 Xray 进程吗？
 
 VLESS 与 Shadowsocks 节点在同一个 Xray 配置中作为多个 inbounds；AnyTLS 与
@@ -538,6 +603,12 @@ Hysteria2 节点在同一个 sing-box 配置中作为多个 inbounds。两个内
 ## 更新日志
 
 ### v5.6.0
+- 新增 Xray Release Management：支持 `xray-version`、`xray-update`、stable、包含
+  prerelease 的 latest release 与固定版本；普通节点安装保留健康的现有 Xray
+- Xray release zip 必须通过官方 SHA-256，且新 binary 必须通过版本核对、现有配置
+  预检、原子替换和 systemd/OpenRC 服务健康检查；失败自动恢复旧 binary
+- Xray binary 备份默认保留最近 3 份；`Ctrl+C` 当前进程回滚，`SIGKILL`/断电遗留
+  事务由下一次 Xray 写操作先恢复
 - 新增 Hysteria2 节点，复用现有 sing-box 服务和安全配置生成路径，支持
   `proto=hysteria2`/`hy2`、`hy2pt`、`hy2pwd`、IPv4/IPv6 分享链接与二维码
 - 修复 `both` 节点二维码只显示 Vision：安装完成和 `qr` 命令现在分别显示 Vision、
