@@ -49,18 +49,44 @@
 bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-hub.sh)
 ```
 
-### 手动安装
+仓库根目录的 `proxy-hub.sh` 是轻量 loader：在完整仓库中运行时加载本地
+`lib/` 模块；通过上面的一行命令远程运行时，从 GitHub 获取 `PROXY_HUB_REF`
+选择的完整、自校验 `dist` bundle，校验后执行。因此，这条一行命令和“只下载
+`proxy-hub.sh` 再运行”都需要在运行期间能够访问 GitHub。loader 的本地和远程
+模式都要求至少提供 `sha256sum`、`shasum` 或 `openssl` 之一；远程模式还要求
+系统已有 `curl`。
+
+`main` 是移动引用。需要可复现执行时，应让外层 loader URL 和内层 bundle 使用
+同一个完整 commit SHA：
 
 ```bash
-# 下载脚本
+export PROXY_HUB_REF='<40-character-commit-sha>'
+bash <(curl -Ls "https://raw.githubusercontent.com/Banezzz/proxy-hub/${PROXY_HUB_REF}/proxy-hub.sh")
+```
+
+### 手动安装
+
+只下载 loader（运行时仍需 GitHub 网络）：
+
+```bash
 curl -O https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-hub.sh
-
-# 添加执行权限
 chmod +x proxy-hub.sh
-
-# 运行
 ./proxy-hub.sh
 ```
+
+需要离线运行时，请预先克隆或下载完整仓库，确保 `proxy-hub.sh` 与 `lib/`
+来自同一个版本：
+
+```bash
+git clone https://github.com/Banezzz/proxy-hub.git
+cd proxy-hub
+chmod +x proxy-hub.sh
+./proxy-hub.sh
+```
+
+不要只复制 `lib/` 中的部分文件，也不要混用不同 commit 的 loader、模块和
+bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令行及环境变量
+契约见 [`docs/api.md`](docs/api.md)。
 
 ## 使用方法
 
