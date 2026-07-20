@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deterministic curl double used by loader tests.  It never accesses a network.
+#
+# Required for successful downloads:
+#   FAKE_CURL_ASSET_DIR  directory whose files are addressed by URL basename
+# Optional:
+#   FAKE_CURL_MODE       ok|fail|api-fail|api-invalid|truncate|block|redirect-http
+#   FAKE_CURL_LOG        append one shell-escaped argv record per invocation
+#   FAKE_CURL_API_JSON   response for api.github.com requests
+
+mode="${FAKE_CURL_MODE:-ok}"
+asset_dir="${FAKE_CURL_ASSET_DIR:-}"
+output_file=""
+url=""
+first_arg="${1:-}"
+proto=""
+proto_redir=""
+tls12=0
+
+if [[ -n "${FAKE_CURL_LOG:-}" ]]; then
+    {
+        printf 'curl'
+        printf ' %q' "$@"
+        printf '\n'
+    } >>"$FAKE_CURL_LOG"
+fi
+
+while (($#)); do
+    case "$1" in
+        -o|--output)
+            (($# >= 2)) || exit 2
+            output_file="$2"
+            shift 2
+            ;;
+        --output=*)
+            output_file="${1#*=}"
+            shift
+            ;;
+        --proto)
+            (($# >= 2)) || exit 2
+            proto="$2"
+            shift 2
+            ;;
+        --proto-redir)
+            (($# >= 2)) || exit 2
+            proto_redir="$2"
+            shift 2
+            ;;
+        --tlsv1.2)
+            tls12=1
+            shift
+            ;;
+        --tls-max|--max-redirs|--connect-timeout|--retry|--retry-delay|--retry-max-time|--max-time|-A|--user-agent|-H|--header)
+            (($# >= 2)) || exit 2
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$url" ]] || exit 2
+
+case "$mode" in
+    fail)
+        exit 22
+        ;;
+    api-fail)
+        [[ "$url" == *api.github.com/* ]] && exit 22
+        ;;
+    api-invalid)
+        if [[ "$url" == *api.github.com/* ]]; then
+            printf '%s\n' '{not-json'
+            exit 0
+        fi
+        ;;
+    block)
+        [[ -n "${FAKE_CURL_READY_FILE:-}" ]] && : >"$FAKE_CURL_READY_FILE"
+        trap 'exit 143' TERM INT HUP
+        while :; do
+            sleep 0.1
+        done
+        ;;
+    redirect-http)
+        if [[ "$url" == */dist/proxy-hub.bundle.sh ]]; then
+            if [[ "$first_arg" == "-q" && "$proto" == "=https" && "$proto_redir" == "=https" && "$tls12" == "1" ]]; then
+                exit 47
+            fi
+        fi
+        ;;
+    ok|truncate)
+        ;;
+    *)
+        printf 'unsupported FAKE_CURL_MODE: %s\n' "$mode" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "$url" == *api.github.com/* ]]; then
+    payload="${FAKE_CURL_API_JSON:-{\"sha\":\"0123456789abcdef0123456789abcdef01234567\"}}"
+    if [[ -n "$output_file" ]]; then
+        printf '%s\n' "$payload" >"$output_file"
+    else
+        printf '%s\n' "$payload"
+    fi
+    exit 0
+fi
+
+[[ -n "$asset_dir" ]] || {
+    printf 'FAKE_CURL_ASSET_DIR is required for %s\n' "$url" >&2
+    exit 22
+}
+
+url_path="${url%%\?*}"
+asset_name="${url_path##*/}"
+asset="$asset_dir/$asset_name"
+[[ -f "$asset" ]] || {
+    printf 'fake curl has no asset for %s (%s)\n' "$url" "$asset" >&2
+    exit 22
+}
+
+if [[ "$mode" == "truncate" ]]; then
+    if [[ -n "$output_file" ]]; then
+        head -c 32 "$asset" >"$output_file"
+    else
+        head -c 32 "$asset"
+    fi
+elif [[ -n "$output_file" ]]; then
+    cp -- "$asset" "$output_file"
+else
+    cat -- "$asset"
+fi

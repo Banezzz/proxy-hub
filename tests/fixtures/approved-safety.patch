@@ -1,0 +1,1249 @@
+--- a/proxy-hub.sh
++++ b/proxy-hub.sh
+@@ -18,2 +18,25 @@
+-LOCK_DIR="/tmp/reality_vision_lock"
+-PID_FILE="$LOCK_DIR/pid"
++LOCK_PARENT=""
++LOCK_DIR=""
++PID_FILE=""
++LOCK_OWNER_FILE=""
++LOCK_FILE=""
++LOCK_FD=200
++LOCK_HELD_METHOD=""
++LOCK_TOKEN=""
++LOCK_DIR_ID=""
++LOCK_SIGNAL_PENDING=""
++
++lock_prepare_parent() {
++    local base_dir="/tmp" base_mode base_owner mode owner
++
++    [[ -d "$base_dir" && ! -L "$base_dir" && -w "$base_dir" ]] || return 1
++    base_owner=$(stat -c '%u' "$base_dir" 2>/dev/null) || return 1
++    base_mode=$(stat -c '%a' "$base_dir" 2>/dev/null) || return 1
++    [[ "$base_mode" =~ ^[0-7]+$ ]] || return 1
++    if [[ "$base_owner" == "$EUID" ]] && (( (8#$base_mode & 022) == 0 )); then
++        :
++    elif [[ "$base_owner" == "0" ]] && (( (8#$base_mode & 01000) != 0 )); then
++        :
++    else
++        return 1
++    fi
+@@ -21,4 +44,3 @@
+-lock_acquire() {
+-    if mkdir "$LOCK_DIR" 2>/dev/null; then
+-        echo "$$" > "$PID_FILE"
+-        return 0
++    LOCK_PARENT="${base_dir%/}/proxy-hub-${EUID}"
++    if [[ ! -e "$LOCK_PARENT" ]]; then
++        (umask 077; mkdir -m 700 "$LOCK_PARENT") 2>/dev/null || return 1
+@@ -26,11 +48,92 @@
+-    # 检查持有锁的进程是否还活着
+-    if [[ -f "$PID_FILE" ]]; then
+-        local old_pid
+-        old_pid=$(cat "$PID_FILE" 2>/dev/null)
+-        if [[ -n "$old_pid" ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+-            # 进程已死，强制接管
+-            rm -rf "$LOCK_DIR"
+-            mkdir "$LOCK_DIR" 2>/dev/null || return 1
+-            echo "$$" > "$PID_FILE"
+-            return 0
+-        fi
++
++    [[ -d "$LOCK_PARENT" && ! -L "$LOCK_PARENT" ]] || return 1
++    owner=$(stat -c '%u' "$LOCK_PARENT" 2>/dev/null) || return 1
++    mode=$(stat -c '%a' "$LOCK_PARENT" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]+$ ]] || return 1
++    (( (8#$mode & 077) == 0 )) || return 1
++
++    LOCK_DIR="$LOCK_PARENT/write.lock.d"
++    PID_FILE="$LOCK_DIR/pid"
++    LOCK_OWNER_FILE="$LOCK_DIR/owner"
++    LOCK_FILE=""
++}
++
++lock_dir_identity() {
++    stat -c '%d:%i' "$1" 2>/dev/null
++}
++
++lock_acquire() {
++    local candidate_token dir_id="" pending_signal rc=1 saved_int saved_term
++
++    [[ -z "$LOCK_HELD_METHOD" ]] || return 1
++    lock_prepare_parent || return 1
++    candidate_token="${EUID}-$$-${RANDOM}-${RANDOM}"
++
++    LOCK_SIGNAL_PENDING=""
++    saved_int=$(trap -p INT || true)
++    saved_term=$(trap -p TERM || true)
++    trap 'LOCK_SIGNAL_PENDING=INT' INT
++    trap 'LOCK_SIGNAL_PENDING=TERM' TERM
++
++    if dir_id=$(
++        local owner_tmp="$LOCK_DIR/.owner-${candidate_token}"
++        local pid_tmp="$LOCK_DIR/.pid-${candidate_token}"
++        local candidate_id=""
++
++        trap '' INT TERM
++        umask 077
++
++        cleanup_candidate() {
++            if [[ -n "$candidate_id" && -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] \
++                && [[ "$(lock_dir_identity "$LOCK_DIR")" == "$candidate_id" ]]; then
++                [[ -f "$owner_tmp" && ! -L "$owner_tmp" ]] && rm -f -- "$owner_tmp"
++                [[ -f "$pid_tmp" && ! -L "$pid_tmp" ]] && rm -f -- "$pid_tmp"
++                [[ -f "$LOCK_OWNER_FILE" && ! -L "$LOCK_OWNER_FILE" ]] && rm -f -- "$LOCK_OWNER_FILE"
++                [[ -f "$PID_FILE" && ! -L "$PID_FILE" ]] && rm -f -- "$PID_FILE"
++                rmdir "$LOCK_DIR" 2>/dev/null || true
++            fi
++        }
++
++        mkdir "$LOCK_DIR" 2>/dev/null || exit 1
++        candidate_id=$(lock_dir_identity "$LOCK_DIR") || {
++            cleanup_candidate
++            exit 1
++        }
++        printf '%s\n%s\n' "$candidate_token" "$$" > "$owner_tmp" || {
++            cleanup_candidate
++            exit 1
++        }
++        [[ -f "$owner_tmp" && ! -L "$owner_tmp" ]] || {
++            cleanup_candidate
++            exit 1
++        }
++        mv -- "$owner_tmp" "$LOCK_OWNER_FILE" || {
++            cleanup_candidate
++            exit 1
++        }
++        printf '%s\n' "$$" > "$pid_tmp" || {
++            cleanup_candidate
++            exit 1
++        }
++        [[ -f "$pid_tmp" && ! -L "$pid_tmp" ]] || {
++            cleanup_candidate
++            exit 1
++        }
++        mv -- "$pid_tmp" "$PID_FILE" || {
++            cleanup_candidate
++            exit 1
++        }
++        printf '%s\n' "$candidate_id"
++    ); then
++        LOCK_TOKEN="$candidate_token"
++        LOCK_DIR_ID="$dir_id"
++        LOCK_HELD_METHOD="mkdir"
++        rc=0
++    fi
++
++    if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
++    if [[ -n "$saved_term" ]]; then eval "$saved_term"; else trap - TERM; fi
++    pending_signal="$LOCK_SIGNAL_PENDING"
++    LOCK_SIGNAL_PENDING=""
++    if [[ -n "$pending_signal" ]]; then
++        kill -s "$pending_signal" "$$" 2>/dev/null || true
+@@ -38 +141 @@
+-    return 1
++    return "$rc"
+@@ -42 +145,15 @@
+-    rm -rf "$LOCK_DIR" 2>/dev/null
++    local owner_token=""
++
++    [[ "$LOCK_HELD_METHOD" == "mkdir" && -n "$LOCK_DIR_ID" && -n "$LOCK_TOKEN" ]] || return 0
++    [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || return 0
++    [[ "$(lock_dir_identity "$LOCK_DIR")" == "$LOCK_DIR_ID" ]] || return 0
++    [[ -f "$LOCK_OWNER_FILE" && ! -L "$LOCK_OWNER_FILE" ]] || return 0
++    IFS= read -r owner_token < "$LOCK_OWNER_FILE" || return 0
++    [[ "$owner_token" == "$LOCK_TOKEN" ]] || return 0
++
++    [[ ! -e "$PID_FILE" || ( -f "$PID_FILE" && ! -L "$PID_FILE" ) ]] || return 0
++    rm -f -- "$PID_FILE" "$LOCK_OWNER_FILE" 2>/dev/null || return 0
++    rmdir "$LOCK_DIR" 2>/dev/null || true
++    LOCK_HELD_METHOD=""
++    LOCK_TOKEN=""
++    LOCK_DIR_ID=""
+@@ -47,5 +164,2 @@
+-# Atomic lock using flock (preferred) with mkdir fallback
+-LOCK_FILE="/var/lock/reality_vision.lock"
+-LOCK_FD=200
+-
+-# Try flock-based locking first (atomic, no TOCTOU race)
++# Compatibility names intentionally use the same mkdir exclusion domain. A
++# separate flock file would allow mixed-mode processes to write concurrently.
+@@ -53,16 +167 @@
+-    # Create lock file directory if needed
+-    local lock_dir
+-    lock_dir=$(dirname "$LOCK_FILE")
+-    if [[ ! -d "$lock_dir" ]]; then
+-        LOCK_FILE="/tmp/reality_vision.lock"
+-    fi
+-
+-    # Open lock file descriptor
+-    exec 200>"$LOCK_FILE" || return 1
+-
+-    # Try non-blocking lock
+-    if flock -n 200; then
+-        echo "$$" >&200
+-        return 0
+-    fi
+-    return 1
++    lock_acquire
+@@ -72,2 +171 @@
+-    flock -u 200 2>/dev/null || true
+-    exec 200>&- 2>/dev/null || true
++    lock_release
+@@ -76 +174 @@
+-# Smart lock acquire: use flock if available, fallback to mkdir
++# All current entry points acquire the same private mkdir lock.
+@@ -78,5 +176 @@
+-    if command -v flock &>/dev/null; then
+-        lock_acquire_flock
+-    else
+-        lock_acquire
+-    fi
++    lock_acquire
+@@ -86,4 +180 @@
+-    if command -v flock &>/dev/null; then
+-        lock_release_flock
+-    fi
+-    lock_release  # Always clean up mkdir lock too
++    lock_release
+@@ -665,0 +757,292 @@
++declare -a CLEANUP_JOB_ROOTS=()
++declare -a CLEANUP_TREE_PIDS=()
++declare -A CLEANUP_TREE_SEEN=()
++declare -A CLEANUP_TREE_IDENTITIES=()
++declare -A CLEANUP_TRACKED_GROUPS=()
++declare -A CLEANUP_GROUP_LEADER_IDENTITIES=()
++CLEANUP_HAS_UNBOUNDED_ROOTS=0
++CLEANUP_UNSAFE_TO_UNLOCK=0
++CLEANUP_STAT_STATE=""
++CLEANUP_STAT_GROUP=""
++CLEANUP_STAT_IDENTITY=""
++
++cleanup_read_process_stat() {
++    local pid="$1" stat_line rest
++    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
++    IFS= read -r stat_line < "/proc/$pid/stat" || return 1
++    rest="${stat_line##*) }"
++    set -- $rest
++    (($# >= 20)) || return 1
++    CLEANUP_STAT_STATE="$1"
++    CLEANUP_STAT_GROUP="$3"
++    CLEANUP_STAT_IDENTITY="${20}"
++}
++
++cleanup_process_identity() {
++    cleanup_read_process_stat "$1" || return 1
++    printf '%s\n' "$CLEANUP_STAT_IDENTITY"
++}
++
++cleanup_pid_is_original() {
++    local pid="$1"
++    [[ -n "${CLEANUP_TREE_IDENTITIES[$pid]:-}" ]] || return 1
++    cleanup_read_process_stat "$pid" || return 1
++    [[ "$CLEANUP_STAT_IDENTITY" == "${CLEANUP_TREE_IDENTITIES[$pid]}" ]]
++}
++
++cleanup_pid_is_live_original() {
++    cleanup_pid_is_original "$1" || return 1
++    [[ "$CLEANUP_STAT_STATE" != Z && "$CLEANUP_STAT_STATE" != X ]]
++}
++
++cleanup_process_group() {
++    cleanup_read_process_stat "$1" || return 1
++    printf '%s\n' "$CLEANUP_STAT_GROUP"
++}
++
++cleanup_track_process_group() {
++    local pid="$1" group_id own_group leader_identity registered_root_identity
++    registered_root_identity="${CLEANUP_TREE_IDENTITIES[$pid]:-}"
++    [[ -n "$registered_root_identity" ]] || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 0
++    }
++    cleanup_read_process_stat "$pid" || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 0
++    }
++    # The jobs snapshot and the group lookup are separate reads.  Refuse to
++    # claim a numeric PID that was reused between them.
++    [[ "$CLEANUP_STAT_IDENTITY" == "$registered_root_identity" ]] || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 0
++    }
++    group_id="$CLEANUP_STAT_GROUP"
++    cleanup_read_process_stat "$$" || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 0
++    }
++    own_group="$CLEANUP_STAT_GROUP"
++
++    # Claim only a group whose leader is the registered job root, or our own
++    # group when this shell is its leader.  Merely being in a different group
++    # does not prove ownership: a child can join an existing external group.
++    if [[ "$group_id" == "$pid" ]] \
++        || [[ "$group_id" == "$own_group" && "$own_group" == "$$" ]]; then
++        cleanup_read_process_stat "$group_id" || {
++            CLEANUP_HAS_UNBOUNDED_ROOTS=1
++            return 0
++        }
++        leader_identity="$CLEANUP_STAT_IDENTITY"
++        if [[ "$group_id" == "$pid" && "$leader_identity" != "$registered_root_identity" ]]; then
++            CLEANUP_HAS_UNBOUNDED_ROOTS=1
++            return 0
++        fi
++        CLEANUP_TRACKED_GROUPS[$group_id]=1
++        CLEANUP_GROUP_LEADER_IDENTITIES[$group_id]="$leader_identity"
++    else
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++    fi
++}
++
++cleanup_list_process_ids() {
++    local stat_path pid
++    for stat_path in /proc/[0-9]*/stat; do
++        [[ -r "$stat_path" ]] || continue
++        pid="${stat_path#/proc/}"
++        printf '%s\n' "${pid%/stat}"
++    done
++}
++
++cleanup_group_leader_is_original() {
++    local group_id="$1" expected_identity
++    expected_identity="${CLEANUP_GROUP_LEADER_IDENTITIES[$group_id]:-}"
++    [[ -n "$expected_identity" ]] || return 1
++    cleanup_read_process_stat "$group_id" 2>/dev/null || return 1
++    [[ "$CLEANUP_STAT_IDENTITY" == "$expected_identity" ]]
++}
++
++cleanup_validate_tracked_groups() {
++    local group_id valid=0
++    for group_id in "${!CLEANUP_TRACKED_GROUPS[@]}"; do
++        if ! cleanup_group_leader_is_original "$group_id"; then
++            CLEANUP_HAS_UNBOUNDED_ROOTS=1
++            valid=1
++        fi
++    done
++    return "$valid"
++}
++
++cleanup_collect_process_tree() {
++    local pid="$1" identity children="" child
++    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
++
++    cleanup_read_process_stat "$pid" || return 0
++    identity="$CLEANUP_STAT_IDENTITY"
++    if [[ -n "${CLEANUP_TREE_IDENTITIES[$pid]:-}" ]] \
++        && [[ "${CLEANUP_TREE_IDENTITIES[$pid]}" != "$identity" ]]; then
++        return 0
++    fi
++    if [[ -z "${CLEANUP_TREE_SEEN[$pid]:-}" ]]; then
++        CLEANUP_TREE_SEEN[$pid]=1
++        CLEANUP_TREE_IDENTITIES[$pid]="$identity"
++        CLEANUP_TREE_PIDS+=("$pid")
++    fi
++
++    if [[ -r "/proc/$pid/task/$pid/children" ]]; then
++        IFS= read -r children < "/proc/$pid/task/$pid/children" || true
++        for child in $children; do
++            cleanup_collect_process_tree "$child"
++        done
++    fi
++}
++
++cleanup_collect_process_group() {
++    local group_id="$1" pid candidate_identity
++    local -a candidate_pids=() candidate_identities=()
++    local -a validated_pids=() validated_identities=()
++    cleanup_group_leader_is_original "$group_id" || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 1
++    }
++
++    # Treat the whole /proc scan as provisional.  Nothing discovered here is
++    # trusted until the leader identity is checked again after the scan.
++    while IFS= read -r pid; do
++        [[ "$pid" =~ ^[0-9]+$ ]] || continue
++        [[ "$pid" != "$$" ]] || continue
++        cleanup_read_process_stat "$pid" 2>/dev/null || continue
++        [[ "$CLEANUP_STAT_GROUP" == "$group_id" ]] || continue
++        candidate_pids+=("$pid")
++        candidate_identities+=("$CLEANUP_STAT_IDENTITY")
++    done < <(cleanup_list_process_ids)
++
++    cleanup_group_leader_is_original "$group_id" || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 1
++    }
++
++    for ((pid = 0; pid < ${#candidate_pids[@]}; pid++)); do
++        candidate_identity="${candidate_identities[$pid]}"
++        cleanup_read_process_stat "${candidate_pids[$pid]}" 2>/dev/null || continue
++        [[ "$CLEANUP_STAT_GROUP" == "$group_id" \
++            && "$CLEANUP_STAT_IDENTITY" == "$candidate_identity" ]] || continue
++        validated_pids+=("${candidate_pids[$pid]}")
++        validated_identities+=("$candidate_identity")
++    done
++
++    # Keep even the revalidated members provisional until one final leader
++    # check succeeds, so a scan-time reuse cannot contaminate the tracked tree.
++    cleanup_group_leader_is_original "$group_id" || {
++        CLEANUP_HAS_UNBOUNDED_ROOTS=1
++        return 1
++    }
++    for ((pid = 0; pid < ${#validated_pids[@]}; pid++)); do
++        if [[ -z "${CLEANUP_TREE_SEEN[${validated_pids[$pid]}]:-}" ]]; then
++            CLEANUP_TREE_SEEN[${validated_pids[$pid]}]=1
++            CLEANUP_TREE_IDENTITIES[${validated_pids[$pid]}]="${validated_identities[$pid]}"
++            CLEANUP_TREE_PIDS+=("${validated_pids[$pid]}")
++        fi
++    done
++}
++
++cleanup_tree_has_live_processes() {
++    local pid
++    for pid in "${CLEANUP_TREE_PIDS[@]}"; do
++        cleanup_pid_is_live_original "$pid" && return 0
++    done
++    return 1
++}
++
++cleanup_signal_original_processes() {
++    local signal="$1" pid
++    # Numeric PGIDs can be reused after collection.  Validate every leader
++    # immediately before every STOP/TERM/KILL pass; on uncertainty signal
++    # nothing and retain the writer lock.
++    cleanup_validate_tracked_groups || return 1
++    for pid in "${CLEANUP_TREE_PIDS[@]}"; do
++        cleanup_pid_is_original "$pid" || continue
++        cleanup_validate_tracked_groups || return 1
++        cleanup_send_signal "$signal" "$pid" 2>/dev/null || true
++    done
++}
++
++cleanup_send_signal() {
++    kill -s "$1" "$2"
++}
++
++cleanup_refresh_process_tree() {
++    local pid group_id
++    for group_id in "${!CLEANUP_TRACKED_GROUPS[@]}"; do
++        cleanup_collect_process_group "$group_id" || return 1
++    done
++    local -a known_pids=("${CLEANUP_TREE_PIDS[@]}")
++    for pid in "${known_pids[@]}"; do
++        cleanup_pid_is_original "$pid" || continue
++        cleanup_collect_process_tree "$pid"
++    done
++}
++
++cleanup_freeze_process_tree() {
++    local attempt pid before_count after_count
++    for attempt in $(seq 1 20); do
++        before_count=${#CLEANUP_TREE_PIDS[@]}
++        cleanup_signal_original_processes STOP || return 1
++        cleanup_refresh_process_tree || return 1
++        cleanup_signal_original_processes STOP || return 1
++        after_count=${#CLEANUP_TREE_PIDS[@]}
++        ((after_count == before_count)) && return 0
++    done
++    return 1
++}
++
++terminate_background_jobs() {
++    local pid attempt
++    CLEANUP_JOB_ROOTS=()
++    CLEANUP_TREE_PIDS=()
++    CLEANUP_TREE_SEEN=()
++    CLEANUP_TREE_IDENTITIES=()
++    CLEANUP_TRACKED_GROUPS=()
++    CLEANUP_GROUP_LEADER_IDENTITIES=()
++    CLEANUP_HAS_UNBOUNDED_ROOTS=0
++
++    while IFS= read -r pid; do
++        [[ "$pid" =~ ^[0-9]+$ ]] && CLEANUP_JOB_ROOTS+=("$pid")
++    done < <(jobs -pr 2>/dev/null || true)
++    ((${#CLEANUP_JOB_ROOTS[@]} > 0)) || return 0
++
++    for pid in "${CLEANUP_JOB_ROOTS[@]}"; do
++        cleanup_collect_process_tree "$pid"
++        cleanup_track_process_group "$pid"
++    done
++    cleanup_refresh_process_tree || return 1
++    cleanup_signal_original_processes TERM || return 1
++
++    for attempt in $(seq 1 20); do
++        cleanup_refresh_process_tree || return 1
++        cleanup_tree_has_live_processes || break
++        sleep 0.1
++    done
++
++    if cleanup_tree_has_live_processes; then
++        cleanup_freeze_process_tree || {
++            cleanup_signal_original_processes KILL || true
++            return 1
++        }
++        cleanup_signal_original_processes KILL || return 1
++    fi
++    for pid in "${CLEANUP_JOB_ROOTS[@]}"; do
++        wait "$pid" 2>/dev/null || true
++    done
++
++    for attempt in $(seq 1 20); do
++        cleanup_refresh_process_tree || return 1
++        if ! cleanup_tree_has_live_processes; then
++            ((CLEANUP_HAS_UNBOUNDED_ROOTS == 0)) && return 0
++            return 1
++        fi
++        sleep 0.05
++    done
++    return 1
++}
++
+@@ -667,0 +1051 @@
++    local jobs_stopped=0 rollback_safe=1
+@@ -670,6 +1054,23 @@
+-    # 终止所有后台作业
+-    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
+-    # 清理可能残留的临时目录
+-    rm -rf /tmp/tmp.*/ 2>/dev/null || true
+-    # 释放锁
+-    lock_release
++    # SSH rollback is itself a tracked background job.  Let its identity-bound
++    # recovery finish before the generic job-tree terminator runs; otherwise a
++    # timer that already claimed rolling-back could be killed between restoring
++    # the config and publishing its durable result.  Any uncertainty remains
++    # fail-closed below and retains the writer lock.
++    if declare -F cleanup_pending_ssh_rollback >/dev/null 2>&1; then
++        cleanup_pending_ssh_rollback || rollback_safe=0
++    fi
++    # Terminate, wait for, and reap every remaining background process tree
++    # before releasing the writer lock.  If SSH recovery could not be proven,
++    # do not risk killing its timer through the generic path; retain the lock
++    # and all ambiguous jobs instead.
++    if ((rollback_safe)); then
++        terminate_background_jobs || jobs_stopped=1
++    else
++        jobs_stopped=1
++    fi
++    ((jobs_stopped == 0)) || CLEANUP_UNSAFE_TO_UNLOCK=1
++    if ((CLEANUP_UNSAFE_TO_UNLOCK == 0)); then
++        lock_release_smart
++    else
++        printf 'proxy-hub: cleanup could not prove quiescence and rollback completion; retaining the write lock\n' >&2
++    fi
+@@ -677 +1078,12 @@
+-trap cleanup EXIT INT TERM
++
++cleanup_signal() {
++    local signal="$1" fallback_status="$2"
++    trap - EXIT INT TERM
++    cleanup
++    kill -s "$signal" "$$" 2>/dev/null || exit "$fallback_status"
++    exit "$fallback_status"
++}
++
++trap cleanup EXIT
++trap 'cleanup_signal INT 130' INT
++trap 'cleanup_signal TERM 143' TERM
+@@ -5592,2 +6004,386 @@
+-# SSH rollback helper: restore original port
+-_ssh_rollback() {
++SSH_ROLLBACK_PID=""
++SSH_ROLLBACK_ID=""
++SSH_ROLLBACK_CONFIG=""
++SSH_ROLLBACK_BACKUP=""
++SSH_ROLLBACK_BACKUP_ID=""
++SSH_ROLLBACK_ORIGINAL_PORT=""
++SSH_ROLLBACK_MARKER=""
++SSH_ROLLBACK_MARKER_TOKEN=""
++SSH_ROLLBACK_RESULT_FILE=""
++SSH_ROLLBACK_STATE_DIR=""
++SSH_ROLLBACK_STATE_ID=""
++SSH_ROLLBACK_STATE_TOKEN=""
++SSH_ROLLBACK_TOKEN_FILE=""
++SSH_ROLLBACK_TOKEN_ID=""
++SSH_ROLLBACK_SIGNAL_PENDING=""
++SSH_ROLLBACK_CLAIM_RESULT=""
++
++ssh_rollback_sync_path() {
++    local path="$1"
++    command -v sync >/dev/null 2>&1 || return 1
++    if sync --help 2>&1 | grep -q -- '--file-system'; then
++        command sync -f "$path"
++    else
++        command sync
++    fi
++}
++
++ssh_rollback_file_identity() {
++    local path="$1"
++    [[ -f "$path" && ! -L "$path" ]] || return 1
++    stat -c '%d:%i' "$path" 2>/dev/null
++}
++
++ssh_rollback_tracked_file() {
++    local path="$1" expected_id="$2" owner identity
++    [[ -n "$path" && -n "$expected_id" && -f "$path" && ! -L "$path" ]] || return 1
++    owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
++    identity=$(ssh_rollback_file_identity "$path") || return 1
++    [[ "$owner" == "$EUID" && "$identity" == "$expected_id" ]]
++}
++
++ssh_rollback_owned_file() {
++    local path="$1" expected_id="$2" mode
++    ssh_rollback_tracked_file "$path" "$expected_id" || return 1
++    mode=$(stat -c '%a' "$path" 2>/dev/null) || return 1
++    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
++    (( (8#$mode & 077) == 0 ))
++}
++
++ssh_rollback_backup_is_valid() {
++    local backup_file="$1"
++    if [[ -n "$SSH_ROLLBACK_STATE_DIR" ]]; then
++        ssh_rollback_state_valid || return 1
++        [[ "$backup_file" == "$SSH_ROLLBACK_STATE_DIR/sshd_config.backup" ]] || return 1
++        ssh_rollback_owned_file "$backup_file" "$SSH_ROLLBACK_BACKUP_ID"
++    else
++        # Compatibility for the existing timer helper contract. Production
++        # change_ssh_port always uses the stricter private-state branch above.
++        ssh_rollback_tracked_file "$backup_file" "$SSH_ROLLBACK_BACKUP_ID"
++    fi
++}
++
++ssh_rollback_state_valid() {
++    local owner mode identity token_value
++    [[ -n "$SSH_ROLLBACK_STATE_DIR" && -n "$SSH_ROLLBACK_STATE_ID" \
++        && -n "$SSH_ROLLBACK_STATE_TOKEN" && -n "$SSH_ROLLBACK_TOKEN_FILE" \
++        && -n "$SSH_ROLLBACK_TOKEN_ID" ]] || return 1
++    [[ -d "$SSH_ROLLBACK_STATE_DIR" && ! -L "$SSH_ROLLBACK_STATE_DIR" ]] || return 1
++    owner=$(stat -c '%u' "$SSH_ROLLBACK_STATE_DIR" 2>/dev/null) || return 1
++    mode=$(stat -c '%a' "$SSH_ROLLBACK_STATE_DIR" 2>/dev/null) || return 1
++    identity=$(stat -c '%d:%i' "$SSH_ROLLBACK_STATE_DIR" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]+$ \
++        && "$identity" == "$SSH_ROLLBACK_STATE_ID" ]] || return 1
++    (( (8#$mode & 077) == 0 )) || return 1
++    [[ "$SSH_ROLLBACK_TOKEN_FILE" == "$SSH_ROLLBACK_STATE_DIR/token" ]] || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_TOKEN_FILE" "$SSH_ROLLBACK_TOKEN_ID" || return 1
++    IFS= read -r token_value < "$SSH_ROLLBACK_TOKEN_FILE" || return 1
++    [[ "$token_value" == "$SSH_ROLLBACK_STATE_TOKEN" ]] || return 1
++    ssh_rollback_phase_current >/dev/null
++}
++
++ssh_rollback_phase_is_valid() {
++    local phase="$1" phase_file phase_id phase_value
++    [[ "$phase" == "pending" || "$phase" == "confirmed" || "$phase" == "rolling-back" ]] || return 1
++    phase_file="$SSH_ROLLBACK_STATE_DIR/phase.$phase"
++    [[ -f "$phase_file" && ! -L "$phase_file" ]] || return 1
++    phase_id=$(ssh_rollback_file_identity "$phase_file") || return 1
++    ssh_rollback_owned_file "$phase_file" "$phase_id" || return 1
++    IFS= read -r phase_value < "$phase_file" || return 1
++    [[ "$phase_value" == "$SSH_ROLLBACK_STATE_TOKEN" ]]
++}
++
++ssh_rollback_phase_current() {
++    local phase found=""
++    for phase in pending confirmed rolling-back; do
++        if [[ -e "$SSH_ROLLBACK_STATE_DIR/phase.$phase" || -L "$SSH_ROLLBACK_STATE_DIR/phase.$phase" ]]; then
++            [[ -z "$found" ]] || return 1
++            ssh_rollback_phase_is_valid "$phase" || return 1
++            found="$phase"
++        fi
++    done
++    [[ -n "$found" ]] || return 1
++    printf '%s\n' "$found"
++}
++
++ssh_rollback_claim_phase() {
++    local target="$1" current source_file target_file
++    SSH_ROLLBACK_CLAIM_RESULT=""
++    [[ "$target" == "confirmed" || "$target" == "rolling-back" ]] || return 1
++    ssh_rollback_state_valid || return 1
++    current=$(ssh_rollback_phase_current) || return 1
++    [[ "$current" == "pending" ]] || return 1
++    source_file="$SSH_ROLLBACK_STATE_DIR/phase.pending"
++    target_file="$SSH_ROLLBACK_STATE_DIR/phase.$target"
++    [[ ! -e "$target_file" && ! -L "$target_file" ]] || return 1
++    mv -- "$source_file" "$target_file" || return 1
++    SSH_ROLLBACK_CLAIM_RESULT="$target"
++    ssh_rollback_phase_is_valid "$target" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR" || return 2
++}
++
++ssh_rollback_prepare_state() {
++    local state_record state_dir state_id state_token token_file token_id
++    local saved_int saved_term saved_hup pending_signal
++
++    [[ -z "$SSH_ROLLBACK_STATE_DIR" && -z "$SSH_ROLLBACK_STATE_ID" \
++        && -z "$SSH_ROLLBACK_STATE_TOKEN" && -z "$SSH_ROLLBACK_TOKEN_FILE" \
++        && -z "$SSH_ROLLBACK_TOKEN_ID" ]] || return 1
++    declare -F lock_prepare_parent >/dev/null 2>&1 || return 1
++    lock_prepare_parent || return 1
++
++    SSH_ROLLBACK_SIGNAL_PENDING=""
++    saved_int=$(trap -p INT || true)
++    saved_term=$(trap -p TERM || true)
++    saved_hup=$(trap -p HUP || true)
++    trap 'SSH_ROLLBACK_SIGNAL_PENDING=INT' INT
++    trap 'SSH_ROLLBACK_SIGNAL_PENDING=TERM' TERM
++    trap 'SSH_ROLLBACK_SIGNAL_PENDING=HUP' HUP
++
++    state_record=$(
++        local candidate_dir="" candidate_id="" candidate_token candidate_token_id="" token_tmp phase_tmp complete=0
++        trap '' INT TERM HUP
++        umask 077
++        cleanup_candidate_state() {
++            ((complete == 0)) || return 0
++            [[ -n "$candidate_dir" && -n "$candidate_id" \
++                && -d "$candidate_dir" && ! -L "$candidate_dir" \
++                && "$(stat -c '%d:%i' "$candidate_dir" 2>/dev/null)" == "$candidate_id" ]] || return 0
++            [[ -n "$token_tmp" && -f "$token_tmp" && ! -L "$token_tmp" ]] && rm -f -- "$token_tmp"
++            [[ -n "$phase_tmp" && -f "$phase_tmp" && ! -L "$phase_tmp" ]] && rm -f -- "$phase_tmp"
++            [[ -f "$candidate_dir/phase.pending" && ! -L "$candidate_dir/phase.pending" ]] && rm -f -- "$candidate_dir/phase.pending"
++            [[ -f "$candidate_dir/token" && ! -L "$candidate_dir/token" ]] && rm -f -- "$candidate_dir/token"
++            rmdir "$candidate_dir" 2>/dev/null || true
++        }
++        trap cleanup_candidate_state EXIT
++        candidate_token="${EUID}-$$-${RANDOM}-${RANDOM}"
++        candidate_dir=$(mktemp -d "$LOCK_PARENT/ssh-rollback.XXXXXXXX") || exit 1
++        candidate_id=$(stat -c '%d:%i' "$candidate_dir" 2>/dev/null) || {
++            rmdir "$candidate_dir" 2>/dev/null || true
++            exit 1
++        }
++        token_tmp="$candidate_dir/.token-${candidate_token}"
++        if ! (set -o noclobber; printf '%s\n' "$candidate_token" > "$token_tmp") 2>/dev/null; then
++            rmdir "$candidate_dir" 2>/dev/null || true
++            exit 1
++        fi
++        chmod 600 "$token_tmp" 2>/dev/null || exit 1
++        mv -- "$token_tmp" "$candidate_dir/token" || exit 1
++        candidate_token_id=$(ssh_rollback_file_identity "$candidate_dir/token") || exit 1
++        phase_tmp="$candidate_dir/.phase-${candidate_token}"
++        if ! (set -o noclobber; printf '%s\n' "$candidate_token" > "$phase_tmp") 2>/dev/null; then
++            exit 1
++        fi
++        chmod 600 "$phase_tmp" 2>/dev/null || exit 1
++        mv -- "$phase_tmp" "$candidate_dir/phase.pending" || exit 1
++        complete=1
++        printf '%s\t%s\t%s\t%s\n' "$candidate_dir" "$candidate_id" "$candidate_token" \
++            "$candidate_token_id"
++    )
++    local create_status=$?
++
++    if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
++    if [[ -n "$saved_term" ]]; then eval "$saved_term"; else trap - TERM; fi
++    if [[ -n "$saved_hup" ]]; then eval "$saved_hup"; else trap - HUP; fi
++    pending_signal="$SSH_ROLLBACK_SIGNAL_PENDING"
++    SSH_ROLLBACK_SIGNAL_PENDING=""
++
++    if ((create_status == 0)); then
++        IFS=$'\t' read -r state_dir state_id state_token token_id <<< "$state_record"
++        token_file="$state_dir/token"
++        SSH_ROLLBACK_STATE_DIR="$state_dir"
++        SSH_ROLLBACK_STATE_ID="$state_id"
++        SSH_ROLLBACK_STATE_TOKEN="$state_token"
++        SSH_ROLLBACK_TOKEN_FILE="$token_file"
++        SSH_ROLLBACK_TOKEN_ID="$token_id"
++        ssh_rollback_state_valid || create_status=1
++    fi
++
++    if [[ -n "$pending_signal" ]]; then
++        kill -s "$pending_signal" "$$" 2>/dev/null || return 1
++    fi
++    ((create_status == 0))
++}
++
++ssh_rollback_create_backup() {
++    local ssh_config="$1" tmp_file
++    ssh_rollback_state_valid || return 1
++    SSH_ROLLBACK_BACKUP="$SSH_ROLLBACK_STATE_DIR/sshd_config.backup"
++    tmp_file="$SSH_ROLLBACK_STATE_DIR/.backup-${SSH_ROLLBACK_STATE_TOKEN}"
++    [[ ! -e "$SSH_ROLLBACK_BACKUP" && ! -L "$SSH_ROLLBACK_BACKUP" ]] || return 1
++    if ! (umask 077; set -o noclobber; command cat -- "$ssh_config" > "$tmp_file") 2>/dev/null; then
++        return 1
++    fi
++    chmod 600 "$tmp_file" || return 1
++    mv -- "$tmp_file" "$SSH_ROLLBACK_BACKUP" || return 1
++    SSH_ROLLBACK_BACKUP_ID=$(ssh_rollback_file_identity "$SSH_ROLLBACK_BACKUP") || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_BACKUP" "$SSH_ROLLBACK_BACKUP_ID" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_BACKUP" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR"
++}
++
++ssh_rollback_marker_is_valid() {
++    local marker="$1" marker_token="$2" marker_id marker_value
++    [[ -n "$marker" && -n "$marker_token" && -f "$marker" && ! -L "$marker" ]] || return 1
++    marker_id=$(ssh_rollback_file_identity "$marker") || return 1
++    ssh_rollback_owned_file "$marker" "$marker_id" || return 1
++    IFS= read -r marker_value < "$marker" || return 1
++    [[ "$marker_value" == "$marker_token" ]]
++}
++
++ssh_rollback_create_marker() {
++    local marker="$1" marker_token="$2" tmp_file marker_id
++    ssh_rollback_state_valid || return 1
++    [[ "$marker" == "$SSH_ROLLBACK_STATE_DIR/confirmed" && ! -e "$marker" && ! -L "$marker" ]] || return 1
++    tmp_file="$SSH_ROLLBACK_STATE_DIR/.confirmed-${marker_token}"
++    if ! (umask 077; set -o noclobber; printf '%s\n' "$marker_token" > "$tmp_file") 2>/dev/null; then
++        return 1
++    fi
++    chmod 600 "$tmp_file" || return 1
++    mv -- "$tmp_file" "$marker" || return 1
++    marker_id=$(ssh_rollback_file_identity "$marker") || return 1
++    ssh_rollback_owned_file "$marker" "$marker_id" || return 1
++    ssh_rollback_marker_is_valid "$marker" "$marker_token"
++}
++
++ssh_rollback_result_is_valid() {
++    local result_value result_id
++    [[ -n "$SSH_ROLLBACK_RESULT_FILE" && -f "$SSH_ROLLBACK_RESULT_FILE" \
++        && ! -L "$SSH_ROLLBACK_RESULT_FILE" ]] || return 1
++    result_id=$(ssh_rollback_file_identity "$SSH_ROLLBACK_RESULT_FILE") || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_RESULT_FILE" "$result_id" || return 1
++    IFS= read -r result_value < "$SSH_ROLLBACK_RESULT_FILE" || return 1
++    [[ "$result_value" == "${SSH_ROLLBACK_STATE_TOKEN}:rolled-back" ]]
++}
++
++ssh_rollback_record_result() {
++    local tmp_file result_id
++    [[ -n "$SSH_ROLLBACK_STATE_DIR" ]] || return 0
++    ssh_rollback_state_valid || return 1
++    SSH_ROLLBACK_RESULT_FILE="$SSH_ROLLBACK_STATE_DIR/rolled-back"
++    if [[ -e "$SSH_ROLLBACK_RESULT_FILE" || -L "$SSH_ROLLBACK_RESULT_FILE" ]]; then
++        ssh_rollback_result_is_valid || return 1
++        ssh_rollback_sync_path "$SSH_ROLLBACK_RESULT_FILE" || return 1
++        ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR"
++        return $?
++    fi
++    tmp_file="$SSH_ROLLBACK_STATE_DIR/.rolled-back-${SSH_ROLLBACK_STATE_TOKEN}"
++    if ! (umask 077; set -o noclobber; \
++        printf '%s\n' "${SSH_ROLLBACK_STATE_TOKEN}:rolled-back" > "$tmp_file") 2>/dev/null; then
++        return 1
++    fi
++    chmod 600 "$tmp_file" || return 1
++    mv -- "$tmp_file" "$SSH_ROLLBACK_RESULT_FILE" || return 1
++    result_id=$(ssh_rollback_file_identity "$SSH_ROLLBACK_RESULT_FILE") || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_RESULT_FILE" "$result_id" || return 1
++    ssh_rollback_result_is_valid || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_RESULT_FILE" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR"
++}
++
++ssh_rollback_config_is_live() {
++    [[ "$1" == "/etc/ssh/sshd_config" ]]
++}
++
++ssh_rollback_validate_config() {
++    local ssh_config="$1" sshd_bin=""
++    ssh_rollback_config_is_live "$ssh_config" || return 0
++    if command -v sshd >/dev/null 2>&1; then
++        sshd_bin=$(command -v sshd)
++    elif [[ -x /usr/sbin/sshd ]]; then
++        sshd_bin=/usr/sbin/sshd
++    else
++        echo -e "${RED}[ERROR]${NC} 找不到 sshd，无法验证 SSH 配置。" >&2
++        return 1
++    fi
++    "$sshd_bin" -t -f "$ssh_config"
++}
++
++ssh_rollback_restart_service() {
++    local ssh_config="$1"
++    ssh_rollback_config_is_live "$ssh_config" || return 0
++    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
++        rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null
++    else
++        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
++    fi
++}
++
++ssh_rollback_remove_backup() {
++    local backup_file="$1"
++    ssh_rollback_backup_is_valid "$backup_file" || return 1
++    rm -f -- "$backup_file" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR"
++}
++
++ssh_rollback_remove_state() {
++    local marker_id="" result_id="" phase phase_id entry state_parent
++    [[ -n "$SSH_ROLLBACK_STATE_DIR" ]] || return 0
++    ssh_rollback_state_valid || return 1
++    [[ ! -e "$SSH_ROLLBACK_BACKUP" && ! -L "$SSH_ROLLBACK_BACKUP" ]] || return 1
++    # Persist any preceding backup deletion before removing the completion
++    # evidence that proves rollback finished.
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR" || return 1
++    for entry in "$SSH_ROLLBACK_STATE_DIR"/* "$SSH_ROLLBACK_STATE_DIR"/.[!.]* \
++        "$SSH_ROLLBACK_STATE_DIR"/..?*; do
++        [[ -e "$entry" || -L "$entry" ]] || continue
++        case "$entry" in
++            "$SSH_ROLLBACK_TOKEN_FILE"|"$SSH_ROLLBACK_MARKER"|"$SSH_ROLLBACK_RESULT_FILE"|\
++            "$SSH_ROLLBACK_STATE_DIR/phase.pending"|"$SSH_ROLLBACK_STATE_DIR/phase.confirmed"|\
++            "$SSH_ROLLBACK_STATE_DIR/phase.rolling-back") ;;
++            *) return 1 ;;
++        esac
++    done
++    if [[ -n "$SSH_ROLLBACK_MARKER" && -e "$SSH_ROLLBACK_MARKER" ]]; then
++        ssh_rollback_marker_is_valid "$SSH_ROLLBACK_MARKER" "$SSH_ROLLBACK_MARKER_TOKEN" || return 1
++        marker_id=$(ssh_rollback_file_identity "$SSH_ROLLBACK_MARKER") || return 1
++        ssh_rollback_owned_file "$SSH_ROLLBACK_MARKER" "$marker_id" || return 1
++        rm -f -- "$SSH_ROLLBACK_MARKER" || return 1
++    fi
++    if [[ -n "$SSH_ROLLBACK_RESULT_FILE" && -e "$SSH_ROLLBACK_RESULT_FILE" ]]; then
++        ssh_rollback_result_is_valid || return 1
++        result_id=$(ssh_rollback_file_identity "$SSH_ROLLBACK_RESULT_FILE") || return 1
++        ssh_rollback_owned_file "$SSH_ROLLBACK_RESULT_FILE" "$result_id" || return 1
++        rm -f -- "$SSH_ROLLBACK_RESULT_FILE" || return 1
++    fi
++    phase=$(ssh_rollback_phase_current) || return 1
++    phase_id=$(ssh_rollback_file_identity "$SSH_ROLLBACK_STATE_DIR/phase.$phase") || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_STATE_DIR/phase.$phase" "$phase_id" || return 1
++    rm -f -- "$SSH_ROLLBACK_STATE_DIR/phase.$phase" || return 1
++    ssh_rollback_owned_file "$SSH_ROLLBACK_TOKEN_FILE" "$SSH_ROLLBACK_TOKEN_ID" || return 1
++    rm -f -- "$SSH_ROLLBACK_TOKEN_FILE" || return 1
++    ssh_rollback_sync_path "$SSH_ROLLBACK_STATE_DIR" || return 1
++    [[ -d "$SSH_ROLLBACK_STATE_DIR" && ! -L "$SSH_ROLLBACK_STATE_DIR" \
++        && "$(stat -c '%d:%i' "$SSH_ROLLBACK_STATE_DIR" 2>/dev/null)" == "$SSH_ROLLBACK_STATE_ID" ]] || return 1
++    state_parent=${SSH_ROLLBACK_STATE_DIR%/*}
++    rmdir "$SSH_ROLLBACK_STATE_DIR" || return 1
++    ssh_rollback_sync_path "$state_parent"
++}
++
++ssh_rollback_discard_unstarted_state() {
++    local entry entry_id
++    [[ -z "$SSH_ROLLBACK_BACKUP_ID" && -z "$SSH_ROLLBACK_PID" ]] || return 1
++    ssh_rollback_state_valid || return 1
++    for entry in "$SSH_ROLLBACK_STATE_DIR"/* "$SSH_ROLLBACK_STATE_DIR"/.[!.]* \
++        "$SSH_ROLLBACK_STATE_DIR"/..?*; do
++        [[ -e "$entry" || -L "$entry" ]] || continue
++        case "$entry" in
++            "$SSH_ROLLBACK_TOKEN_FILE"|"$SSH_ROLLBACK_STATE_DIR/phase.pending") ;;
++            "$SSH_ROLLBACK_STATE_DIR/.backup-${SSH_ROLLBACK_STATE_TOKEN}"|\
++            "$SSH_ROLLBACK_STATE_DIR/.confirmed-${SSH_ROLLBACK_STATE_TOKEN}"|\
++            "$SSH_ROLLBACK_STATE_DIR/.rolled-back-${SSH_ROLLBACK_STATE_TOKEN}")
++                entry_id=$(ssh_rollback_file_identity "$entry") || return 1
++                ssh_rollback_owned_file "$entry" "$entry_id" || return 1
++                rm -f -- "$entry" || return 1
++                ;;
++            *) return 1 ;;
++        esac
++    done
++    SSH_ROLLBACK_BACKUP=""
++    SSH_ROLLBACK_MARKER=""
++    SSH_ROLLBACK_RESULT_FILE=""
++    ssh_rollback_remove_state
++}
++
++# SSH rollback helper: restore original port after atomically claiming rollback.
++_ssh_rollback_claimed() {
+@@ -5598,7 +6394,86 @@
+-    if [[ -f "$backup_file" ]]; then
+-        cp "$backup_file" "$ssh_config"
+-        rm -f "$backup_file"
+-
+-        # Restart SSH with original config
+-        if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+-            rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
++    [[ "$(ssh_rollback_phase_current 2>/dev/null || true)" == "rolling-back" ]] || return 1
++    ssh_rollback_backup_is_valid "$backup_file" || return 1
++    command cat -- "$backup_file" > "$ssh_config" || return 1
++    ssh_rollback_sync_path "$ssh_config" || return 1
++    ssh_rollback_validate_config "$ssh_config" || return 1
++    ssh_rollback_restart_service "$ssh_config" || return 1
++    ssh_rollback_record_result || return 1
++    ssh_rollback_remove_backup "$backup_file" || return 1
++
++    echo -e "\n${YELLOW}[AUTO-ROLLBACK]${NC} SSH 端口已自动恢复为 ${original_port}"
++}
++
++_ssh_rollback() {
++    local ssh_config="$1" backup_file="$2" original_port="$3" claim_status=0
++    ssh_rollback_claim_phase rolling-back || claim_status=$?
++    if ((claim_status != 0)); then
++        ((claim_status == 2)) && [[ "$SSH_ROLLBACK_CLAIM_RESULT" == "rolling-back" ]] || return 1
++    fi
++    _ssh_rollback_claimed "$ssh_config" "$backup_file" "$original_port" || return 1
++    ssh_rollback_remove_state || return 1
++    clear_ssh_rollback_state
++}
++
++clear_ssh_rollback_state() {
++    SSH_ROLLBACK_PID=""
++    SSH_ROLLBACK_ID=""
++    SSH_ROLLBACK_CONFIG=""
++    SSH_ROLLBACK_BACKUP=""
++    SSH_ROLLBACK_BACKUP_ID=""
++    SSH_ROLLBACK_ORIGINAL_PORT=""
++    SSH_ROLLBACK_MARKER=""
++    SSH_ROLLBACK_MARKER_TOKEN=""
++    SSH_ROLLBACK_RESULT_FILE=""
++    SSH_ROLLBACK_STATE_DIR=""
++    SSH_ROLLBACK_STATE_ID=""
++    SSH_ROLLBACK_STATE_TOKEN=""
++    SSH_ROLLBACK_TOKEN_FILE=""
++    SSH_ROLLBACK_TOKEN_ID=""
++    SSH_ROLLBACK_CLAIM_RESULT=""
++}
++
++stop_ssh_rollback_timer() {
++    local current_id=""
++    if [[ "$SSH_ROLLBACK_PID" =~ ^[0-9]+$ ]]; then
++        current_id=$(cleanup_process_identity "$SSH_ROLLBACK_PID" 2>/dev/null || true)
++        if [[ -n "$current_id" ]]; then
++            [[ -n "$SSH_ROLLBACK_ID" && "$current_id" == "$SSH_ROLLBACK_ID" ]] || return 1
++            kill "$SSH_ROLLBACK_PID" 2>/dev/null || return 1
++        fi
++        wait "$SSH_ROLLBACK_PID" 2>/dev/null || true
++        current_id=$(cleanup_process_identity "$SSH_ROLLBACK_PID" 2>/dev/null || true)
++        [[ -z "$current_id" || "$current_id" != "$SSH_ROLLBACK_ID" ]] || return 1
++    fi
++    SSH_ROLLBACK_PID=""
++    SSH_ROLLBACK_ID=""
++}
++
++start_ssh_rollback_timer() {
++    local ssh_config="$1" backup_file="$2" original_port="$3" timeout="$4" marker="$5"
++    local backup_id marker_token
++    backup_id=$(ssh_rollback_file_identity "$backup_file") || return 1
++    SSH_ROLLBACK_BACKUP_ID="$backup_id"
++    ssh_rollback_backup_is_valid "$backup_file" || return 1
++    [[ "$(ssh_rollback_phase_current 2>/dev/null || true)" == "pending" ]] || return 1
++    marker_token="${SSH_ROLLBACK_STATE_TOKEN:-${EUID}-$$-${RANDOM}-${RANDOM}}"
++    SSH_ROLLBACK_MARKER_TOKEN="$marker_token"
++    (
++        local claim_status=0
++        sleep "$timeout"
++        # Once the timeout has elapsed, rollback claiming and recovery form a
++        # critical transaction.  A signal sent to the whole process group also
++        # reaches this worker and every external command it starts.  Ignore the
++        # interactive termination signals from immediately before the claim
++        # through durable result publication and backup removal; the parent
++        # receives the same signal, waits for this identity-bound worker, and
++        # performs the requested signal exit after cleanup.  Before the sleep
++        # completes the worker keeps the default dispositions, so a still-
++        # pending timer remains promptly cancellable by stop_ssh_rollback_timer.
++        trap '' INT TERM HUP
++        ssh_rollback_claim_phase rolling-back || claim_status=$?
++        # Only a fully successful claim proves that this worker owns the
++        # rollback.  A non-zero result (whether from a durability error or a
++        # competing claimant changing the visible phase) carries no claimant
++        # identity and must never authorize a second restore.
++        if ((claim_status == 0)); then
++            _ssh_rollback_claimed "$ssh_config" "$backup_file" "$original_port"
+@@ -5606 +6481,3 @@
+-            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
++            local observed_phase
++            observed_phase=$(ssh_rollback_phase_current 2>/dev/null || true)
++            [[ "$observed_phase" == "confirmed" || "$observed_phase" == "rolling-back" ]]
+@@ -5607,0 +6485,15 @@
++    ) &
++    SSH_ROLLBACK_PID=$!
++    SSH_ROLLBACK_ID=$(cleanup_process_identity "$SSH_ROLLBACK_PID" 2>/dev/null || true)
++    SSH_ROLLBACK_CONFIG="$ssh_config"
++    SSH_ROLLBACK_BACKUP="$backup_file"
++    SSH_ROLLBACK_ORIGINAL_PORT="$original_port"
++    SSH_ROLLBACK_MARKER="$marker"
++    [[ -n "$SSH_ROLLBACK_STATE_DIR" ]] && \
++        SSH_ROLLBACK_RESULT_FILE="$SSH_ROLLBACK_STATE_DIR/rolled-back"
++    if [[ -z "$SSH_ROLLBACK_ID" ]]; then
++        kill "$SSH_ROLLBACK_PID" 2>/dev/null || true
++        wait "$SSH_ROLLBACK_PID" 2>/dev/null || true
++        return 1
++    fi
++}
+@@ -5609 +6501,25 @@
+-        echo -e "\n${YELLOW}[AUTO-ROLLBACK]${NC} SSH 端口已自动恢复为 ${original_port}"
++ssh_rollback_wait_for_timer_completion() {
++    local current_id="" wait_status=0
++    [[ "$(ssh_rollback_phase_current 2>/dev/null || true)" == "rolling-back" ]] || return 1
++    if [[ "$SSH_ROLLBACK_PID" =~ ^[0-9]+$ ]]; then
++        current_id=$(cleanup_process_identity "$SSH_ROLLBACK_PID" 2>/dev/null || true)
++        if [[ -n "$current_id" ]]; then
++            [[ -n "$SSH_ROLLBACK_ID" && "$current_id" == "$SSH_ROLLBACK_ID" ]] || return 1
++        fi
++        wait "$SSH_ROLLBACK_PID" || wait_status=$?
++        ((wait_status == 0)) || return 1
++        current_id=$(cleanup_process_identity "$SSH_ROLLBACK_PID" 2>/dev/null || true)
++        [[ -z "$current_id" || "$current_id" != "$SSH_ROLLBACK_ID" ]] || return 1
++    fi
++    ssh_rollback_result_is_valid || return 1
++    [[ ! -e "$SSH_ROLLBACK_BACKUP" && ! -L "$SSH_ROLLBACK_BACKUP" ]]
++}
++
++ssh_rollback_confirm() {
++    local phase
++    if ssh_rollback_claim_phase confirmed; then
++        stop_ssh_rollback_timer || return 1
++        ssh_rollback_remove_backup "$SSH_ROLLBACK_BACKUP" || return 1
++        ssh_rollback_remove_state || return 1
++        clear_ssh_rollback_state
++        return 0
+@@ -5610,0 +6527,65 @@
++    phase=$(ssh_rollback_phase_current 2>/dev/null || true)
++    if [[ "$phase" == "rolling-back" ]]; then
++        if ! ssh_rollback_wait_for_timer_completion; then
++            echo -e "${RED}[ERROR]${NC} 确认输掉回滚竞态，且无法验证回滚完成；状态已保留。" >&2
++            return 1
++        fi
++        ssh_rollback_remove_state || return 1
++        clear_ssh_rollback_state
++        echo -e "${YELLOW}[ROLLBACK WON]${NC} 确认输掉回滚竞态；已等待并验证回滚完成。" >&2
++        return 2
++    fi
++    echo -e "${RED}[ERROR]${NC} 无法安全提交确认；phase 状态已保留。" >&2
++    return 1
++}
++
++cleanup_pending_ssh_rollback() {
++    local phase claim_status=0
++    [[ -n "$SSH_ROLLBACK_PID" || -n "$SSH_ROLLBACK_STATE_DIR" ]] || return 0
++    if [[ -n "$SSH_ROLLBACK_STATE_DIR" && -z "$SSH_ROLLBACK_BACKUP_ID" ]]; then
++        if [[ -n "$SSH_ROLLBACK_PID" ]]; then
++            stop_ssh_rollback_timer || return 1
++        fi
++        ssh_rollback_discard_unstarted_state || return 1
++        clear_ssh_rollback_state
++        return 0
++    fi
++    phase=$(ssh_rollback_phase_current) || return 1
++    case "$phase" in
++        pending)
++            ssh_rollback_claim_phase rolling-back || claim_status=$?
++            if ((claim_status != 0)) \
++                && ! { ((claim_status == 2)) && [[ "$SSH_ROLLBACK_CLAIM_RESULT" == "rolling-back" ]]; }; then
++                phase=$(ssh_rollback_phase_current 2>/dev/null || true)
++                [[ "$phase" == "rolling-back" ]] || return 1
++                ssh_rollback_wait_for_timer_completion || return 1
++            else
++                if [[ -n "$SSH_ROLLBACK_PID" ]]; then
++                    stop_ssh_rollback_timer || return 1
++                fi
++                _ssh_rollback_claimed "$SSH_ROLLBACK_CONFIG" "$SSH_ROLLBACK_BACKUP" \
++                    "$SSH_ROLLBACK_ORIGINAL_PORT" || return 1
++            fi
++            ssh_rollback_remove_state || return 1
++            ;;
++        confirmed)
++            if [[ -n "$SSH_ROLLBACK_PID" ]]; then
++                stop_ssh_rollback_timer || return 1
++            fi
++            if [[ -e "$SSH_ROLLBACK_BACKUP" || -L "$SSH_ROLLBACK_BACKUP" ]]; then
++                ssh_rollback_remove_backup "$SSH_ROLLBACK_BACKUP" || return 1
++            fi
++            ssh_rollback_remove_state || return 1
++            ;;
++        rolling-back)
++            if [[ -n "$SSH_ROLLBACK_PID" ]]; then
++                ssh_rollback_wait_for_timer_completion || return 1
++            elif ! ssh_rollback_result_is_valid; then
++                _ssh_rollback_claimed "$SSH_ROLLBACK_CONFIG" "$SSH_ROLLBACK_BACKUP" \
++                    "$SSH_ROLLBACK_ORIGINAL_PORT" || return 1
++            fi
++            ssh_rollback_remove_state || return 1
++            ;;
++        *) return 1 ;;
++    esac
++    clear_ssh_rollback_state
+@@ -5616 +6597,2 @@
+-    local backup_file="/tmp/sshd_config.backup.$$"
++    local backup_file=""
++    local rollback_marker=""
+@@ -5654,2 +6636,18 @@
+-    # Step 1: Create backup BEFORE any changes
+-    cp "$ssh_config" "$backup_file"
++    # Step 1: Create an owned private rollback state and backup BEFORE any changes.
++    if ! ssh_rollback_prepare_state; then
++        echo -e "${RED}[ERROR]${NC} 无法安全创建 SSH 回滚状态，未修改配置。" >&2
++        return 1
++    fi
++    rollback_marker="$SSH_ROLLBACK_STATE_DIR/confirmed"
++    SSH_ROLLBACK_CONFIG="$ssh_config"
++    SSH_ROLLBACK_ORIGINAL_PORT="$CURRENT_SSH"
++    SSH_ROLLBACK_MARKER="$rollback_marker"
++    SSH_ROLLBACK_MARKER_TOKEN="$SSH_ROLLBACK_STATE_TOKEN"
++    SSH_ROLLBACK_RESULT_FILE="$SSH_ROLLBACK_STATE_DIR/rolled-back"
++    if ! ssh_rollback_create_backup "$ssh_config"; then
++        echo -e "${RED}[ERROR]${NC} 无法安全创建 SSH 回滚备份，未修改配置。" >&2
++        cleanup_pending_ssh_rollback || \
++            echo -e "${RED}[ERROR]${NC} 未能安全清理回滚状态；写锁必须保留。" >&2
++        return 1
++    fi
++    backup_file="$SSH_ROLLBACK_BACKUP"
+@@ -5660 +6658,5 @@
+-        sed -i "s/^Port.*/Port $new_port/" "$ssh_config"
++        if ! sed -i "s/^Port.*/Port $new_port/" "$ssh_config"; then
++            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
++                echo -e "${RED}[ERROR]${NC} 配置写入及自动恢复均失败；安全备份已保留。" >&2
++            return 1
++        fi
+@@ -5662 +6664,12 @@
+-        echo "Port $new_port" >> "$ssh_config"
++        if ! echo "Port $new_port" >> "$ssh_config"; then
++            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
++                echo -e "${RED}[ERROR]${NC} 配置写入及自动恢复均失败；安全备份已保留。" >&2
++            return 1
++        fi
++    fi
++
++    if ! ssh_rollback_validate_config "$ssh_config"; then
++        echo -e "${RED}[ERROR]${NC} 新 SSH 配置验证失败，正在恢复原配置。" >&2
++        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
++            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份已保留在 $backup_file" >&2
++        return 1
+@@ -5668,10 +6681,8 @@
+-    # Step 4: Start background rollback timer
+-    (
+-        sleep "$rollback_timeout"
+-        # Check if marker file exists (means user confirmed)
+-        if [[ ! -f "/tmp/ssh_port_confirmed.$$" ]]; then
+-            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH"
+-        fi
+-    ) &
+-    local rollback_pid=$!
+-    disown $rollback_pid 2>/dev/null || true
++    # Step 4: Start a tracked background rollback timer
++    if ! start_ssh_rollback_timer "$ssh_config" "$backup_file" "$CURRENT_SSH" \
++        "$rollback_timeout" "$rollback_marker"; then
++        echo -e "${RED}[ERROR]${NC} 无法启动 SSH 回滚计时器，正在恢复原配置。" >&2
++        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
++            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份已保留在 $backup_file" >&2
++        return 1
++    fi
+@@ -5681,4 +6692,6 @@
+-    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+-        rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
+-    else
+-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
++    if ! ssh_rollback_restart_service "$ssh_config"; then
++        echo -e "${RED}[ERROR]${NC} SSH 服务重启失败，正在恢复原配置。" >&2
++        if ! cleanup_pending_ssh_rollback; then
++            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份和状态已保留。" >&2
++        fi
++        return 1
+@@ -5711,7 +6724,8 @@
+-        # User confirmed, create marker and clean up
+-        touch "/tmp/ssh_port_confirmed.$$"
+-        rm -f "$backup_file"
+-        # Try to kill rollback process
+-        kill $rollback_pid 2>/dev/null || true
+-        echo -e "${GREEN}[SUCCESS]${NC} SSH 端口修改已确认！新端口: $new_port"
+-        rm -f "/tmp/ssh_port_confirmed.$$"
++        if ssh_rollback_confirm; then
++            echo -e "${GREEN}[SUCCESS]${NC} SSH 端口修改已确认！新端口: $new_port"
++        else
++            local confirm_status=$?
++            ((confirm_status == 2)) || \
++                echo -e "${RED}[ERROR]${NC} 无法安全提交确认；回滚状态已保留。" >&2
++            return 1
++        fi
+@@ -5722,2 +6736,4 @@
+-        kill $rollback_pid 2>/dev/null || true
+-        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH"
++        if ! cleanup_pending_ssh_rollback; then
++            echo -e "${RED}[ERROR]${NC} SSH 自动回滚未完整成功；安全备份和状态已保留。" >&2
++            return 1
++        fi
+@@ -6878 +7894 @@
+-    if ! lock_acquire; then
++    if ! lock_acquire_smart; then
+@@ -6880 +7896 @@
+-        log_error "If you are sure no other instance is running, remove: $LOCK_DIR"
++        log_error "Lock path: ${LOCK_FILE:-${LOCK_DIR:-unknown}}"

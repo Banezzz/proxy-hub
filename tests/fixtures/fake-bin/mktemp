@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+created_path=$(/usr/bin/mktemp "$@")
+if [[ "${FAKE_MKTEMP_SIGNAL:-0}" == "1" ]]; then
+    process_group=$(ps -o pgid= -p "$$" | tr -d '[:space:]')
+    kill -s "${FAKE_MKTEMP_SIGNAL_NAME:-TERM}" -- "-$process_group"
+    sleep 0.1
+fi
+printf '%s\n' "$created_path"

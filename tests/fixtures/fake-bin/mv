@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+/usr/bin/mv "$@"
+
+last_arg=""
+for last_arg in "$@"; do :; done
+
+build_stage="${FAKE_BUILD_MV_STAGE:-}"
+build_action="${FAKE_BUILD_MV_ACTION:-}"
+build_marker="${FAKE_BUILD_MV_MARKER:-}"
+build_stage_matches=0
+case "$build_stage:$last_arg" in
+    manifest:*/lib/manifest.sha256|bundle:*/dist/proxy-hub.bundle.sh)
+        build_stage_matches=1
+        ;;
+esac
+if ((build_stage_matches == 1)) && [[ -n "$build_action" && -n "$build_marker" && ! -e "$build_marker" ]]; then
+    : >"$build_marker"
+    case "$build_action" in
+        fail)
+            exit 97
+            ;;
+        HUP|INT|TERM)
+            kill -s "$build_action" "$PPID"
+            sleep 0.05
+            ;;
+        replace-manifest-txn|replace-manifest-txn-fail)
+            release_root=$(dirname -- "$(dirname -- "$last_arg")")
+            shopt -s nullglob
+            manifest_txns=("$release_root"/lib/.proxy-hub.manifest.txn.*)
+            ((${#manifest_txns[@]} == 1)) || {
+                echo "cannot uniquely locate manifest transaction" >&2
+                exit 99
+            }
+            manifest_txn="${manifest_txns[0]}"
+            /usr/bin/mv -- "$manifest_txn" "${manifest_txn}.identity-replaced"
+            /usr/bin/mkdir -m 700 -- "$manifest_txn"
+            printf 'replacement\n' >"$manifest_txn/keep"
+            [[ "$build_action" == replace-manifest-txn ]] || exit 97
+            ;;
+        *)
+            echo "unsupported FAKE_BUILD_MV_ACTION: $build_action" >&2
+            exit 98
+            ;;
+    esac
+fi
+
+case "${FAKE_LOCK_SIGNAL_STAGE:-}:$last_arg" in
+    owner:*/owner|pid:*/pid)
+        target_pid=$(ps -o ppid= -p "$PPID" | tr -d '[:space:]')
+        kill -TERM "$target_pid"
+        ;;
+esac
