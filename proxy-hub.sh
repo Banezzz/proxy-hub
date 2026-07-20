@@ -20,6 +20,7 @@ fi
 __phb_modules=(
     00_security_state.sh
     10_runtime_platform_ui.sh
+    15_xray_release.sh
     20_installers_restart.sh
     30_provision_network.sh
     40_config_share.sh
