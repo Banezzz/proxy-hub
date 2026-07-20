@@ -36,8 +36,8 @@ proxy-hub.sh (loader)
 | `00_security_state.sh` | 锁、安全下载/配置读取、JSON builder、加密、全局状态与常量 |
 | `10_runtime_platform_ui.sh` | 生命周期、日志与输入 UI、包管理器/init/service 适配、i18n、节点目录 |
 | `20_installers_restart.sh` | Xray、sing-box、GeoData 安装与代理内核定时重启 |
-| `30_provision_network.sh` | 协议选择、凭据/端口生成、IP 与 SNI 探测 |
-| `40_config_share.sh` | Xray/sing-box 配置渲染、校验、同步、节点持久化与分享信息 |
+| `30_provision_network.sh` | 协议选择、凭据/transport-aware 端口生成、IP、证书与 SNI 探测 |
+| `40_config_share.sh` | Xray/sing-box 配置渲染、校验、同步、节点持久化、分享链接与二维码 |
 | `50_node_commands.sh` | 节点 install/info/list/edit/remove/health/update 等命令编排 |
 | `60_system_tools.sh` | WARP、BBR、Swap、Fail2ban |
 | `70_ports_logs.sh` | SSH/代理端口与日志管理、独立工具命令安装 |
@@ -46,6 +46,55 @@ proxy-hub.sh (loader)
 
 模块编号就是装载顺序，也是依赖方向。不得让低编号模块在 source 阶段调用尚未
 定义的高编号模块；模块之间仍共享一个 Bash 进程和全局命名空间。
+
+## 四分支语义移植设计
+
+历史分支基于拆分前的单体脚本，不能把旧文件直接 cherry-pick 回来。本轮只移植
+仍有价值的行为，并让实现服从当前模块、安全加载、双内核和发布产物契约。
+
+### Hysteria2 复用 sing-box
+
+Hysteria2 不安装独立 `hysteria` 二进制，也不为每个节点创建独立 service；它与
+AnyTLS 一样由现有 `sing-box` service 承载。`write_singbox_config` 从节点目录聚合
+`anytls`、`anytls_reality` 和 `hysteria2` inbounds，使用 jq builder 校验名称、端口、
+密码和证书路径后一次生成配置。添加或删除其中任一节点都通过同一个 sync 路径
+重建、校验并重启 sing-box；最后一个 sing-box 节点删除后才停用服务。
+
+Hysteria2 使用 `PORT` 记录 UDP 监听端口、`HY2_PASSWORD` 记录认证密码，证书沿用
+`SINGBOX_CERT_DIR/<name>.crt|key` 的逐节点自签名证书布局。密码进入节点文件前遵循
+现有可选加密策略，读取一律经过 `safe_read_config_value`/`safe_load_node_config`，
+不得 source 节点 env。分享链接支持 IPv4/IPv6，并明确 `insecure=1` 的自签名证书
+语义。端口选择和健康检查查询 UDP socket，不得用 TCP 探测代替。
+
+### `both` 节点的双二维码
+
+`get_share_link` 保持返回单链接的兼容 ABI。新的二维码编排助手安全加载当前节点，
+对普通协议显示一个二维码，对 `both` 分别构造 Vision 和 XHTTP 链接并显示两个。
+`cmd_install` 与 `cmd_qr` 共用该助手，避免两套协议分支漂移；不得复制历史补丁中
+`source "$node_file"` 的不安全做法。地址按可用的 IPv4、IPv6、旧 `SERVER_IP`
+顺序回退，缺少对应端口时不生成空二维码。
+
+### SS2022 时间同步菜单
+
+SS2022 安装完成后的提示从 y/n 改为显式菜单。普通主机及具备时钟能力的容器提供
+“安装并启用、只检查准确度、跳过”；没有 `CAP_SYS_TIME` 的容器保留权限说明，
+只提供“检查、跳过”。检查路径只读取 HTTPS `Date` 头，不要求改时钟权限；空输入、
+跳过和无效输入都不得产生安装副作用。菜单文案由 `10_runtime_platform_ui.sh` 的
+中英文 `msg()` 表统一提供，行为位于 `80_timesync.sh`。
+
+### 安装成功门与 transport-aware 防火墙
+
+节点安装是“保存候选节点 → 重建并校验所属内核配置 → 重启并确认服务 active →
+按 transport 放行本机端口 → 输出成功、分享信息和二维码”的有序流程。transport
+映射为：Vision/XHTTP/AnyTLS 为 TCP，Hysteria2 为 UDP，Shadowsocks 为 TCP+UDP；
+`both` 的两个 VLESS 端口分别按 TCP 处理。防火墙 helper 必须显式接收 transport，
+避免为 Hysteria2 错开 TCP 或为所有协议无条件扩大 TCP+UDP 暴露面。
+
+配置生成、服务重启或健康门失败时，安装返回非零，删除本次新节点及其尚未共享的
+逐节点证书，重新生成受影响内核的旧节点配置并尝试恢复服务；失败路径不得继续输出
+`install_complete`、分享链接或二维码。端口只在服务通过健康门后放行，因此启动失败
+不产生新的防火墙规则。来宾系统无法修改云厂商安全组，仍需用户按相同 transport
+在控制台放行；该边界记录在 `docs/audits.md`。
 
 ## Loader 的两条路径
 

@@ -1,5 +1,16 @@
 # 当前未解决事项
 
+## 云平台安全组仍需按 transport 人工放行
+
+- 严重性：low
+- 影响范围：所有新增节点，尤其只监听 UDP/QUIC 的 Hysteria2。
+- 触发条件：脚本已放行来宾系统内的 iptables/ip6tables、firewalld 或 ufw，但云厂商
+  security group、网络 ACL 或上游防火墙仍拒绝对应端口/transport。
+- 影响：服务和本机监听健康，外部客户端仍无法连接；只为 Hysteria2 开放同号 TCP
+  不会放行其 UDP 流量。
+- 临时缓解：在云控制台按节点协议显式开放端口；Vision/XHTTP/AnyTLS 使用 TCP，
+  Hysteria2 使用 UDP，Shadowsocks 同时开放 TCP 与 UDP。
+
 ## 构建事务不确定时需人工恢复发布锁
 
 - 严重性：low
