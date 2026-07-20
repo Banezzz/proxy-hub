@@ -9,10 +9,12 @@ readonly MANIFEST_REL="lib/manifest.sha256"
 readonly BUILD_SCRIPT_REL="scripts/build-bundle.sh"
 readonly BUNDLE_REL="dist/proxy-hub.bundle.sh"
 readonly APPROVED_PATCH_REL="tests/fixtures/approved-safety.patch"
+readonly XRAY_RELEASE_PATCH_REL="tests/fixtures/xray-release-management.patch"
 readonly API_VERSION="1"
 readonly -a MODULES=(
     00_security_state.sh
     10_runtime_platform_ui.sh
+    15_xray_release.sh
     20_installers_restart.sh
     30_provision_network.sh
     40_config_share.sh
@@ -38,6 +40,7 @@ assert_file "$REPO_ROOT/$MANIFEST_REL"
 assert_file "$REPO_ROOT/$BUILD_SCRIPT_REL"
 assert_file "$REPO_ROOT/$BUNDLE_REL"
 assert_file "$REPO_ROOT/$APPROVED_PATCH_REL"
+assert_file "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL"
 
 bash -n "$REPO_ROOT/proxy-hub.sh"
 bash -n "$REPO_ROOT/$BUILD_SCRIPT_REL"
@@ -62,12 +65,12 @@ done
 pass "module line limits and complete lib top-level inventory are valid"
 
 mapfile -t manifest_lines <"$REPO_ROOT/$MANIFEST_REL"
-assert_eq "14" "${#manifest_lines[@]}" "manifest must have exactly 14 lines"
+assert_eq "15" "${#manifest_lines[@]}" "manifest must have exactly 15 lines"
 assert_eq "# proxy-hub-manifest-v1" "${manifest_lines[0]}" "manifest start marker"
 assert_eq "# api=$API_VERSION" "${manifest_lines[1]}" "manifest API"
 [[ "${manifest_lines[2]}" =~ ^#[[:space:]]build-id=([0-9a-f]{64})$ ]] || fail "invalid manifest build-id line"
 manifest_build_id="${BASH_REMATCH[1]}"
-assert_eq "# proxy-hub-manifest-end-v1" "${manifest_lines[13]}" "manifest end marker"
+assert_eq "# proxy-hub-manifest-end-v1" "${manifest_lines[14]}" "manifest end marker"
 
 manifest_stream="$TEST_DIR/.tmp"
 mkdir -p -- "$manifest_stream"
@@ -99,6 +102,7 @@ copy_build_inputs() {
     cp -- "$REPO_ROOT/proxy-hub.sh" "$destination/proxy-hub.sh"
     cp -- "$REPO_ROOT/$BUILD_SCRIPT_REL" "$destination/$BUILD_SCRIPT_REL"
     cp -- "$REPO_ROOT/$APPROVED_PATCH_REL" "$destination/$APPROVED_PATCH_REL"
+    cp -- "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL" "$destination/$XRAY_RELEASE_PATCH_REL"
     local module
     for module in "${MODULES[@]}"; do
         cp -- "$REPO_ROOT/lib/$module" "$destination/lib/$module"
@@ -503,12 +507,13 @@ git -C "$REPO_ROOT" show "$LEGACY_BASELINE_COMMIT:proxy-hub.sh" >"$baseline_dir/
 (
     cd -- "$baseline_dir"
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$APPROVED_PATCH_REL"
+    git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL"
 )
 
 full_bundle="$structure_tmp/full-bundle"
 head -n -6 -- "$bundle" >"$full_bundle"
 if ! cmp -s -- "$baseline_dir/proxy-hub.sh" "$full_bundle"; then
     diff -u -- "$baseline_dir/proxy-hub.sh" "$full_bundle" | sed -n '1,200p' >&2 || true
-    fail "bundle content differs from the pinned historical baseline plus approved safety patch"
+    fail "bundle content differs from the pinned baseline plus approved safety and Xray release patches"
 fi
-pass "complete bundle equals the pinned historical baseline plus the approved safety patch"
+pass "complete bundle equals the pinned baseline plus approved safety and Xray release patches"
