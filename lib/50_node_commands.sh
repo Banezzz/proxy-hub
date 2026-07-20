@@ -1,0 +1,877 @@
+cmd_install() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+
+    log_info "$(msg installing)"
+
+    # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
+    # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
+    # GeoIP/GeoSite 数据库不再默认下载，仅在启用 WARP 分流时才按需获取。
+    install_deps
+
+    # 交互式输入节点名称（或使用环境变量 name=xxx）
+    if [[ -n "${name:-}" ]]; then
+        CURRENT_NODE_NAME="$name"
+        # 如果名称已存在，添加后缀
+        local base_name="$CURRENT_NODE_NAME"
+        local counter=1
+        while node_exists "$CURRENT_NODE_NAME"; do
+            CURRENT_NODE_NAME="${base_name}_${counter}"
+            ((counter++))
+        done
+    else
+        CURRENT_NODE_NAME=$(prompt_node_name)
+    fi
+    log_info "Node name: $CURRENT_NODE_NAME"
+
+    # 选择协议类型（除非通过环境变量指定）
+    if [[ -n "${proto:-}" ]]; then
+        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality
+        case "$proto" in
+            xhttp) PROTOCOL_TYPE="xhttp" ;;
+            both) PROTOCOL_TYPE="both" ;;
+            shadowsocks|ss) PROTOCOL_TYPE="shadowsocks" ;;
+            anytls) PROTOCOL_TYPE="anytls" ;;
+            anytls-reality|anytls_reality|anytlsreality) PROTOCOL_TYPE="anytls_reality" ;;
+            *) PROTOCOL_TYPE="vision" ;;
+        esac
+        log_info "协议类型: $PROTOCOL_TYPE"
+    elif [[ -n "${xhttp:-}" ]]; then
+        # 向后兼容: xhttp=true 等同于 proto=both
+        if [[ "$xhttp" == "true" ]] || [[ "$xhttp" == "1" ]] || [[ "$xhttp" == "y" ]]; then
+            PROTOCOL_TYPE="both"
+            log_info "协议类型: both (Vision + XHTTP)"
+        fi
+    else
+        prompt_protocol_type
+    fi
+
+    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS 用 sing-box
+    # （sing-box 在下方 AnyTLS 分支中安装，便于复用安装失败的回滚处理）
+    case "$PROTOCOL_TYPE" in
+        anytls|anytls_reality)
+            : # sing-box 在 AnyTLS 分支中安装
+            ;;
+        *)
+            install_xray || { log_error "Xray 安装失败"; return 1; }
+            ;;
+    esac
+
+    # Shadowsocks 和 VLESS 的安装流程不同
+    if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
+        # Shadowsocks 安装流程
+        # 选择加密方式（或使用环境变量 ssmethod=xxx）
+        if [[ -n "${ssmethod:-}" ]]; then
+            SS_METHOD="$ssmethod"
+            log_info "加密方式: $SS_METHOD"
+        else
+            prompt_ss_method
+        fi
+
+        # 生成密码（或使用环境变量 sspwd=xxx）
+        if [[ -n "${sspwd:-}" ]]; then
+            SS_PASSWORD="$sspwd"
+            log_info "使用指定密码"
+        else
+            gen_ss_password
+        fi
+
+        # 选择端口
+        choose_ports
+
+        # SS 不需要 SNI, UUID, Reality Keys
+        SNI=""
+        UUID=""
+        PUBLIC_KEY=""
+        PRIVATE_KEY=""
+        SHORT_ID=""
+    elif [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        # AnyTLS 安装流程（基于 sing-box）
+        install_singbox || { log_error "sing-box 安装失败"; return 1; }
+
+        # SNI: REALITY 节点需要真实可达域名；plain 节点的 SNI 仅作伪装/证书 CN，
+        # 但同样支持「测速选择 + 自定义」，与 REALITY 逻辑一致。
+        if [[ -n "${reym:-}" ]]; then
+            SNI="$reym"
+            log_info "$(msg using_sni): $SNI"
+        else
+            rm -f "$CACHE_FILE" 2>/dev/null
+            [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
+            select_best_sni
+        fi
+
+        choose_ports
+
+        # 生成密码与随机化 padding scheme
+        gen_anytls_password
+        ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
+        log_info "已生成随机化 AnyTLS padding scheme"
+
+        if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+            gen_reality_keys
+        else
+            UUID=""
+            PUBLIC_KEY=""
+            PRIVATE_KEY=""
+            SHORT_ID=""
+        fi
+    else
+        # VLESS 安装流程
+        # 安装时清除 SNI 缓存，强制重新测试
+        rm -f "$CACHE_FILE" 2>/dev/null
+
+        if [[ -n "${reym:-}" ]]; then
+            SNI="$reym"
+            log_info "$(msg using_sni): $SNI"
+        else
+            select_best_sni
+        fi
+
+        gen_uuid
+        choose_ports
+        gen_reality_keys
+    fi
+
+    # 检测双栈 IP
+    detect_network_stack
+
+    save_env
+
+    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+        # AnyTLS 节点：由 sing-box 处理
+        # plain AnyTLS 需要自签名证书
+        if [[ "$PROTOCOL_TYPE" == "anytls" ]]; then
+            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+        fi
+
+        if ! singbox_sync; then
+            log_error "Failed to configure sing-box, rolling back..."
+            local node_file
+            node_file=$(get_node_file "$CURRENT_NODE_NAME")
+            rm -f "$node_file" 2>/dev/null
+            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+            singbox_sync  # 重新同步以反映回滚
+            return 1
+        fi
+    else
+        # 生成 Xray 配置文件，如果失败则回滚
+        if ! write_config; then
+            log_error "Failed to generate Xray config, rolling back..."
+            # 删除刚保存的节点配置
+            local node_file
+            node_file=$(get_node_file "$CURRENT_NODE_NAME")
+            rm -f "$node_file" 2>/dev/null
+            return 1
+        fi
+
+        service_enable xray
+        service_restart xray
+
+        # 验证服务启动成功
+        sleep 1
+        if ! service_is_active xray; then
+            log_warn "Xray service may not have started correctly. Run 'xray health' to check."
+        fi
+    fi
+
+    log_info "$(msg install_complete)"
+
+    show_info
+
+    # 显示主要链接的二维码
+    local link
+    link=$(get_share_link)
+    show_qrcode "$link"
+
+    # 询问是否启用定时重启 Xray（仅首次创建节点时提示，或通过环境变量 restart= 指定）
+    prompt_xray_restart_on_install
+
+    # SS2022 安装完成后自动提示时间同步
+    if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
+        prompt_timesync_for_ss2022
+    fi
+}
+
+cmd_info() {
+    select_node || return 1
+    show_info
+}
+
+cmd_qr() {
+    select_node || return 1
+
+    if ! command -v qrencode &>/dev/null; then
+        log_info "$(msg install_deps)"
+        $PKG_UPDATE >/dev/null 2>&1 || true
+        $PKG_INSTALL qrencode >/dev/null 2>&1
+    fi
+
+    local link
+    link=$(get_share_link)
+    show_qrcode "$link"
+}
+
+# 列出所有节点
+cmd_list() {
+    local nodes
+    read -ra nodes <<< "$(list_nodes)"
+
+    if [[ ${#nodes[@]} -eq 0 ]]; then
+        log_error "$(msg config_not_found)"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     All Nodes / 所有节点${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    local i=1
+    for node in "${nodes[@]}"; do
+        local node_file
+        node_file=$(get_node_file "$node")
+        # 使用安全的配置加载（防止命令注入）
+        safe_load_node_config "$node_file"
+        # 根据协议类型显示对应的端口
+        local display_port=""
+        local proto="${PROTOCOL_TYPE:-vision}"
+        if [[ "$proto" == "shadowsocks" ]]; then
+            display_port="${PORT:-N/A}"
+        elif [[ "$proto" == "xhttp" ]]; then
+            display_port="${XHTTP_PORT:-N/A}"
+        elif [[ "$proto" == "both" ]]; then
+            display_port="${PORT:-}/${XHTTP_PORT:-}"
+        else
+            display_port="${PORT:-N/A}"
+        fi
+        echo -e "  ${GREEN}$i.${NC} ${BLUE}$node${NC}"
+        if [[ "$proto" == "shadowsocks" ]]; then
+            echo -e "     Port: $display_port | Method: ${SS_METHOD:-N/A}"
+            echo -e "     Password: ${SS_PASSWORD:0:12}..."
+        elif [[ "$proto" == "anytls" || "$proto" == "anytls_reality" ]]; then
+            local at_label="AnyTLS"
+            [[ "$proto" == "anytls_reality" ]] && at_label="AnyTLS + REALITY"
+            echo -e "     Port: $display_port | Type: $at_label"
+            echo -e "     Password: ${ANYTLS_PASSWORD:0:12}..."
+            [[ "$proto" == "anytls_reality" ]] && echo -e "     SNI: $SNI"
+        else
+            echo -e "     Port: $display_port | SNI: $SNI"
+            echo -e "     UUID: ${UUID:0:8}..."
+            if [[ -n "$XHTTP_PORT" ]] && [[ "$proto" != "vision" ]]; then
+                echo -e "     XHTTP: $XHTTP_PORT"
+            fi
+        fi
+        echo ""
+        ((i++))
+    done
+
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+cmd_status() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     $(msg service_status)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    if service_is_active xray; then
+        echo -e "  Xray: ${GREEN}● Running${NC}"
+    else
+        echo -e "  Xray: ${RED}○ Stopped${NC}"
+    fi
+
+    # sing-box（AnyTLS）状态：仅在已安装时显示
+    if [[ -f "$SINGBOX_BIN" ]]; then
+        if service_is_active "$SINGBOX_SERVICE"; then
+            echo -e "  sing-box (AnyTLS): ${GREEN}● Running${NC}"
+        else
+            echo -e "  sing-box (AnyTLS): ${RED}○ Stopped${NC}"
+        fi
+    fi
+
+    local node_count
+    node_count=$(count_nodes)
+    echo -e "  Nodes: ${GREEN}${node_count}${NC}"
+
+    # 显示每个节点的连接数
+    if [[ $node_count -gt 0 ]]; then
+        echo ""
+        echo -e "  ${BLUE}Active connections:${NC}"
+        for node_file in "$NODES_DIR"/*.env; do
+            [[ -f "$node_file" ]] || continue
+            local n_name n_port
+            n_name=$(basename "$node_file" .env)
+            n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
+            local conn_count
+            conn_count=$(ss -tn state established "( sport = :${n_port} )" 2>/dev/null | tail -n +2 | wc -l)
+            echo -e "    $n_name (Port $n_port): ${GREEN}${conn_count}${NC}"
+        done
+    fi
+
+    echo ""
+    service_status xray
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+cmd_restart() {
+    service_restart xray
+    log_info "$(msg service_restarted)"
+}
+
+# 重新生成配置文件（用于修复配置问题）
+cmd_regenerate() {
+    log_info "Regenerating Xray config from node files..."
+
+    # 备份当前配置
+    if [[ -f "$XRAY_CONF" ]]; then
+        cp "$XRAY_CONF" "${XRAY_CONF}.bak"
+        log_info "Backed up current config to ${XRAY_CONF}.bak"
+    fi
+
+    # 重新生成配置
+    if write_config; then
+        log_info "Config regenerated successfully"
+        service_restart xray
+        sleep 1
+        if service_is_active xray; then
+            log_info "Xray service restarted successfully"
+        else
+            log_error "Xray service failed to start. Restoring backup..."
+            if [[ -f "${XRAY_CONF}.bak" ]]; then
+                mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+                service_restart xray
+            fi
+            return 1
+        fi
+    else
+        log_error "Failed to regenerate config"
+        if [[ -f "${XRAY_CONF}.bak" ]]; then
+            log_info "Restoring backup config..."
+            mv "${XRAY_CONF}.bak" "$XRAY_CONF"
+        fi
+        return 1
+    fi
+
+    # 同步 sing-box（AnyTLS）配置
+    if ! singbox_sync; then
+        log_warn "sing-box config sync failed"
+    fi
+
+    # 清理备份
+    rm -f "${XRAY_CONF}.bak" 2>/dev/null
+    return 0
+}
+
+# 删除单个节点
+cmd_remove() {
+    select_node || return 1
+
+    local node_file
+    node_file=$(get_node_file "$CURRENT_NODE_NAME")
+
+    {
+    echo ""
+    echo -e "${YELLOW}About to remove node: $CURRENT_NODE_NAME${NC}"
+    echo -n "Confirm? [y/N]: "
+    } >/dev/tty
+    read -r confirm </dev/tty
+
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    rm -f "$node_file"
+    # 清理可能存在的 AnyTLS 自签名证书
+    rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+    log_info "Node '$CURRENT_NODE_NAME' removed"
+
+    # 重新生成 xray 配置
+    write_config
+    service_restart xray
+
+    # 同步 sing-box（AnyTLS）配置：无 AnyTLS 节点时会自动停止服务
+    singbox_sync
+
+    log_info "Config updated"
+}
+
+# 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
+cmd_edit() {
+    select_node || return 1
+    local node_file
+    node_file=$(get_node_file "$CURRENT_NODE_NAME")
+    safe_load_node_config "$node_file"
+
+    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
+    ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
+    UUID=$(decrypt_value "$UUID")
+    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
+    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
+    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
+
+    local proto_type="${PROTOCOL_TYPE:-vision}"
+    local changed=false
+    local sni_changed=false
+
+    while true; do
+        {
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}        编辑节点 / Edit Node: ${CURRENT_NODE_NAME} [${proto_type}]${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        case "$proto_type" in
+            vision)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 Reality 密钥对"
+                ;;
+            xhttp)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / XHTTP Port      ${GRAY}(${XHTTP_PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 Reality 密钥对"
+                echo -e "  ${GREEN}5.${NC} 重新生成 XHTTP path        ${GRAY}(${XHTTP_PATH})${NC}"
+                ;;
+            both)
+                echo -e "  ${GREEN}1.${NC} 修改 Vision 端口           ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 XHTTP 端口            ${GRAY}(${XHTTP_PORT})${NC}"
+                echo -e "  ${GREEN}3.${NC} 修改 SNI / dest            ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}4.${NC} 重新生成 UUID              ${GRAY}(${UUID:0:8}...)${NC}"
+                echo -e "  ${GREEN}5.${NC} 重新生成 Reality 密钥对"
+                ;;
+            shadowsocks)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改加密方式 / Method      ${GRAY}(${SS_METHOD})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                ;;
+            anytls|anytls_reality)
+                echo -e "  ${GREEN}1.${NC} 修改端口 / Port            ${GRAY}(${PORT})${NC}"
+                echo -e "  ${GREEN}2.${NC} 修改 SNI                   ${GRAY}(${SNI})${NC}"
+                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 重新生成 padding scheme"
+                [[ "$proto_type" == "anytls_reality" ]] && echo -e "  ${GREEN}5.${NC} 重新生成 Reality 密钥对"
+                ;;
+            *)
+                log_error "未知协议类型: $proto_type"
+                return 1
+                ;;
+        esac
+        echo -e "  ${GREEN}0.${NC} 完成并应用 / Save & apply"
+        echo ""
+        echo -n "  选择要修改的项 / Select [0-5]: "
+        } >/dev/tty
+
+        local c
+        read -r c </dev/tty
+
+        case "${proto_type}:${c}" in
+            *:0) break ;;
+
+            # ---- 端口 ----
+            xhttp:1)
+                XHTTP_PORT=$(prompt_port "新 XHTTP 端口 / New port" "${XHTTP_PORT}")
+                changed=true ;;
+            both:1)
+                PORT=$(prompt_port "新 Vision 端口 / New port" "${PORT}" "${XHTTP_PORT:-0}")
+                changed=true ;;
+            both:2)
+                XHTTP_PORT=$(prompt_port "新 XHTTP 端口 / New port" "${XHTTP_PORT}" "${PORT:-0}")
+                changed=true ;;
+            vision:1|shadowsocks:1|anytls:1|anytls_reality:1)
+                PORT=$(prompt_port "新端口 / New port" "${PORT}")
+                changed=true ;;
+
+            # ---- SNI（测速 + 自定义）----
+            vision:2|xhttp:2|both:3|anytls:2|anytls_reality:2)
+                rm -f "$CACHE_FILE" 2>/dev/null
+                [[ "$proto_type" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
+                select_best_sni
+                sni_changed=true
+                changed=true ;;
+
+            # ---- UUID ----
+            vision:3|xhttp:3|both:4)
+                UUID=$(cat /proc/sys/kernel/random/uuid)
+                log_info "新 UUID: $UUID"
+                changed=true ;;
+
+            # ---- Reality 密钥对 ----
+            vision:4|xhttp:4|both:5|anytls_reality:5)
+                if gen_reality_keys; then
+                    log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
+                    changed=true
+                fi ;;
+
+            # ---- XHTTP path ----
+            xhttp:5)
+                XHTTP_PATH="/$(openssl rand -hex 4)"
+                log_info "新 path: $XHTTP_PATH"
+                changed=true ;;
+
+            # ---- Shadowsocks 加密方式（同时重新生成匹配长度的密码）----
+            shadowsocks:2)
+                prompt_ss_method
+                gen_ss_password
+                log_warn "加密方式已变更，密码已随之重新生成"
+                changed=true ;;
+
+            # ---- 密码（SS / AnyTLS）----
+            shadowsocks:3)
+                gen_ss_password
+                log_info "密码已重新生成"
+                changed=true ;;
+            anytls:3|anytls_reality:3)
+                gen_anytls_password
+                changed=true ;;
+
+            # ---- AnyTLS padding ----
+            anytls:4|anytls_reality:4)
+                ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
+                log_info "padding scheme 已重新随机生成"
+                changed=true ;;
+
+            *)
+                log_warn "无效选择 / invalid choice"
+                sleep 1 ;;
+        esac
+    done
+
+    if ! $changed; then
+        log_info "未做任何修改 / No changes"
+        return 0
+    fi
+
+    # 写回 .env（save_env 会按当前全局变量重写该节点配置）
+    save_env
+
+    # 重新生成对应内核配置并重启
+    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
+        # plain AnyTLS 改了 SNI：重新生成自签名证书（CN 跟随新 SNI）
+        if [[ "$proto_type" == "anytls" ]] && $sni_changed; then
+            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
+        fi
+        if ! singbox_sync; then
+            log_error "应用失败：sing-box 配置无效，请检查参数"
+            return 1
+        fi
+    else
+        if ! write_config; then
+            log_error "应用失败：Xray 配置无效，请检查参数"
+            return 1
+        fi
+        service_restart xray
+    fi
+
+    log_info "节点已更新 / Node updated"
+    show_info
+}
+
+cmd_uninstall() {
+    log_info "$(msg uninstalling)"
+    # 清理定时重启计划（service/timer 或 crontab 条目）
+    remove_xray_restart_schedule
+    service_stop xray
+    service_disable xray
+    rm -f "$XRAY_CONF" "$LANG_FILE"
+    rm -rf "$NODES_DIR"
+
+    # Alpine 使用手动安装，需要手动清理
+    if [[ "$PKG_MANAGER" == "apk" ]]; then
+        rm -f /usr/local/bin/xray
+        rm -rf /usr/local/etc/xray
+        rm -rf /usr/local/share/xray
+        rm -rf /var/log/xray
+        rm -f /etc/init.d/xray
+    else
+        # Security: Download script to temp file first, then execute
+        local tmp_installer="/tmp/xray-uninstall-$$.sh"
+        if secure_curl "https://github.com/XTLS/Xray-install/raw/main/install-release.sh" -o "$tmp_installer"; then
+            bash "$tmp_installer" remove >/dev/null 2>&1
+            rm -f "$tmp_installer"
+        fi
+    fi
+
+    # 卸载 sing-box（AnyTLS）
+    if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
+        service_stop "$SINGBOX_SERVICE"
+        service_disable "$SINGBOX_SERVICE"
+        rm -f "$SINGBOX_BIN"
+        rm -rf "$SINGBOX_DIR"
+        rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box
+        rm -f /var/log/sing-box.log
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    log_info "$(msg uninstall_complete)"
+}
+
+cmd_test_sni() {
+    local total=${#SNI_LIST[@]}
+    log_info "$(msg testing_sni) ($(msg total_domains): $total)"
+    echo ""
+
+    declare -A latency_map
+
+    # 使用并行测试（带详细输出）
+    test_domains_parallel_verbose latency_map
+
+    echo ""
+
+    # 显示排序结果（前10名）
+    if [[ ${#latency_map[@]} -gt 0 ]]; then
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     Top 10 $(msg best_latency)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+
+        # 排序并显示前10
+        for domain in "${!latency_map[@]}"; do
+            echo "${latency_map[$domain]} $domain"
+        done | sort -n | head -10 | while read -r lat dom; do
+            printf "  ${GREEN}%4dms${NC}  %s\n" "$lat" "$dom"
+        done
+
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    fi
+
+    log_info "$(msg test_complete)"
+}
+
+cmd_health() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     $(msg health_check)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    local all_ok=true
+
+    # 1. 检查 Xray 服务状态
+    if service_is_active xray; then
+        echo -e "  ${GREEN}✓${NC} Xray service is running"
+    else
+        echo -e "  ${RED}✗${NC} Xray service is not running"
+        all_ok=false
+    fi
+
+    # 1b. 检查 sing-box（AnyTLS）服务状态（仅当存在 AnyTLS 节点时校验）
+    if [[ "$(anytls_node_count)" -gt 0 ]]; then
+        if service_is_active "$SINGBOX_SERVICE"; then
+            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS)"
+        else
+            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS)"
+            all_ok=false
+        fi
+    fi
+
+    # 2. 检查节点数量
+    local node_count
+    node_count=$(count_nodes)
+    if [[ $node_count -gt 0 ]]; then
+        echo -e "  ${GREEN}✓${NC} $node_count node(s) configured"
+    else
+        echo -e "  ${RED}✗${NC} No nodes configured"
+        all_ok=false
+    fi
+
+    # 3. 检查每个节点的端口和 SNI
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        local n_name n_port n_sni n_xhttp_port n_protocol_type
+        n_name=$(basename "$node_file" .env)
+        n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
+        n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
+        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
+        n_protocol_type=$(grep "^PROTOCOL_TYPE=" "$node_file" | cut -d= -f2)
+
+        # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
+        if [[ -z "$n_protocol_type" ]]; then
+            if [[ -n "$n_port" ]] && [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="both"
+            elif [[ -n "$n_xhttp_port" ]]; then
+                n_protocol_type="xhttp"
+            else
+                n_protocol_type="vision"
+            fi
+        fi
+
+        echo ""
+        echo -e "  ${BLUE}Node: $n_name${NC} (${n_protocol_type})"
+
+        # 根据协议类型检查端口
+        if [[ "$n_protocol_type" == "vision" || "$n_protocol_type" == "both" ]] && [[ -n "$n_port" ]]; then
+            if ss -lnt | grep -qE ":${n_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} Vision port $n_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} Vision port $n_port is not listening"
+                all_ok=false
+            fi
+        fi
+
+        if [[ "$n_protocol_type" == "xhttp" || "$n_protocol_type" == "both" ]] && [[ -n "$n_xhttp_port" ]]; then
+            if ss -lnt | grep -qE ":${n_xhttp_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} XHTTP port $n_xhttp_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} XHTTP port $n_xhttp_port is not listening"
+                all_ok=false
+            fi
+        fi
+
+        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" ]] && [[ -n "$n_port" ]]; then
+            if ss -lnt | grep -qE ":${n_port}\s"; then
+                echo -e "    ${GREEN}✓${NC} AnyTLS port $n_port is listening"
+            else
+                echo -e "    ${RED}✗${NC} AnyTLS port $n_port is not listening"
+                all_ok=false
+            fi
+        fi
+
+        # 测试 SNI 连接
+        if timeout 3 openssl s_client -connect "${n_sni}:443" -servername "$n_sni" </dev/null &>/dev/null; then
+            echo -e "    ${GREEN}✓${NC} SNI ($n_sni) is reachable"
+        else
+            echo -e "    ${YELLOW}!${NC} SNI ($n_sni) connection timeout"
+        fi
+    done
+
+    echo ""
+    if $all_ok; then
+        echo -e "  ${GREEN}All checks passed! Nodes are healthy.${NC}"
+    else
+        echo -e "  ${RED}Some checks failed. Please review above.${NC}"
+    fi
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# ============== IP 变更检测与更新 ==============
+
+cmd_update_ip() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     $(msg update_ip)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # 检查是否有节点
+    local node_count
+    node_count=$(count_nodes)
+    if [[ $node_count -eq 0 ]]; then
+        log_error "$(msg update_ip_no_nodes)"
+        return 1
+    fi
+
+    # 检测当前公网 IP
+    log_info "$(msg update_ip_detecting)"
+    local current_ipv4 current_ipv6
+    current_ipv4=$(get_ipv4)
+    current_ipv6=$(get_ipv6)
+
+    if [[ -z "$current_ipv4" ]] && [[ -z "$current_ipv6" ]]; then
+        log_error "$(msg update_ip_detect_fail)"
+        return 1
+    fi
+
+    [[ -n "$current_ipv4" ]] && echo -e "  ${BLUE}$(msg update_ip_current) IPv4:${NC} $current_ipv4"
+    [[ -n "$current_ipv6" ]] && echo -e "  ${BLUE}$(msg update_ip_current) IPv6:${NC} $current_ipv6"
+    echo ""
+
+    # 逐节点对比并更新各自存储的 IP。
+    #
+    # 旧实现以"第一个节点"的存储 IP 作为全局基准来判断是否变更：当基准节点
+    # 恰好已经是新 IP（例如在换 IP 之后才新增的节点排在最前）时，会被误判为
+    # "无变化"而提前返回，导致换 IP 之前就存在的旧节点不会被同步，其分享链接
+    # 仍显示旧 IP。这里改为对每个节点用其自身存储的 IP 单独比较与更新。
+    log_info "$(msg update_ip_updating)"
+    local updated_count=0
+
+    for node_file in "$NODES_DIR"/*.env; do
+        [[ -f "$node_file" ]] || continue
+        local n_name n_v4 n_v6 n_changed detail
+        n_name=$(basename "$node_file" .env)
+        n_v4=$(safe_read_config_value "$node_file" "SERVER_IPV4")
+        # 向后兼容：没有 SERVER_IPV4 时回退到 SERVER_IP
+        [[ -z "$n_v4" ]] && n_v4=$(safe_read_config_value "$node_file" "SERVER_IP")
+        n_v6=$(safe_read_config_value "$node_file" "SERVER_IPV6")
+        n_changed=false
+        detail=""
+
+        # IPv4：仅当检测到当前 IPv4 且与该节点存储值不同时才更新
+        if [[ -n "$current_ipv4" ]] && [[ "$current_ipv4" != "$n_v4" ]]; then
+            if grep -q "^SERVER_IP=" "$node_file"; then
+                sed -i "s|^SERVER_IP=.*|SERVER_IP=${current_ipv4}|" "$node_file"
+            else
+                echo "SERVER_IP=${current_ipv4}" >> "$node_file"
+            fi
+            if grep -q "^SERVER_IPV4=" "$node_file"; then
+                sed -i "s|^SERVER_IPV4=.*|SERVER_IPV4=${current_ipv4}|" "$node_file"
+            else
+                echo "SERVER_IPV4=${current_ipv4}" >> "$node_file"
+            fi
+            detail+="\n    IPv4: ${RED}${n_v4:-N/A}${NC} → ${GREEN}${current_ipv4}${NC}"
+            n_changed=true
+        fi
+
+        # IPv6：同理
+        if [[ -n "$current_ipv6" ]] && [[ "$current_ipv6" != "$n_v6" ]]; then
+            if grep -q "^SERVER_IPV6=" "$node_file"; then
+                sed -i "s|^SERVER_IPV6=.*|SERVER_IPV6=${current_ipv6}|" "$node_file"
+            else
+                echo "SERVER_IPV6=${current_ipv6}" >> "$node_file"
+            fi
+            detail+="\n    IPv6: ${RED}${n_v6:-N/A}${NC} → ${GREEN}${current_ipv6}${NC}"
+            n_changed=true
+        fi
+
+        if $n_changed; then
+            echo -e "  ${GREEN}✓${NC} $(msg update_ip_node_updated): ${n_name}${detail}"
+            updated_count=$((updated_count + 1))
+        fi
+    done
+
+    # 所有节点的 IP 均已是最新，无需任何更新
+    if [[ $updated_count -eq 0 ]]; then
+        echo ""
+        echo -e "  ${GREEN}✓${NC} $(msg update_ip_no_change)"
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        return 0
+    fi
+
+    echo ""
+    log_info "$(msg update_ip_done) ($updated_count)"
+
+    # 更新全局变量
+    [[ -n "$current_ipv4" ]] && SERVER_IPV4="$current_ipv4"
+    [[ -n "$current_ipv6" ]] && SERVER_IPV6="$current_ipv6"
+    SERVER_IP="${current_ipv4:-$SERVER_IP}"
+
+    # 重新生成 Xray 配置（分享链接使用 .env 中的 IP，配置本身不含 IP，但为安全起见重新生成）
+    log_info "$(msg update_ip_regen)"
+    if write_config; then
+        log_info "$(msg update_ip_restarting)"
+        service_restart xray
+        sleep 1
+        if service_is_active xray; then
+            echo ""
+            echo -e "  ${GREEN}✓${NC} $(msg update_ip_complete)"
+        else
+            log_error "Xray service failed to start after IP update"
+        fi
+    else
+        log_error "Failed to regenerate config"
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
