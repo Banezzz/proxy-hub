@@ -1,9 +1,6 @@
 --- a/proxy-hub.sh
 +++ b/proxy-hub.sh
-@@ -1487,6 +1487,71 @@
-     fi
- }
- 
+@@ -1489,0 +1490,65 @@
 +# Strict variants are used by transactional lifecycle operations that must
 +# distinguish a real service-manager failure from an already-stopped service.
 +service_start_strict() {
@@ -69,13 +66,7 @@
 +    printf '%s\n' "$pid"
 +}
 +
- # 重启服务
- service_restart() {
-     local svc="$1"
-@@ -1732,6 +1797,17 @@
-             "xray_restart_action_set") echo "Enable / Modify schedule" ;;
-             "xray_restart_action_disable") echo "Disable periodic restart" ;;
-             "xray_restart_back") echo "Back" ;;
+@@ -1734,0 +1800,11 @@
 +            "xray_release_title") echo "Xray Version / Update" ;;
 +            "xray_release_show_status") echo "Show version status" ;;
 +            "xray_release_update_stable") echo "Update to latest stable" ;;
@@ -87,13 +78,7 @@
 +            "xray_release_version_prompt") echo "Xray version (for example v26.7.11)" ;;
 +            "xray_release_cancel") echo "Cancel" ;;
 +            "xray_release_back") echo "Back" ;;
-             *) echo "$key" ;;
-         esac
-     else
-@@ -1920,6 +1996,17 @@
-             "xray_restart_action_set") echo "启用 / 修改计划" ;;
-             "xray_restart_action_disable") echo "禁用定时重启" ;;
-             "xray_restart_back") echo "返回" ;;
+@@ -1922,0 +1999,11 @@
 +            "xray_release_title") echo "Xray 版本 / 更新" ;;
 +            "xray_release_show_status") echo "显示版本状态" ;;
 +            "xray_release_update_stable") echo "更新到最新稳定版" ;;
@@ -105,13 +90,7 @@
 +            "xray_release_version_prompt") echo "Xray 版本（例如 v26.7.11）" ;;
 +            "xray_release_cancel") echo "取消" ;;
 +            "xray_release_back") echo "返回" ;;
-             *) echo "$key" ;;
-         esac
-     fi
-@@ -2136,6 +2223,1561 @@
-     save_lang
- }
- 
+@@ -2138,0 +2226,1555 @@
 +# Resolve a temporary parent that cannot be renamed by an unrelated user:
 +# either a private directory owned by this process UID or a root-owned sticky
 +# directory such as /tmp.
@@ -1667,36 +1646,19 @@
 +    done
 +}
 +
- install_deps() {
-     log_info "$(msg install_deps)"
- 
-@@ -2143,18 +3785,18 @@
-     local required_packages
-     case "$PKG_MANAGER" in
-         apt)
+@@ -2146 +3788 @@
 -            required_packages=(curl unzip tar openssl ca-certificates iproute2 qrencode jq cron)
 +            required_packages=(curl unzip tar openssl ca-certificates iproute2 qrencode jq cron util-linux)
-             ;;
-         dnf|yum)
+@@ -2149 +3791 @@
 -            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq cronie)
 +            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq cronie util-linux)
-             ;;
-         apk)
-             # Alpine Linux 特殊包名
-             # libqrencode-tools 提供 qrencode 命令
+@@ -2154 +3796 @@
 -            required_packages=(curl unzip tar openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq)
 +            required_packages=(curl unzip tar openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq flock)
-             ;;
-         *)
+@@ -2157 +3799 @@
 -            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq)
 +            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq util-linux)
-             ;;
-     esac
- 
-@@ -2182,104 +3824,409 @@
-     fi
- }
- 
+@@ -2185,6 +3827,12 @@
 -install_xray() {
 -    # 检查 Xray 是否已安装
 -    if [[ -f "$XRAY_BIN" ]] && "$XRAY_BIN" version &>/dev/null; then
@@ -1715,12 +1677,12 @@
 +        [[ "$verify_comm" == xray ]] && printf '%s\n' "$pid"
 +    done
 +}
- 
+@@ -2192 +3840,3 @@
 -    log_info "$(msg install_xray)"
 +xray_process_exists() {
 +    [[ -n "$(xray_list_process_ids)" ]]
 +}
- 
+@@ -2194,8 +3844,11 @@
 -    # Alpine Linux 需要手动安装（官方脚本依赖 systemd）
 -    if [[ "$PKG_MANAGER" == "apk" ]]; then
 -        install_xray_alpine
@@ -1740,7 +1702,7 @@
 +    done < <(xray_list_process_ids)
 +    ((count == 1))
 +}
- 
+@@ -2203,5 +3856,7 @@
 -        if ! secure_curl "$installer_url" -o "$tmp_installer"; then
 -            log_error "Failed to download Xray installer"
 -            rm -f "$tmp_installer"
@@ -1753,7 +1715,7 @@
 +    actual_id=$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null) || return 1
 +    [[ "$actual_id" == "$expected_id" ]]
 +}
- 
+@@ -2209,8 +3864,6 @@
 -        # Execute downloaded script
 -        if ! bash "$tmp_installer" >/dev/null 2>&1; then
 -            log_error "Failed to install Xray. Please check your network connection."
@@ -1768,8 +1730,7 @@
 +    IFS=: read -r owner mode < <(stat -c '%u:%a' "$path" 2>/dev/null) || return 1
 +    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
 +    ((8#$mode == 8#$expected_mode))
- }
- 
+@@ -2219,5 +3872,6 @@
 -# Alpine Linux 专用 Xray 安装函数
 -install_xray_alpine() {
 -    local arch
@@ -1781,7 +1742,7 @@
 +    actual_digest=$(_xray_sha256_file "$path" 2>/dev/null) || return 1
 +    [[ "$actual_digest" == "$expected_digest" ]]
 +}
- 
+@@ -2225,16 +3879,20 @@
 -    # 映射架构名称
 -    case "$arch" in
 -        x86_64)
@@ -1818,7 +1779,7 @@
 +        return 1
 +    }
 +}
- 
+@@ -2242,5 +3900,16 @@
 -    # 获取最新版本号（使用安全的 API 解析）
 -    local latest_version
 -    latest_version=$(fetch_github_release_tag "XTLS/Xray-core")
@@ -1840,8 +1801,7 @@
 +    if [[ -e "$target" || -L "$target" ]]; then
 +        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
 +        log_error "No-clobber Xray staging did not move the canonical target"
-         return 1
-     fi
+@@ -2248,0 +3918,19 @@
 +    _xray_binary_metadata_matches "$preserved" "$expected_mode" || {
 +        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
 +        return 1
@@ -1861,7 +1821,7 @@
 +        return 1
 +    fi
 +}
- 
+@@ -2250 +3938,18 @@
 -    log_info "Installing Xray $latest_version for Alpine (${xray_arch})..."
 +xray_copy_verified_backup() {
 +    local source="$1" copy_stage="$2" backup="$3" expected_digest="$4" mode="$5"
@@ -1881,7 +1841,7 @@
 +    _xray_sync_path "$backup" || return 1
 +    _xray_sync_path "$(dirname "$backup")"
 +}
- 
+@@ -2252,4 +3957,18 @@
 -    # 下载 Xray（使用安全的 curl 封装）
 -    local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-linux-${xray_arch}.zip"
 -    local tmp_dir
@@ -1904,7 +1864,7 @@
 +        return 1
 +    }
 +}
- 
+@@ -2257,3 +3976,57 @@
 -    if ! secure_curl "$download_url" -o "${tmp_dir}/xray.zip"; then
 -        log_error "Failed to download Xray"
 -        rm -rf "$tmp_dir"
@@ -1965,10 +1925,9 @@
 +            return 1
 +        fi
 +    else
-         return 1
-     fi
+@@ -2261,0 +4035 @@
 +}
- 
+@@ -2263,7 +4037,86 @@
 -    # 解压安装
 -    unzip -q "${tmp_dir}/xray.zip" -d "${tmp_dir}"
 -    mkdir -p /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
@@ -2062,7 +2021,7 @@
 +        esac
 +    fi
 +}
- 
+@@ -2271 +4124,50 @@
 -    rm -rf "$tmp_dir"
 +xray_restore_transaction_binary() {
 +    local old_exists="$1" old_digest="$2" old_mode="$3" new_digest="$4" restore_stage="$5"
@@ -2114,7 +2073,7 @@
 +    log_error "No verified old Xray binary is available for recovery"
 +    return 1
 +}
- 
+@@ -2273,2 +4175,19 @@
 -    # 创建 OpenRC 服务脚本
 -    create_xray_openrc_service
 +install_xray() {
@@ -2136,7 +2095,7 @@
 +    ensure_xray_service_definition || return 1
 +    log_info "Xray installed successfully"
 +}
- 
+@@ -2276 +4195,23 @@
 -    log_info "Xray installed successfully on Alpine"
 +# Backward-compatible internal entry point.
 +install_xray_alpine() {
@@ -2161,10 +2120,7 @@
 +    mv -f -T -- "$source" "$target" || return 1
 +    _xray_sync_path "$target" || return 1
 +    _xray_sync_path "$(dirname "$target")"
- }
- 
- # 创建 Xray OpenRC 服务脚本
- create_xray_openrc_service() {
+@@ -2281 +4222,6 @@
 -    cat > /etc/init.d/xray <<'OPENRC_SERVICE'
 +    local target=/etc/init.d/xray tmp legacy
 +    _xray_prepare_managed_file_parent "$target" || return 1
@@ -2172,15 +2128,9 @@
 +    tmp=$(mktemp /etc/init.d/.xray.proxy-hub.XXXXXXXX) || return 1
 +    legacy="${tmp}.legacy"
 +    cat > "$tmp" <<'OPENRC_SERVICE'
- #!/sbin/openrc-run
+@@ -2282,0 +4229 @@
 +# proxy-hub-managed: xray-service-v1
- 
- name="xray"
- description="Xray - A platform for building proxies"
-@@ -2300,8 +4247,77 @@
-     checkpath --directory --owner root:root --mode 0755 /var/log/xray
- }
- OPENRC_SERVICE
+@@ -2302,0 +4250,64 @@
 +    grep -Fv '# proxy-hub-managed: xray-service-v1' "$tmp" > "$legacy" || {
 +        rm -f -- "$tmp" "$legacy"
 +        return 1
@@ -2245,7 +2195,7 @@
 +    }
 +    systemctl daemon-reload
 +}
- 
+@@ -2304 +4315,6 @@
 -    chmod 755 /etc/init.d/xray
 +ensure_xray_service_definition() {
 +    if [[ "$INIT_SYSTEM" == openrc ]]; then
@@ -2253,21 +2203,9 @@
 +    else
 +        create_xray_systemd_service
 +    fi
- }
- 
- # ============== sing-box 安装（AnyTLS / Hysteria2 支持） ==============
-@@ -2480,6 +4496,7 @@
- XRAY_RESTART_SYSTEMD_SERVICE="/etc/systemd/system/${XRAY_RESTART_NAME}.service"
- XRAY_RESTART_SYSTEMD_TIMER="/etc/systemd/system/${XRAY_RESTART_NAME}.timer"
- XRAY_RESTART_CRON_MARKER="# proxy-hub-xray-restart"
+@@ -2482,0 +4499 @@
 +XRAY_RESTART_HELPER="/usr/local/libexec/proxy-hub-xray-restart"
- 
- # 调度选择的全局返回值
- XRAY_RESTART_LABEL=""
-@@ -2526,9 +4543,75 @@
-     chmod 600 "$XRAY_RESTART_CONF"
- }
- 
+@@ -2528,0 +4546,64 @@
 +install_xray_restart_helper() {
 +    local target="$XRAY_RESTART_HELPER" tmp marker='# proxy-hub-managed: xray-restart-helper-v1'
 +    [[ "$target" == /usr/local/libexec/proxy-hub-xray-restart ]] || return 1
@@ -2332,34 +2270,15 @@
 +    }
 +}
 +
- # 通过 systemd timer + service 安装（Ubuntu/Debian/CentOS 等）
- install_xray_restart_systemd() {
-     local systemd_cal="$1"
+@@ -2531,0 +4613,2 @@
 +    [[ "$XRAY_LIFECYCLE_LOCK" == "$XRAY_PRODUCTION_LIFECYCLE_LOCK" ]] || return 1
 +    install_xray_restart_helper || return 1
- 
-     cat > "$XRAY_RESTART_SYSTEMD_SERVICE" <<EOF
- [Unit]
-@@ -2537,7 +4620,7 @@
- 
- [Service]
- Type=oneshot
+@@ -2540 +4623 @@
 -ExecStart=/bin/sh -c 'for u in xray sing-box; do systemctl try-restart "\$u".service 2>/dev/null; done; true'
 +ExecStart=$XRAY_RESTART_HELPER
- EOF
- 
-     cat > "$XRAY_RESTART_SYSTEMD_TIMER" <<EOF
-@@ -2563,21 +4646,15 @@
- # 通过 crontab 安装（Alpine/OpenRC，以及自定义 cron 表达式场景）
- install_xray_restart_cron() {
-     local cron_expr="$1"
+@@ -2565,0 +4649 @@
 +    [[ "$XRAY_LIFECYCLE_LOCK" == "$XRAY_PRODUCTION_LIFECYCLE_LOCK" ]] || return 1
- 
-     if ! command -v crontab &>/dev/null; then
-         log_warn "crontab not available; cannot schedule Xray restart"
-         return 1
-     fi
- 
+@@ -2572,9 +4656,2 @@
 -    # 重启所有在用的代理内核（Xray 和/或 sing-box），而不仅是 Xray
 -    local restart_cmd
 -    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -2371,99 +2290,45 @@
 -    local cron_line="$cron_expr $restart_cmd >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
 +    install_xray_restart_helper || return 1
 +    local cron_line="$cron_expr $XRAY_RESTART_HELPER >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
- 
-     if ! (crontab -l 2>/dev/null | grep -v "$XRAY_RESTART_CRON_MARKER"; echo "$cron_line") | crontab - 2>/dev/null; then
-         log_warn "Failed to write crontab for Xray restart"
-@@ -2620,6 +4697,10 @@
- setup_xray_restart_schedule() {
-     local label="$1" cron_expr="$2" systemd_cal="$3"
- 
+@@ -2622,0 +4700,4 @@
 +    # Publish the validated fixed-path lock helper before disturbing an existing
 +    # schedule, so helper creation failure leaves the current schedule intact.
 +    install_xray_restart_helper || return 1
 +
-     # 清理旧的
-     remove_xray_restart_systemd
-     remove_xray_restart_cron
-@@ -2687,7 +4768,8 @@
-             local custom_cron
-             read -r custom_cron
-             # 简单验证：5 个字段
+@@ -2690 +4771,2 @@
 -            if [[ -z "$custom_cron" ]] || [[ $(echo "$custom_cron" | awk '{print NF}') -ne 5 ]]; then
 +            if [[ -z "$custom_cron" || ! "$custom_cron" =~ ^[0-9*/?,[:space:]-]+$ ]] \
 +                || [[ $(awk '{print NF}' <<< "$custom_cron") -ne 5 ]]; then
-                 log_warn "$(msg xray_restart_cron_invalid)"
-                 XRAY_RESTART_LABEL="daily"
-                 XRAY_RESTART_CRON="0 4 * * *"
-@@ -8153,13 +10235,14 @@
-         echo -e "  ${GREEN}6.${NC} 端口管理 (Ports)"
-         echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
-         echo -e "  ${GREEN}8.${NC} $(msg xray_restart_title)"
+@@ -8155,0 +10238 @@
 +        echo -e "  ${GREEN}9.${NC} $(msg xray_release_title)"
-         echo ""
-         echo -e "  ${BLUE}[其他]${NC}"
+@@ -8158 +10241 @@
 -        echo -e "  ${GREEN}9.${NC} 安装独立工具命令"
 +        echo -e "  ${GREEN}10.${NC} 安装独立工具命令"
-         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-         echo -e "  ${RED}0.${NC} Back / 返回"
-         echo ""
+@@ -8162 +10245 @@
 -        echo -n "  $(msg menu_choice) [0-9]: "
 +        echo -n "  $(msg menu_choice) [0-10]: "
-         read -r choice
- 
-         case "$choice" in
-@@ -8171,7 +10254,8 @@
-             6) cmd_ports ;;
-             7) cmd_logs ;;
-             8) cmd_xray_restart ;;
+@@ -8174 +10257,2 @@
 -            9)
 +            9) cmd_xray_release_menu ;;
 +            10)
-                 install_standalone_tools
-                 echo ""
-                 read -rp "$(msg menu_press_enter)"
-@@ -8341,6 +10425,8 @@
-     echo "  fail2ban    Fail2ban management"
-     echo "  timesync    System time synchronization (NTP/Chrony)"
-     echo "  xray-restart  Schedule periodic Xray restart (systemd timer or cron)"
+@@ -8343,0 +10428,2 @@
 +    echo "  xray-version  Show installed/stable/prerelease Xray versions"
 +    echo "  xray-update   Safely update Xray with config test and rollback"
-     echo ""
-     echo "Other:"
-     echo "  menu        Show interactive menu"
-@@ -8379,6 +10465,12 @@
-     echo "  restart=weekly  Weekly restart (Sun 04:00)"
-     echo "  restart=no      Skip the restart schedule prompt"
-     echo ""
+@@ -8381,0 +10468,6 @@
 +    echo "Xray release management:"
 +    echo "  XRAY_CHANNEL=stable|prerelease  Select the release channel (default: stable)"
 +    echo "  XRAY_VERSION=v26.7.11           Install an explicit Xray version (highest priority)"
 +    echo "  xray_channel=stable|prerelease  Lowercase compatibility alias"
 +    echo "  xray_version=v26.7.11           Lowercase compatibility alias"
 +    echo ""
-     echo "Examples:"
-     echo "  bash $0                                    # Interactive menu"
-     echo "  bash $0 install                            # Add node (interactive)"
-@@ -8391,6 +10483,8 @@
-     echo "  bash $0 tools                              # System tools menu"
-     echo "  bash $0 ports                              # Port management"
-     echo "  bash $0 logs                               # Log viewer"
+@@ -8393,0 +10486,2 @@
 +    echo "  XRAY_CHANNEL=prerelease bash $0 xray-update  # Update including prereleases"
 +    echo "  XRAY_VERSION=v26.7.11 bash $0 xray-update    # Install a specified Xray version"
-     echo ""
- }
- 
-@@ -8510,6 +10604,13 @@
-         init_language_if_needed
-         cmd_xray_restart
-         ;;
+@@ -8511,0 +10606,7 @@
++        ;;
 +    xray-version)
 +        cmd_xray_version
 +        ;;
 +    xray-update)
 +        check_lock_for_write_ops
 +        cmd_xray_update
-+        ;;
-     ports)
-         check_lock_for_write_ops
-         init_language_if_needed
