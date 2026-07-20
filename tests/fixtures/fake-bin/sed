@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${FAKE_SED_READY_FILE:-}" && -n "${FAKE_SED_RELEASE_FILE:-}" ]]; then
+    : >"$FAKE_SED_READY_FILE"
+    while [[ ! -e "$FAKE_SED_RELEASE_FILE" ]]; do
+        sleep 0.02
+    done
+fi
+
+exec /usr/bin/sed "$@"

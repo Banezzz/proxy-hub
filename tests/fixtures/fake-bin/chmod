@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${!#}"
+match="${FAKE_CHMOD_FAIL_MATCH:-}"
+action="${FAKE_CHMOD_FAIL_ACTION:-}"
+
+if [[ -n "${FAKE_CHMOD_READY_FILE:-}" && -n "${FAKE_CHMOD_RELEASE_FILE:-}" && \
+      -n "${FAKE_CHMOD_PAUSE_MATCH:-}" && "$target" == *"${FAKE_CHMOD_PAUSE_MATCH}"* ]]; then
+    /usr/bin/chmod "$@"
+    : >"$FAKE_CHMOD_READY_FILE"
+    while [[ ! -e "$FAKE_CHMOD_RELEASE_FILE" ]]; do
+        sleep 0.02
+    done
+    exit 0
+fi
+
+if [[ -n "$match" && "$target" == *"$match"* ]]; then
+    case "$action" in
+        fail)
+            exit 96
+            ;;
+        replace)
+            /usr/bin/mv -- "$target" "${target}.original"
+            /usr/bin/mkdir -m 700 -- "$target"
+            printf 'replacement\n' >"$target/keep"
+            exit 96
+            ;;
+        replace-file-success)
+            /usr/bin/mv -- "$target" "${target}.original"
+            printf '%s\n' '# valid shell replacement injected after validation' >"$target"
+            /usr/bin/chmod 400 "$target"
+            exit 0
+            ;;
+        *)
+            printf 'unsupported FAKE_CHMOD_FAIL_ACTION: %s\n' "$action" >&2
+            exit 95
+            ;;
+    esac
+fi
+
+exec /usr/bin/chmod "$@"

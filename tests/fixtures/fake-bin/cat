@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Locate the platform cat without recursing through this fixture directory.
+system_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+real_cat=$(PATH="$system_path" command -v cat) || exit 127
+
+match="${FAKE_CAT_FAIL_MATCH:-}"
+if [[ -n "$match" ]]; then
+    matched=0
+    kept=()
+    for arg in "$@"; do
+        if [[ "$arg" == *"$match"* ]]; then
+            matched=1
+        else
+            kept+=("$arg")
+        fi
+    done
+    if ((matched == 1)); then
+        case "${FAKE_CAT_FAIL_ACTION:-partial-fail}" in
+            partial-fail)
+                # Model a utility that publishes a valid-looking prefix,
+                # then reports the underlying write failure.
+                printf '%s\n' '# partial write injected by fake cat'
+                exit 74
+                ;;
+            omit-success)
+                # Copy every nonmatching input but silently omit the selected
+                # one.  /dev/null prevents `cat --` from blocking when the
+                # selected input was the only input.
+                exec "$real_cat" "${kept[@]}" </dev/null
+                ;;
+            *)
+                printf 'unsupported FAKE_CAT_FAIL_ACTION: %s\n' \
+                    "${FAKE_CAT_FAIL_ACTION}" >&2
+                exit 73
+                ;;
+        esac
+    fi
+fi
+
+exec "$real_cat" "$@"

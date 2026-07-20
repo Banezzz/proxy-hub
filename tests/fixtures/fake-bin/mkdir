@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+/usr/bin/mkdir "$@"
+
+last_arg=""
+for last_arg in "$@"; do :; done
+if [[ "${FAKE_LOCK_SIGNAL_STAGE:-}" == "mkdir" && "$last_arg" == */write.lock.d ]]; then
+    target_pid=$(ps -o ppid= -p "$PPID" | tr -d '[:space:]')
+    kill -TERM "$target_pid"
+fi
