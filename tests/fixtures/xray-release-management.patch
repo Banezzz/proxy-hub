@@ -1,0 +1,2334 @@
+--- a/proxy-hub.sh
++++ b/proxy-hub.sh
+@@ -1489,0 +1490,65 @@
++# Strict variants are used by transactional lifecycle operations that must
++# distinguish a real service-manager failure from an already-stopped service.
++service_start_strict() {
++    local svc="$1"
++    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
++        rc-service "$svc" start
++    else
++        systemctl start "$svc"
++    fi
++}
++
++service_stop_strict() {
++    local svc="$1"
++    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
++        rc-service "$svc" stop
++    else
++        systemctl stop "$svc"
++    fi
++}
++
++openrc_service_pidfile() {
++    local svc="$1" script="${2:-/etc/init.d/$1}" line value="" count=0
++    [[ -f "$script" && ! -L "$script" ]] || return 1
++    while IFS= read -r line || [[ -n "$line" ]]; do
++        if [[ "$line" =~ ^[[:space:]]*pidfile=(.*)$ ]]; then
++            value="${BASH_REMATCH[1]}"
++            ((++count))
++        fi
++    done < "$script"
++    [[ "$count" == 1 ]] || return 1
++    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
++        value="${value:1:${#value}-2}"
++    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
++        value="${value:1:${#value}-2}"
++    fi
++    value="${value//'${RC_SVCNAME}'/$svc}"
++    value="${value//'$RC_SVCNAME'/$svc}"
++    [[ "$value" =~ ^/[A-Za-z0-9_./-]+$ && "$value" != *'..'* ]] || return 1
++    printf '%s\n' "$value"
++}
++
++service_main_pid() {
++    local svc="$1" pid pidfile
++    local -a pids=()
++    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
++        pidfile=$(openrc_service_pidfile "$svc" 2>/dev/null || true)
++        if [[ -n "$pidfile" && -f "$pidfile" && ! -L "$pidfile" ]]; then
++            IFS= read -r pid < "$pidfile" || return 1
++        else
++            if [[ "$svc" == xray ]] && declare -F xray_list_process_ids >/dev/null; then
++                mapfile -t pids < <(xray_list_process_ids)
++            else
++                mapfile -t pids < <(pgrep -x "$svc" 2>/dev/null || true)
++            fi
++            [[ ${#pids[@]} -eq 1 ]] || return 1
++            pid="${pids[0]}"
++        fi
++    else
++        pid=$(systemctl show --property MainPID --value "$svc" 2>/dev/null) || return 1
++    fi
++    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
++    kill -0 "$pid" 2>/dev/null || return 1
++    printf '%s\n' "$pid"
++}
++
+@@ -1734,0 +1800,11 @@
++            "xray_release_title") echo "Xray Version / Update" ;;
++            "xray_release_show_status") echo "Show version status" ;;
++            "xray_release_update_stable") echo "Update to latest stable" ;;
++            "xray_release_update_latest") echo "Update to latest release including prerelease" ;;
++            "xray_release_install_version") echo "Install specified version" ;;
++            "xray_release_latest_stable") echo "Latest stable" ;;
++            "xray_release_latest_all") echo "Latest release, including prerelease" ;;
++            "xray_release_specify") echo "Specify version" ;;
++            "xray_release_version_prompt") echo "Xray version (for example v26.7.11)" ;;
++            "xray_release_cancel") echo "Cancel" ;;
++            "xray_release_back") echo "Back" ;;
+@@ -1922,0 +1999,11 @@
++            "xray_release_title") echo "Xray 版本 / 更新" ;;
++            "xray_release_show_status") echo "显示版本状态" ;;
++            "xray_release_update_stable") echo "更新到最新稳定版" ;;
++            "xray_release_update_latest") echo "更新到最新版本（含预发布版）" ;;
++            "xray_release_install_version") echo "安装指定版本" ;;
++            "xray_release_latest_stable") echo "最新稳定版" ;;
++            "xray_release_latest_all") echo "最新版本（含预发布版）" ;;
++            "xray_release_specify") echo "指定版本" ;;
++            "xray_release_version_prompt") echo "Xray 版本（例如 v26.7.11）" ;;
++            "xray_release_cancel") echo "取消" ;;
++            "xray_release_back") echo "返回" ;;
+@@ -2138,0 +2226,1555 @@
++# Resolve a temporary parent that cannot be renamed by an unrelated user:
++# either a private directory owned by this process UID or a root-owned sticky
++# directory such as /tmp.
++secure_resolve_tmp_parent() {
++    local candidate="${1:-${TMPDIR:-/tmp}}" resolved current owner mode
++    [[ "$candidate" != *$'\n'* && "$candidate" != *$'\r'* &&
++       -d "$candidate" && ! -L "$candidate" && -w "$candidate" ]] || return 1
++    resolved=$(cd -P -- "$candidate" 2>/dev/null && pwd) || return 1
++    current="$resolved"
++    while :; do
++        [[ -d "$current" && ! -L "$current" ]] || return 1
++        owner=$(stat -c '%u' "$current" 2>/dev/null) || return 1
++        mode=$(stat -c '%a' "$current" 2>/dev/null) || return 1
++        [[ "$mode" =~ ^[0-7]+$ ]] || return 1
++        if [[ "$owner" == "$EUID" || "$owner" == 0 ]] && (((8#$mode & 022) == 0)); then
++            :
++        elif [[ "$owner" == 0 ]] && (((8#$mode & 01000) != 0)); then
++            :
++        else
++            return 1
++        fi
++        [[ "$current" == / ]] && break
++        current=$(dirname "$current") || return 1
++    done
++    SECURE_TMP_PARENT="$resolved"
++}
++
++identity_bound_tmp_create() {
++    local parent="$1" prefix="$2" path owner identity
++    [[ "$prefix" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
++    secure_resolve_tmp_parent "$parent" || return 1
++    parent="$SECURE_TMP_PARENT"
++    path=$(mktemp -d "${parent%/}/${prefix}XXXXXXXX") || return 1
++    [[ -d "$path" && ! -L "$path" ]] || { rmdir -- "$path" 2>/dev/null || true; return 1; }
++    owner=$(stat -c '%u' "$path" 2>/dev/null) || { rmdir -- "$path"; return 1; }
++    [[ "$owner" == "$EUID" ]] || { rmdir -- "$path"; return 1; }
++    chmod 0700 "$path" || { rmdir -- "$path"; return 1; }
++    identity=$(stat -c '%d:%i' "$path" 2>/dev/null) || { rmdir -- "$path"; return 1; }
++    IDENTITY_TMP_PATH="$path"
++    IDENTITY_TMP_ID="$identity"
++    IDENTITY_TMP_PARENT="$parent"
++}
++
++identity_bound_tmp_intact() {
++    local path="$1" expected_id="$2" parent="$3" prefix="$4" owner current_id
++    [[ "$path" == "${parent%/}/${prefix}"* && -d "$path" && ! -L "$path" ]] || return 1
++    owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
++    current_id=$(stat -c '%d:%i' "$path" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$current_id" == "$expected_id" ]]
++}
++
++identity_bound_tmp_cleanup() {
++    local path="$1" expected_id="$2" parent="$3" prefix="$4"
++    [[ -n "$path" ]] || return 0
++    identity_bound_tmp_intact "$path" "$expected_id" "$parent" "$prefix" || return 1
++    rm -rf -- "$path"
++}
++
++# ============== Xray release management ==============
++
++XRAY_REPO="XTLS/Xray-core"
++XRAY_RELEASE_API="https://api.github.com/repos/${XRAY_REPO}/releases"
++XRAY_BACKUP_KEEP="${XRAY_BACKUP_KEEP:-3}"
++XRAY_MAX_RELEASE_BYTES=$((128 * 1024 * 1024))
++XRAY_MAX_ARCHIVE_MEMBERS=256
++# Production paths ignore inherited values; isolated tests may reassign them after sourcing.
++XRAY_LIFECYCLE_LOCK="/run/proxy-hub-xray-lifecycle.lock"
++XRAY_UPDATE_STATE_FILE="/var/lib/proxy-hub/xray-update.state"
++XRAY_PRODUCTION_LIFECYCLE_LOCK="/run/proxy-hub-xray-lifecycle.lock"
++XRAY_PRODUCTION_UPDATE_STATE_FILE="/var/lib/proxy-hub/xray-update.state"
++XRAY_REQUEST_OVERRIDE_SET=0
++XRAY_REQUEST_VERSION_OVERRIDE=""
++XRAY_REQUEST_CHANNEL_OVERRIDE=""
++xray_requested_version() {
++    if ((XRAY_REQUEST_OVERRIDE_SET)); then
++        printf '%s\n' "$XRAY_REQUEST_VERSION_OVERRIDE"
++    elif [[ -n "${XRAY_VERSION:-}" ]]; then
++        printf '%s\n' "$XRAY_VERSION"
++    elif [[ -n "${xray_version:-}" ]]; then
++        printf '%s\n' "$xray_version"
++    fi
++}
++xray_requested_channel() {
++    if ((XRAY_REQUEST_OVERRIDE_SET)); then
++        printf '%s\n' "$XRAY_REQUEST_CHANNEL_OVERRIDE"
++    elif [[ -n "${XRAY_CHANNEL:-}" ]]; then
++        printf '%s\n' "$XRAY_CHANNEL"
++    elif [[ -n "${xray_channel:-}" ]]; then
++        printf '%s\n' "$xray_channel"
++    fi
++}
++normalize_xray_version() {
++    local raw="${1:-}"
++    [[ "$raw" =~ ^v?[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]] || return 1
++    [[ "$raw" == v* ]] || raw="v$raw"
++    printf '%s\n' "$raw"
++}
++_xray_parse_version() {
++    local normalized body
++    normalized=$(normalize_xray_version "${1:-}") || return 1
++    body="${normalized#v}"
++    XRAY_PARSED_SUFFIX=""
++    if [[ "$body" =~ ^([0-9]+(\.[0-9]+){1,3})([.-][A-Za-z0-9._-]+)?$ ]]; then
++        XRAY_PARSED_CORE="${BASH_REMATCH[1]}"
++        XRAY_PARSED_SUFFIX="${BASH_REMATCH[3]:-}"
++        return 0
++    fi
++    return 1
++}
++_xray_trim_numeric() {
++    local value="${1:-0}"
++    while [[ ${#value} -gt 1 && "$value" == 0* ]]; do
++        value="${value#0}"
++    done
++    printf '%s\n' "$value"
++}
++_xray_compare_numeric_string() {
++    local left right
++    left=$(_xray_trim_numeric "$1")
++    right=$(_xray_trim_numeric "$2")
++    if ((${#left} < ${#right})); then
++        printf '%s\n' -1
++    elif ((${#left} > ${#right})); then
++        printf '%s\n' 1
++    elif [[ "$left" == "$right" ]]; then
++        printf '%s\n' 0
++    elif [[ "$left" < "$right" ]]; then
++        printf '%s\n' -1
++    else
++        printf '%s\n' 1
++    fi
++}
++_xray_take_natural_run() {
++    local value="$1" run
++    if [[ "$value" =~ ^([0-9]+) ]]; then
++        run="${BASH_REMATCH[1]}"
++        XRAY_NATURAL_KIND="number"
++    elif [[ "$value" =~ ^([^0-9]+) ]]; then
++        run="${BASH_REMATCH[1]}"
++        XRAY_NATURAL_KIND="text"
++    else
++        return 1
++    fi
++    XRAY_NATURAL_RUN="$run"
++    XRAY_NATURAL_REST="${value:${#run}}"
++}
++_xray_compare_suffixes() {
++    local left="${1#[-.]}" right="${2#[-.]}" left_kind left_run cmp
++    while [[ -n "$left" || -n "$right" ]]; do
++        [[ -n "$left" ]] || { printf '%s\n' -1; return 0; }
++        [[ -n "$right" ]] || { printf '%s\n' 1; return 0; }
++        _xray_take_natural_run "$left" || return 1
++        left_kind="$XRAY_NATURAL_KIND"
++        left_run="$XRAY_NATURAL_RUN"
++        left="$XRAY_NATURAL_REST"
++        _xray_take_natural_run "$right" || return 1
++        if [[ "$left_kind" != "$XRAY_NATURAL_KIND" ]]; then
++            [[ "$left_kind" == "number" ]] && printf '%s\n' -1 || printf '%s\n' 1
++            return 0
++        fi
++        if [[ "$left_kind" == "number" ]]; then
++            cmp=$(_xray_compare_numeric_string "$left_run" "$XRAY_NATURAL_RUN") || return 1
++        elif [[ "$left_run" == "$XRAY_NATURAL_RUN" ]]; then
++            cmp=0
++        elif [[ "$left_run" < "$XRAY_NATURAL_RUN" ]]; then
++            cmp=-1
++        else
++            cmp=1
++        fi
++        [[ "$cmp" == 0 ]] || { printf '%s\n' "$cmp"; return 0; }
++        right="$XRAY_NATURAL_REST"
++    done
++    printf '%s\n' 0
++}
++xray_compare_versions() {
++    local left right left_core left_suffix right_core right_suffix cmp i sorted_first
++    local -a left_parts right_parts
++    left=$(normalize_xray_version "$1") || return 1
++    right=$(normalize_xray_version "$2") || return 1
++    _xray_parse_version "$left" || return 1
++    left_core="$XRAY_PARSED_CORE"
++    left_suffix="$XRAY_PARSED_SUFFIX"
++    _xray_parse_version "$right" || return 1
++    right_core="$XRAY_PARSED_CORE"
++    right_suffix="$XRAY_PARSED_SUFFIX"
++    if [[ -z "$left_suffix" && -z "$right_suffix" ]] && sort -V </dev/null >/dev/null 2>&1; then
++        if [[ "$left" == "$right" ]]; then
++            printf '%s\n' 0
++            return 0
++        fi
++        sorted_first=$(printf '%s\n%s\n' "$left" "$right" | LC_ALL=C sort -V | head -n 1) || return 1
++        [[ "$sorted_first" == "$left" ]] && printf '%s\n' -1 || printf '%s\n' 1
++        return 0
++    fi
++    IFS=. read -r -a left_parts <<< "$left_core"
++    IFS=. read -r -a right_parts <<< "$right_core"
++    for i in 0 1 2 3; do
++        cmp=$(_xray_compare_numeric_string "${left_parts[$i]:-0}" "${right_parts[$i]:-0}") || return 1
++        [[ "$cmp" == 0 ]] || { printf '%s\n' "$cmp"; return 0; }
++    done
++    if [[ -z "$left_suffix" && -z "$right_suffix" ]]; then
++        printf '%s\n' 0
++    elif [[ -z "$left_suffix" ]]; then
++        printf '%s\n' 1
++    elif [[ -z "$right_suffix" ]]; then
++        printf '%s\n' -1
++    else
++        _xray_compare_suffixes "$left_suffix" "$right_suffix"
++    fi
++}
++compare_xray_versions() {
++    xray_compare_versions "$@"
++}
++map_xray_arch() {
++    local arch="${1:-}"
++    [[ -n "$arch" ]] || arch=$(uname -m)
++    case "$arch" in
++        x86_64|amd64) printf '%s\n' 64 ;;
++        aarch64|arm64) printf '%s\n' arm64-v8a ;;
++        armv7l|armv7) printf '%s\n' arm32-v7a ;;
++        i386|i486|i586|i686|386) printf '%s\n' 32 ;;
++        armv5*|arm32-v5) printf '%s\n' arm32-v5 ;;
++        armv6*|arm32-v6) printf '%s\n' arm32-v6 ;;
++        riscv64|s390x|ppc64le) printf '%s\n' "$arch" ;;
++        *)
++            log_error "Unsupported Xray architecture: $arch"
++            return 1
++            ;;
++    esac
++}
++
++xray_github_api() {
++    local url="$1"
++    secure_curl --connect-timeout 10 --max-time 30 \
++        -H 'Accept: application/vnd.github+json' \
++        -H 'X-GitHub-Api-Version: 2022-11-28' "$url"
++}
++
++_xray_require_jq() {
++    command -v jq >/dev/null 2>&1 || {
++        log_error "jq is required to parse GitHub release metadata safely"
++        return 1
++    }
++}
++
++get_xray_stable_version() {
++    local response tag normalized
++    _xray_require_jq || return 1
++    if ! response=$(xray_github_api "$XRAY_RELEASE_API/latest" 2>/dev/null); then
++        log_error "GitHub API request for the latest stable Xray release failed (network or rate limit)"
++        return 1
++    fi
++    if ! jq -e 'type == "object" and .draft == false and .prerelease == false and
++        (.tag_name | type == "string") and (.published_at | type == "string")' \
++        >/dev/null 2>&1 <<< "$response"; then
++        log_error "GitHub returned incomplete stable Xray release metadata"
++        return 1
++    fi
++    tag=$(jq -r '.tag_name' <<< "$response") || return 1
++    normalized=$(normalize_xray_version "$tag") || {
++        log_error "GitHub returned an invalid stable Xray tag"
++        return 1
++    }
++    printf '%s\n' "$normalized"
++}
++
++get_xray_latest_version() {
++    local page response count published tag normalized best_date="" best_tag="" line
++    _xray_require_jq || return 1
++    for page in 1 2 3; do
++        if ! response=$(xray_github_api "$XRAY_RELEASE_API?per_page=100&page=$page" 2>/dev/null); then
++            log_error "GitHub API request for Xray releases page $page failed (network or rate limit)"
++            return 1
++        fi
++        jq -e 'type == "array"' >/dev/null 2>&1 <<< "$response" || {
++            log_error "GitHub returned malformed Xray release-list metadata"
++            return 1
++        }
++        count=$(jq 'length' <<< "$response") || return 1
++        while IFS=$'\t' read -r published tag; do
++            [[ -n "$published" && -n "$tag" ]] || continue
++            [[ "$published" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z$ ]] || continue
++            normalized=$(normalize_xray_version "$tag") || continue
++            if [[ -z "$best_date" || "$published" > "$best_date" || \
++                  ( "$published" == "$best_date" && "$normalized" > "$best_tag" ) ]]; then
++                best_date="$published"
++                best_tag="$normalized"
++            fi
++        done < <(jq -r '.[] | select(.draft == false and (.published_at | type == "string") and
++            (.tag_name | type == "string")) | [.published_at, .tag_name] | @tsv' <<< "$response")
++        ((count < 100)) && break
++        if ((page == 3)); then
++            log_error "Xray release pagination exceeded the safe lookup bound"
++            return 1
++        fi
++    done
++    [[ -n "$best_tag" ]] || {
++        log_error "No published non-draft Xray release was found"
++        return 1
++    }
++    printf '%s\n' "$best_tag"
++}
++
++resolve_xray_target_version() {
++    local requested channel
++    requested=$(xray_requested_version)
++    channel=$(xray_requested_channel)
++    if [[ -n "$requested" ]]; then
++        normalize_xray_version "$requested" || {
++            log_error "Invalid XRAY_VERSION: $requested"
++            return 1
++        }
++        return 0
++    fi
++    channel="${channel:-stable}"
++    case "$channel" in
++        stable) get_xray_stable_version ;;
++        prerelease) get_xray_latest_version ;;
++        *)
++            log_error "Invalid XRAY_CHANNEL: $channel (expected stable or prerelease)"
++            return 1
++            ;;
++    esac
++}
++
++_xray_run_bounded() {
++    local output_file output_size probe_parent rc=0
++    command -v timeout >/dev/null 2>&1 && command -v head >/dev/null 2>&1 || return 1
++    if [[ -n "${XRAY_TXN_TMP_DIR:-}" ]]; then
++        identity_bound_tmp_intact "$XRAY_TXN_TMP_DIR" "$XRAY_TXN_TMP_ID" \
++            "$XRAY_TXN_TMP_PARENT" proxy-hub-xray. || return 1
++        probe_parent="$XRAY_TXN_TMP_DIR"
++    else
++        secure_resolve_tmp_parent "${TMPDIR:-/tmp}" || return 1
++        probe_parent="$SECURE_TMP_PARENT"
++    fi
++    output_file=$(mktemp "${probe_parent%/}/proxy-hub-xray-probe.XXXXXX") || return 1
++    chmod 0600 "$output_file" || {
++        rm -f -- "$output_file"
++        return 1
++    }
++    # Limit the regular-file output as well as wall time so an untrusted
++    # candidate cannot consume unbounded memory or temporary storage.
++    (ulimit -f 130; timeout --signal=TERM --kill-after=2s 15s "$@") >"$output_file" 2>&1 || rc=$?
++    output_size=$(wc -c < "$output_file") || {
++        rm -f -- "$output_file"
++        return 1
++    }
++    if ((output_size > 65536)); then
++        rm -f -- "$output_file"
++        log_error "Xray probe exceeded the output limit"
++        return 1
++    fi
++    if ((rc == 124 || rc == 137)); then
++        rm -f -- "$output_file"
++        log_error "Xray probe timed out"
++        return 1
++    fi
++    output=$(head -c 65536 "$output_file")
++    rm -f -- "$output_file"
++    printf '%s\n' "$output"
++    return "$rc"
++}
++
++get_installed_xray_version() {
++    local binary="${1:-$XRAY_BIN}" output line token_pattern
++    [[ -x "$binary" && ! -d "$binary" ]] || return 1
++    if ! output=$(_xray_run_bounded "$binary" version); then
++        output=$(_xray_run_bounded "$binary" -version) || return 1
++    fi
++    token_pattern='v?[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?'
++    while IFS= read -r line || [[ -n "$line" ]]; do
++        line="${line%$'\r'}"
++        if [[ "$line" =~ [Xx]ray[[:space:]]+($token_pattern) ]]; then
++            normalize_xray_version "${BASH_REMATCH[1]}" && return 0
++        fi
++    done <<< "$output"
++    return 1
++}
++
++xray_update_decision() {
++    local current target source="${3:-channel}" cmp
++    current=$(normalize_xray_version "$1") || return 1
++    target=$(normalize_xray_version "$2") || return 1
++    cmp=$(xray_compare_versions "$current" "$target") || return 1
++    if [[ "$cmp" == 0 ]]; then
++        [[ "$source" == "version" ]] && printf '%s\n' reinstall || printf '%s\n' noop
++    elif [[ "$cmp" == -1 ]]; then
++        printf '%s\n' upgrade
++    elif [[ "$source" == "version" ]]; then
++        printf '%s\n' downgrade
++    else
++        printf '%s\n' refuse
++    fi
++}
++
++_xray_release_asset_metadata() {
++    local target="$1" arch="$2" response zip_name digest_name expected_zip expected_digest
++    local zip_count digest_count zip_url digest_url digest
++    target=$(normalize_xray_version "$target") || return 1
++    [[ "$arch" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
++    _xray_require_jq || return 1
++    if ! response=$(xray_github_api "$XRAY_RELEASE_API/tags/$target" 2>/dev/null); then
++        log_error "GitHub API request for Xray $target failed"
++        return 1
++    fi
++    jq -e --arg tag "$target" 'type == "object" and .draft == false and .tag_name == $tag and
++        (.assets | type == "array")' >/dev/null 2>&1 <<< "$response" || {
++        log_error "GitHub returned incomplete release metadata for Xray $target"
++        return 1
++    }
++    zip_name="Xray-linux-${arch}.zip"
++    digest_name="${zip_name}.dgst"
++    zip_count=$(jq --arg name "$zip_name" '[.assets[] | select(.name == $name)] | length' <<< "$response")
++    digest_count=$(jq --arg name "$digest_name" '[.assets[] | select(.name == $name)] | length' <<< "$response")
++    [[ "$zip_count" == 1 && "$digest_count" == 1 ]] || {
++        log_error "Xray $target does not expose one unambiguous archive and digest for $arch"
++        return 1
++    }
++    zip_url=$(jq -r --arg name "$zip_name" '.assets[] | select(.name == $name) | .browser_download_url' <<< "$response")
++    digest_url=$(jq -r --arg name "$digest_name" '.assets[] | select(.name == $name) | .browser_download_url' <<< "$response")
++    digest=$(jq -r --arg name "$zip_name" '.assets[] | select(.name == $name) | (.digest // "")' <<< "$response")
++    expected_zip="https://github.com/$XRAY_REPO/releases/download/$target/$zip_name"
++    expected_digest="${expected_zip}.dgst"
++    [[ "$zip_url" == "$expected_zip" && "$digest_url" == "$expected_digest" ]] || {
++        log_error "GitHub returned an unexpected Xray asset URL"
++        return 1
++    }
++    printf '%s\n%s\n%s\n' "$zip_url" "$digest_url" "$digest"
++}
++
++_xray_parse_digest_file() {
++    local file="$1" line digest="" count=0
++    while IFS= read -r line || [[ -n "$line" ]]; do
++        line="${line%$'\r'}"
++        if [[ "$line" =~ ^SHA2-256=[[:space:]]([0-9A-Fa-f]{64})$ ]]; then
++            digest="${BASH_REMATCH[1],,}"
++            ((++count))
++        fi
++    done < "$file"
++    [[ "$count" == 1 ]] || return 1
++    printf '%s\n' "$digest"
++}
++
++_xray_download_file() {
++    local url="$1" destination="$2" max_bytes="$3" expected_sha="${4:-}" size actual_sha
++    [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
++    if ! secure_curl --connect-timeout 10 --max-time 300 --speed-limit 1024 --speed-time 30 \
++        --max-filesize "$max_bytes" "$url" -o "$destination" 2>/dev/null; then
++        rm -f -- "$destination"
++        return 1
++    fi
++    size=$(stat -c '%s' "$destination" 2>/dev/null) || return 1
++    ((size > 0 && size <= max_bytes)) || return 1
++    if [[ -n "$expected_sha" ]]; then
++        actual_sha=$(_xray_sha256_file "$destination") || return 1
++        [[ "$actual_sha" == "$expected_sha" ]] || {
++            log_error "SHA256 mismatch for the downloaded Xray release asset"
++            return 1
++        }
++    fi
++}
++
++download_xray_release() {
++    local target="$1" arch="$2" tmp_dir="$3" expected_sha digest_value size member entry_size xray_count=0
++    local archive_listing archive_metadata member_count=0
++    local zip_file="$tmp_dir/xray.zip" digest_file="$tmp_dir/xray.zip.dgst" candidate="$tmp_dir/xray"
++    local -a metadata
++    identity_bound_tmp_intact "$tmp_dir" "$XRAY_TXN_TMP_ID" "$XRAY_TXN_TMP_PARENT" proxy-hub-xray. || return 1
++    mapfile -t metadata < <(_xray_release_asset_metadata "$target" "$arch") || return 1
++    [[ ${#metadata[@]} -eq 3 ]] || return 1
++    digest_value="${metadata[2]}"
++    if [[ "$digest_value" =~ ^sha256:([0-9A-Fa-f]{64})$ ]]; then
++        expected_sha="${BASH_REMATCH[1],,}"
++    else
++        if ! _xray_download_file "${metadata[1]}" "$digest_file" 4096; then
++            log_error "Failed to download the official Xray digest for $target"
++            return 1
++        fi
++        expected_sha=$(_xray_parse_digest_file "$digest_file") || {
++            log_error "The official Xray digest for $target is malformed"
++            return 1
++        }
++    fi
++    _xray_check_disk_space "$tmp_dir" "$XRAY_MAX_RELEASE_BYTES" || return 1
++    if ! _xray_download_file "${metadata[0]}" "$zip_file" "$XRAY_MAX_RELEASE_BYTES" "$expected_sha"; then
++        log_error "Xray archive download or SHA256 verification failed"
++        return 1
++    fi
++    size=$(stat -c '%s' "$zip_file" 2>/dev/null) || return 1
++    ((size > 0 && size <= XRAY_MAX_RELEASE_BYTES)) || {
++        log_error "Xray archive exceeds the safe size limit"
++        return 1
++    }
++    archive_listing=$(_xray_run_bounded unzip -Z1 "$zip_file") || {
++        log_error "Xray archive member listing failed or exceeded its safety bound"
++        return 1
++    }
++    while IFS= read -r member || [[ -n "$member" ]]; do
++        [[ -n "$member" ]] || continue
++        ((++member_count))
++        ((member_count <= XRAY_MAX_ARCHIVE_MEMBERS)) || {
++            log_error "Xray archive contains too many members"
++            return 1
++        }
++        [[ "$member" != /* && "$member" != *'\'* && "$member" != *$'\r'* &&
++           "$member" != ".." && "$member" != ../* && "$member" != */../* && "$member" != */.. ]] || {
++            log_error "Unsafe path in Xray release archive"
++            return 1
++        }
++        [[ "$member" == xray ]] && ((++xray_count))
++    done <<< "$archive_listing"
++    [[ "$xray_count" == 1 ]] || {
++        log_error "Xray archive must contain exactly one top-level xray binary"
++        return 1
++    }
++    archive_metadata=$(_xray_run_bounded unzip -Z -l "$zip_file" xray) || {
++        log_error "Xray archive metadata lookup failed or exceeded its safety bound"
++        return 1
++    }
++    entry_size=$(awk '$NF == "xray" {print $4}' <<< "$archive_metadata") || return 1
++    [[ "$entry_size" =~ ^[1-9][0-9]*$ ]] && ((entry_size <= XRAY_MAX_RELEASE_BYTES)) || {
++        log_error "Xray archive entry exceeds the safe uncompressed-size limit"
++        return 1
++    }
++    # The downloaded archive is still present, so check the remaining space for
++    # the separate extracted candidate plus the normal safety margin.
++    _xray_check_disk_space "$tmp_dir" "$entry_size" || return 1
++    timeout --signal=TERM --kill-after=2s 60s unzip -tq "$zip_file" xray >/dev/null 2>&1 || {
++        log_error "Xray archive integrity test failed"
++        return 1
++    }
++    (umask 077; ulimit -f 262144; timeout --signal=TERM --kill-after=2s 60s \
++        unzip -p "$zip_file" xray > "$candidate") || {
++        log_error "Failed to extract the Xray binary safely"
++        return 1
++    }
++    [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
++    size=$(stat -c '%s' "$candidate" 2>/dev/null) || return 1
++    ((size > 0 && size <= XRAY_MAX_RELEASE_BYTES)) || return 1
++    chmod 0755 "$candidate" || return 1
++    printf '%s\n' "$candidate"
++}
++
++_xray_sha256_file() {
++    local file="$1" output
++    if command -v sha256sum >/dev/null 2>&1; then
++        sha256sum "$file" | awk '{print $1}'
++    elif command -v shasum >/dev/null 2>&1; then
++        shasum -a 256 "$file" | awk '{print $1}'
++    elif command -v openssl >/dev/null 2>&1; then
++        output=$(openssl dgst -sha256 "$file") || return 1
++        printf '%s\n' "${output##*= }"
++    else
++        return 1
++    fi
++}
++
++validate_xray_binary() {
++    local binary="$1" target="$2" mode="${3:-update}" reported cmp modern_error legacy_error
++    [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] || {
++        log_error "The downloaded Xray binary is not a regular executable"
++        return 1
++    }
++    reported=$(get_installed_xray_version "$binary") || {
++        log_error "The downloaded Xray binary cannot report its version"
++        return 1
++    }
++    cmp=$(xray_compare_versions "$reported" "$target") || return 1
++    [[ "$cmp" == 0 ]] || {
++        log_error "Downloaded Xray version mismatch: expected $target, got $reported"
++        return 1
++    }
++
++    if [[ -f "$XRAY_CONF" ]]; then
++        if modern_error=$(_xray_run_bounded "$binary" run -test -config "$XRAY_CONF"); then
++            return 0
++        fi
++        if legacy_error=$(_xray_run_bounded "$binary" -test -config "$XRAY_CONF"); then
++            return 0
++        fi
++        log_error "New Xray rejected the existing config (modern: ${modern_error:-failed}; legacy: ${legacy_error:-failed})"
++        return 1
++    fi
++    if [[ "$mode" == "update" && -e "$XRAY_BIN" ]]; then
++        log_error "Refusing to update an existing Xray without config: $XRAY_CONF"
++        return 1
++    fi
++    log_warn "Xray config does not exist yet; binary config test skipped for fresh installation"
++}
++
++_xray_validate_backup_keep() {
++    local keep="${XRAY_BACKUP_KEEP:-}"
++    [[ "$keep" =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$keep <= 1000)) || {
++        log_error "XRAY_BACKUP_KEEP must be an integer between 1 and 1000"
++        return 1
++    }
++}
++
++_xray_release_capability_check() {
++    local command_name
++    for command_name in curl jq unzip stat install mv ln unlink cat df date chmod flock awk sed readlink sync sha256sum timeout head mktemp wc; do
++        command -v "$command_name" >/dev/null 2>&1 || {
++            log_error "Xray update requires command: $command_name"
++            return 1
++        }
++    done
++    _xray_sha256_file "${BASH_SOURCE[0]}" >/dev/null 2>&1 || {
++        log_error "Xray update requires a working SHA256 implementation"
++        return 1
++    }
++    _xray_validate_backup_keep
++}
++
++xray_runtime_healthy() {
++    local expected_binary="${1:-$XRAY_BIN}" attempt pid expected_id actual_id consecutive=0
++    expected_id=$(stat -Lc '%d:%i' "$expected_binary" 2>/dev/null) || return 1
++    for attempt in {1..12}; do
++        pid=""
++        actual_id=""
++        if service_is_active xray &&
++           pid=$(service_main_pid xray 2>/dev/null) &&
++        [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/exe" ]] &&
++           actual_id=$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null) &&
++           [[ "$actual_id" == "$expected_id" ]] &&
++           xray_runtime_has_only_service_pid "$pid"; then
++            ((++consecutive))
++            ((consecutive >= 3)) && return 0
++        else
++            consecutive=0
++        fi
++        sleep 1
++    done
++    if service_is_active xray; then
++        pid=$(service_main_pid xray 2>/dev/null || true)
++        [[ -n "$pid" ]] && xray_pid_uses_binary "$pid" "$expected_binary" &&
++            xray_runtime_has_only_service_pid "$pid" || \
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++    elif xray_process_exists; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++    fi
++    log_error "Xray service did not stay healthy on the activated binary"
++    return 1
++}
++
++_xray_stop_and_wait() {
++    local expected_binary="${1:-$XRAY_BIN}" expected_digest="${2:-}" attempt pid actual_digest
++    if service_is_active xray; then
++        pid=$(service_main_pid xray 2>/dev/null) || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Xray is active but its main process cannot be identified at the stop boundary"
++            return 1
++        }
++        xray_pid_uses_binary "$pid" "$expected_binary" || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Refusing to stop Xray because its process no longer matches the expected binary"
++            return 1
++        }
++        xray_runtime_has_only_service_pid "$pid" || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Refusing to stop Xray while another Xray process exists"
++            return 1
++        }
++        if [[ -n "$expected_digest" ]]; then
++            actual_digest=$(_xray_sha256_file "$expected_binary" 2>/dev/null) || {
++                XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++                return 1
++            }
++            [[ "$actual_digest" == "$expected_digest" ]] || {
++                XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++                log_error "Refusing to stop Xray because its binary changed during the update"
++                return 1
++            }
++        fi
++    elif xray_process_exists; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Refusing to stop an unmanaged or stale Xray process"
++        return 1
++    else
++        return 0
++    fi
++    service_stop_strict xray || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    for attempt in {1..20}; do
++        if ! service_is_active xray && ! xray_process_exists; then
++            return 0
++        fi
++        sleep 0.25
++    done
++    XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++    log_error "Xray did not stop cleanly"
++    return 1
++}
++
++_xray_start_and_verify() {
++    service_start_strict xray || {
++        ! service_is_active xray && ! xray_process_exists || XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    xray_runtime_healthy "$XRAY_BIN"
++}
++
++_xray_sync_path() {
++    local path="$1"
++    sync -f "$path" >/dev/null 2>&1
++}
++
++_xray_prepare_managed_file_parent() {
++    local file="$1" private_parent="${2:-0}" parent grandparent owner mode created=0
++    parent=$(dirname "$file") || return 1
++    if [[ ! -e "$parent" ]]; then
++        grandparent=$(dirname "$parent") || return 1
++        [[ -d "$grandparent" && ! -L "$grandparent" ]] || return 1
++        mkdir "$parent" || return 1
++        created=1
++    fi
++    [[ -d "$parent" && ! -L "$parent" ]] || return 1
++    owner=$(stat -c '%u' "$parent" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" ]] || return 1
++    [[ ( ! -e "$file" && ! -L "$file" ) || ( -f "$file" && ! -L "$file" ) ]] || return 1
++    if [[ -e "$file" || -L "$file" ]]; then
++        owner=$(stat -c '%u' "$file" 2>/dev/null) || return 1
++        [[ "$owner" == "$EUID" ]] || return 1
++    fi
++    if [[ "$private_parent" == 1 ]]; then
++        mode=$(stat -c '%a' "$parent" 2>/dev/null) || return 1
++        if [[ "$mode" != 700 ]]; then
++            chmod 0700 "$parent" || return 1
++            _xray_sync_path "$parent" || return 1
++        fi
++    fi
++    if ((created)); then
++        _xray_sync_path "$parent" || return 1
++        _xray_sync_path "$(dirname "$parent")" || return 1
++    fi
++}
++
++_xray_state_storage_trusted() {
++    local require_file="${1:-0}" state_dir owner mode links size ancestor
++    state_dir=$(dirname "$XRAY_UPDATE_STATE_FILE") || return 1
++    [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
++    owner=$(stat -c '%u' "$state_dir" 2>/dev/null) || return 1
++    mode=$(stat -c '%a' "$state_dir" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
++    (((8#$mode & 077) == 0)) || return 1
++    if [[ "$XRAY_UPDATE_STATE_FILE" == "$XRAY_PRODUCTION_UPDATE_STATE_FILE" ]]; then
++        for ancestor in /var /var/lib; do
++            [[ -d "$ancestor" && ! -L "$ancestor" ]] || return 1
++            owner=$(stat -c '%u' "$ancestor" 2>/dev/null) || return 1
++            mode=$(stat -c '%a' "$ancestor" 2>/dev/null) || return 1
++            [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
++            (((8#$mode & 022) == 0)) || return 1
++        done
++    fi
++    [[ "$require_file" == 1 ]] || return 0
++    [[ -f "$XRAY_UPDATE_STATE_FILE" && ! -L "$XRAY_UPDATE_STATE_FILE" ]] || return 1
++    IFS=: read -r owner mode links size < <(stat -c '%u:%a:%h:%s' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$mode" == 600 && "$links" == 1 &&
++       "$size" =~ ^[1-9][0-9]*$ && "$size" -le 16384 ]]
++}
++
++_xray_write_state() {
++    local phase="$1" state_dir payload_file payload_id checksum prior_id="" published_id owner mode links
++    state_dir=$(dirname "$XRAY_UPDATE_STATE_FILE")
++    _xray_prepare_managed_file_parent "$XRAY_UPDATE_STATE_FILE" 1 || return 1
++    if [[ -e "$XRAY_UPDATE_STATE_FILE" || -L "$XRAY_UPDATE_STATE_FILE" ]]; then
++        [[ -f "$XRAY_UPDATE_STATE_FILE" && ! -L "$XRAY_UPDATE_STATE_FILE" ]] || return 1
++        prior_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++        [[ -n "${XRAY_TXN_STATE_ID:-}" && "$prior_id" == "$XRAY_TXN_STATE_ID" ]] || return 1
++    else
++        [[ -z "${XRAY_TXN_STATE_ID:-}" ]] || return 1
++    fi
++    payload_file=$(mktemp "$state_dir/.xray-update-state.${XRAY_TXN_TOKEN}.payload.XXXXXXXX") || return 1
++    payload_id=$(stat -Lc '%d:%i' "$payload_file" 2>/dev/null) || return 1
++    IFS=: read -r owner mode links < <(stat -c '%u:%a:%h' "$payload_file" 2>/dev/null) || return 1
++    [[ -f "$payload_file" && ! -L "$payload_file" && "$owner" == "$EUID" &&
++       "$mode" == 600 && "$links" == 1 ]] || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    [[ "$XRAY_TXN_BACKUP" != *$'\n'* && "$XRAY_TXN_RESTORE_STAGE" != *$'\n'* &&
++       "$XRAY_TXN_SCHEDULE_LABEL" != *$'\n'* && "$XRAY_TXN_SCHEDULE_CRON" != *$'\n'* &&
++       "$XRAY_TXN_SCHEDULE_CALENDAR" != *$'\n'* ]] || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    (umask 077; {
++        printf 'format=proxy-hub-xray-update-v1\n'
++        printf 'phase=%s\n' "$phase"
++        printf 'token=%s\n' "$XRAY_TXN_TOKEN"
++        printf 'target=%s\n' "$XRAY_TXN_TARGET"
++        printf 'new_digest=%s\n' "$XRAY_TXN_NEW_DIGEST"
++        printf 'old_exists=%s\n' "$XRAY_TXN_OLD_EXISTS"
++        printf 'old_digest=%s\n' "$XRAY_TXN_OLD_DIGEST"
++        printf 'old_mode=%s\n' "$XRAY_TXN_OLD_MODE"
++        printf 'backup=%s\n' "$XRAY_TXN_BACKUP"
++        printf 'restore_stage=%s\n' "$XRAY_TXN_RESTORE_STAGE"
++        printf 'was_active=%s\n' "$XRAY_TXN_WAS_ACTIVE"
++        printf 'schedule_enabled=%s\n' "$XRAY_TXN_SCHEDULE_ENABLED"
++        printf 'schedule_label=%s\n' "$XRAY_TXN_SCHEDULE_LABEL"
++        printf 'schedule_cron=%s\n' "$XRAY_TXN_SCHEDULE_CRON"
++        printf 'schedule_calendar=%s\n' "$XRAY_TXN_SCHEDULE_CALENDAR"
++    } > "$payload_file") || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    checksum=$(_xray_sha256_file "$payload_file") || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    printf 'checksum=%s\n' "$checksum" >> "$payload_file" || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    chmod 0600 "$payload_file" || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    if [[ -n "$prior_id" ]]; then
++        [[ "$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null)" == "$prior_id" ]] || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++        mv -f -- "$payload_file" "$XRAY_UPDATE_STATE_FILE" || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    else
++        mv -n -T -- "$payload_file" "$XRAY_UPDATE_STATE_FILE" || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++        [[ ! -e "$payload_file" && ! -L "$payload_file" ]] || { _xray_discard_state_payload "$payload_file" "$payload_id" >/dev/null 2>&1 || true; return 1; }
++    fi
++    [[ -f "$XRAY_UPDATE_STATE_FILE" && ! -L "$XRAY_UPDATE_STATE_FILE" ]] || return 1
++    published_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    XRAY_TXN_STATE_ID="$published_id"
++    _xray_sync_path "$XRAY_UPDATE_STATE_FILE" || return 1
++    _xray_sync_path "$state_dir" || return 1
++    [[ "$phase" != prepared ]] || XRAY_TXN_PREPARED=1
++    XRAY_TXN_PHASE="$phase"
++}
++
++_xray_load_state() {
++    local key value expected_checksum actual_checksum payload loaded_id final_id
++    _xray_state_storage_trusted 1 || return 1
++    loaded_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    XRAY_STATE_FORMAT="" XRAY_STATE_PHASE="" XRAY_STATE_TOKEN="" XRAY_STATE_TARGET=""
++    XRAY_STATE_NEW_DIGEST=""
++    XRAY_STATE_OLD_EXISTS="" XRAY_STATE_OLD_DIGEST="" XRAY_STATE_OLD_MODE=""
++    XRAY_STATE_BACKUP="" XRAY_STATE_RESTORE_STAGE="" XRAY_STATE_WAS_ACTIVE=""
++    XRAY_STATE_SCHEDULE_ENABLED="" XRAY_STATE_SCHEDULE_LABEL=""
++    XRAY_STATE_SCHEDULE_CRON="" XRAY_STATE_SCHEDULE_CALENDAR=""
++    expected_checksum=""
++    while IFS='=' read -r key value || [[ -n "$key" ]]; do
++        case "$key" in
++            format) XRAY_STATE_FORMAT="$value" ;;
++            phase) XRAY_STATE_PHASE="$value" ;;
++            token) XRAY_STATE_TOKEN="$value" ;;
++            target) XRAY_STATE_TARGET="$value" ;;
++            new_digest) XRAY_STATE_NEW_DIGEST="$value" ;;
++            old_exists) XRAY_STATE_OLD_EXISTS="$value" ;;
++            old_digest) XRAY_STATE_OLD_DIGEST="$value" ;;
++            old_mode) XRAY_STATE_OLD_MODE="$value" ;;
++            backup) XRAY_STATE_BACKUP="$value" ;;
++            restore_stage) XRAY_STATE_RESTORE_STAGE="$value" ;;
++            was_active) XRAY_STATE_WAS_ACTIVE="$value" ;;
++            schedule_enabled) XRAY_STATE_SCHEDULE_ENABLED="$value" ;;
++            schedule_label) XRAY_STATE_SCHEDULE_LABEL="$value" ;;
++            schedule_cron) XRAY_STATE_SCHEDULE_CRON="$value" ;;
++            schedule_calendar) XRAY_STATE_SCHEDULE_CALENDAR="$value" ;;
++            checksum) expected_checksum="$value" ;;
++            *) return 1 ;;
++        esac
++    done < "$XRAY_UPDATE_STATE_FILE"
++    [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
++    payload=$(sed '$d' "$XRAY_UPDATE_STATE_FILE") || return 1
++    actual_checksum=$(_xray_sha256_file <(printf '%s\n' "$payload")) || return 1
++    [[ "$actual_checksum" == "$expected_checksum" ]] || return 1
++    [[ "$XRAY_STATE_FORMAT" == proxy-hub-xray-update-v1 &&
++       "$XRAY_STATE_TOKEN" =~ ^[A-Za-z0-9._-]+$ &&
++       "$XRAY_STATE_NEW_DIGEST" =~ ^[0-9a-f]{64}$ &&
++       "$XRAY_STATE_OLD_EXISTS" =~ ^[01]$ && "$XRAY_STATE_WAS_ACTIVE" =~ ^[01]$ &&
++       "$XRAY_STATE_SCHEDULE_ENABLED" =~ ^[01]$ &&
++       "$XRAY_STATE_OLD_MODE" =~ ^[0-7]{3,4}$ ]] || return 1
++    [[ "$(normalize_xray_version "$XRAY_STATE_TARGET" 2>/dev/null || true)" == "$XRAY_STATE_TARGET" ]] || return 1
++    if [[ "$XRAY_STATE_OLD_EXISTS" == 1 ]]; then
++        [[ "$XRAY_STATE_OLD_DIGEST" =~ ^[0-9a-f]{64}$ ]] || return 1
++    else
++        [[ -z "$XRAY_STATE_OLD_DIGEST" ]] || return 1
++    fi
++    if [[ "$XRAY_STATE_SCHEDULE_ENABLED" == 1 ]]; then
++        [[ "$XRAY_STATE_SCHEDULE_LABEL" =~ ^[A-Za-z0-9_-]+$ &&
++           "$XRAY_STATE_SCHEDULE_CRON" =~ ^[0-9*/?,[:space:]-]+$ &&
++           "$XRAY_STATE_SCHEDULE_CALENDAR" =~ ^[A-Za-z0-9*/?,:.*[:space:]-]*$ &&
++           "$(awk '{print NF}' <<< "$XRAY_STATE_SCHEDULE_CRON")" == 5 ]] || return 1
++    else
++        [[ -z "$XRAY_STATE_SCHEDULE_LABEL" && -z "$XRAY_STATE_SCHEDULE_CRON" &&
++           -z "$XRAY_STATE_SCHEDULE_CALENDAR" ]] || return 1
++    fi
++    case "$XRAY_STATE_PHASE" in
++        prepared|schedule-paused|stopped|displaced|activated|committed|rolled-back) ;;
++        *) return 1 ;;
++    esac
++    final_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    [[ "$final_id" == "$loaded_id" ]] || return 1
++    XRAY_STATE_FILE_ID="$loaded_id"
++}
++
++_xray_read_restart_config_value() {
++    local file="$1" wanted="$2" line key value found=0
++    [[ -f "$file" && ! -L "$file" ]] || return 1
++    while IFS= read -r line || [[ -n "$line" ]]; do
++        [[ "$line" == *=* ]] || continue
++        key="${line%%=*}"
++        [[ "$key" == "$wanted" ]] || continue
++        value="${line#*=}"
++        ((++found))
++    done < "$file"
++    [[ "$found" == 1 ]] || return 1
++    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
++        value="${value:1:${#value}-2}"
++    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
++        value="${value:1:${#value}-2}"
++    fi
++    [[ "$value" != *$'\r'* && "$value" != *$'\n'* ]] || return 1
++    printf '%s\n' "$value"
++}
++
++_xray_capture_restart_schedule() {
++    local restart_conf="${XRAY_RESTART_CONF:-/etc/proxy-hub/xray-restart.conf}" enabled fields
++    XRAY_TXN_SCHEDULE_ENABLED=0
++    XRAY_TXN_SCHEDULE_LABEL=""
++    XRAY_TXN_SCHEDULE_CRON=""
++    XRAY_TXN_SCHEDULE_CALENDAR=""
++    [[ -f "$restart_conf" ]] || return 0
++    enabled=$(_xray_read_restart_config_value "$restart_conf" RESTART_ENABLED) || return 1
++    [[ "$enabled" == yes ]] || return 0
++    XRAY_TXN_SCHEDULE_LABEL=$(_xray_read_restart_config_value "$restart_conf" RESTART_LABEL) || return 1
++    XRAY_TXN_SCHEDULE_CRON=$(_xray_read_restart_config_value "$restart_conf" RESTART_CRON) || return 1
++    XRAY_TXN_SCHEDULE_CALENDAR=$(_xray_read_restart_config_value "$restart_conf" RESTART_SYSTEMD_CALENDAR) || return 1
++    [[ "$XRAY_TXN_SCHEDULE_LABEL" =~ ^[A-Za-z0-9_-]+$ &&
++       "$XRAY_TXN_SCHEDULE_CRON" =~ ^[0-9*/?,[:space:]-]+$ &&
++       "$XRAY_TXN_SCHEDULE_CALENDAR" =~ ^[A-Za-z0-9*/?,:.*[:space:]-]*$ ]] || {
++        log_error "Xray restart schedule contains unsupported characters"
++        return 1
++    }
++    fields=$(awk '{print NF}' <<< "$XRAY_TXN_SCHEDULE_CRON") || return 1
++    [[ "$fields" == 5 ]] || return 1
++    XRAY_TXN_SCHEDULE_ENABLED=1
++}
++
++_xray_pause_restart_schedule() {
++    [[ "$XRAY_TXN_SCHEDULE_ENABLED" == 1 ]] || return 0
++    remove_xray_restart_schedule
++}
++
++_xray_restore_restart_schedule_values() {
++    local enabled="$1" label="$2" cron="$3" calendar="$4"
++    [[ "$enabled" == 1 ]] || return 0
++    setup_xray_restart_schedule "$label" "$cron" "$calendar"
++}
++
++_xray_cleanup_managed_stages() {
++    local bin_dir="$1" token="$2" restore_stage="$3" new_stage displaced failed backup_copy stage owner
++    local -a stages
++    [[ "$token" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
++    [[ "$restore_stage" == "$bin_dir/.xray.restore.$token" ]] || return 1
++    new_stage="$bin_dir/.xray.new.$token"
++    displaced="$bin_dir/.xray.displaced.$token"
++    failed="$bin_dir/.xray.failed.$token"
++    backup_copy="$bin_dir/.xray.backup-copy.$token"
++    stages=("$new_stage" "$restore_stage" "$displaced" "$failed" "$backup_copy")
++    for stage in "${stages[@]}"; do
++        [[ ! -e "$stage" && ! -L "$stage" ]] && continue
++        if [[ ! -f "$stage" || -L "$stage" ]]; then
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Refusing to remove an unclassifiable Xray transaction stage: $stage"
++            return 1
++        fi
++        owner=$(stat -c '%u' "$stage" 2>/dev/null) || return 1
++        [[ "$owner" == "$EUID" ]] || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            return 1
++        }
++    done
++    for stage in "${stages[@]}"; do
++        [[ ! -e "$stage" && ! -L "$stage" ]] || unlink "$stage" || return 1
++    done
++    _xray_sync_path "$bin_dir"
++}
++
++recover_pending_xray_update() {
++    local bin_dir backup_base restore_id backup_id recovery_ok=1
++    XRAY_RECOVERY_EXTERNAL_CONFLICT=0
++    [[ -e "$XRAY_UPDATE_STATE_FILE" || -L "$XRAY_UPDATE_STATE_FILE" ]] || return 0
++    if ! _xray_load_state; then
++        log_error "Xray update recovery state is malformed: $XRAY_UPDATE_STATE_FILE"
++        return 1
++    fi
++    bin_dir=$(dirname "$XRAY_BIN")
++    backup_base=$(basename "$XRAY_STATE_BACKUP")
++    [[ "$XRAY_STATE_BACKUP" == "$bin_dir/$backup_base" &&
++       "$backup_base" =~ ^xray\.bak-v[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?-[0-9]{8}-[0-9]{6}$ &&
++       "$XRAY_STATE_RESTORE_STAGE" == "$bin_dir/.xray.restore.$XRAY_STATE_TOKEN" ]] || {
++        log_error "Xray recovery paths are outside the managed namespace"
++        return 1
++    }
++    _xray_validate_backup_keep || return 1
++    case "$XRAY_STATE_PHASE" in
++        committed|rolled-back)
++            if ! xray_finalize_transaction_evidence "$XRAY_STATE_PHASE" \
++                "$XRAY_STATE_OLD_EXISTS" "$XRAY_STATE_OLD_DIGEST" "$XRAY_STATE_OLD_MODE" \
++                "$XRAY_STATE_NEW_DIGEST" "$XRAY_STATE_WAS_ACTIVE" "$bin_dir" \
++                "$XRAY_STATE_TOKEN" "$XRAY_STATE_RESTORE_STAGE" "$XRAY_STATE_FILE_ID"; then
++                log_error "Terminal Xray recovery evidence was preserved at '$XRAY_UPDATE_STATE_FILE'."
++                log_error "Do not overwrite or remove '$XRAY_BIN' until its owner and purpose are identified."
++                if [[ "$XRAY_STATE_OLD_EXISTS" == 1 && -f "$XRAY_STATE_BACKUP" && ! -L "$XRAY_STATE_BACKUP" ]]; then
++                    log_error "After preserving the target elsewhere, verify SHA-256 '$XRAY_STATE_OLD_DIGEST' and restore from '$XRAY_STATE_BACKUP'."
++                fi
++                return 1
++            fi
++            _xray_prune_backups || log_warn "Could not prune managed Xray backups after recovery"
++            return 0
++            ;;
++    esac
++    log_warn "Recovering an interrupted Xray update (${XRAY_STATE_PHASE})"
++    xray_restore_transaction_binary "$XRAY_STATE_OLD_EXISTS" "$XRAY_STATE_OLD_DIGEST" \
++        "$XRAY_STATE_OLD_MODE" "$XRAY_STATE_NEW_DIGEST" "$XRAY_STATE_RESTORE_STAGE" "$XRAY_STATE_BACKUP" \
++        "$XRAY_STATE_WAS_ACTIVE" "$XRAY_STATE_TOKEN" || recovery_ok=0
++    if ((recovery_ok)) && [[ "$XRAY_STATE_WAS_ACTIVE" == 1 ]]; then
++        service_start_strict xray || recovery_ok=0
++        ((recovery_ok)) && xray_runtime_healthy "$XRAY_BIN" || recovery_ok=0
++    fi
++    if ((recovery_ok)); then
++        _xray_restore_restart_schedule_values \
++            "$XRAY_STATE_SCHEDULE_ENABLED" "$XRAY_STATE_SCHEDULE_LABEL" \
++            "$XRAY_STATE_SCHEDULE_CRON" "$XRAY_STATE_SCHEDULE_CALENDAR" || recovery_ok=0
++    fi
++    if ((recovery_ok)); then
++        xray_adopt_loaded_transaction_state
++        _xray_write_state rolled-back || recovery_ok=0
++        ((recovery_ok)) && xray_finalize_transaction_evidence rolled-back \
++            "$XRAY_TXN_OLD_EXISTS" "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" \
++            "$XRAY_TXN_NEW_DIGEST" "$XRAY_TXN_WAS_ACTIVE" "$bin_dir" \
++            "$XRAY_TXN_TOKEN" "$XRAY_TXN_RESTORE_STAGE" "$XRAY_TXN_STATE_ID" || recovery_ok=0
++    fi
++    if ((recovery_ok)); then
++        _xray_prune_backups || log_warn "Could not prune managed Xray backups after recovery"
++        log_info "Interrupted Xray update recovered successfully"
++        return 0
++    fi
++    restore_id=$(stat -Lc '%d:%i' "$XRAY_STATE_RESTORE_STAGE" 2>/dev/null || true)
++    backup_id=$(stat -Lc '%d:%i' "$XRAY_STATE_BACKUP" 2>/dev/null || true)
++    log_error "AUTOMATIC XRAY ROLLBACK FAILED (restore=$restore_id backup=$backup_id)"
++    if [[ "$XRAY_RECOVERY_EXTERNAL_CONFLICT" == 1 ]]; then
++        log_error "An external Xray target or runtime state was preserved at '$XRAY_BIN'; do not overwrite or remove it until its owner and purpose are identified."
++        if [[ "$XRAY_STATE_OLD_EXISTS" == 1 && -f "$XRAY_STATE_BACKUP" && ! -L "$XRAY_STATE_BACKUP" ]]; then
++            log_error "After preserving the external target elsewhere, verify SHA-256 '$XRAY_STATE_OLD_DIGEST', then restore with: install -m ${XRAY_STATE_OLD_MODE:-0755} '$XRAY_STATE_BACKUP' '$XRAY_BIN'"
++        else
++            log_error "Inspect '$XRAY_UPDATE_STATE_FILE' and the managed staged binaries before choosing which binary to keep."
++        fi
++    elif [[ "$XRAY_STATE_OLD_EXISTS" == 1 && -f "$XRAY_STATE_BACKUP" && ! -L "$XRAY_STATE_BACKUP" ]]; then
++        log_error "Manual recovery: install -m ${XRAY_STATE_OLD_MODE:-0755} '$XRAY_STATE_BACKUP' '$XRAY_BIN'"
++    elif [[ "$XRAY_STATE_OLD_EXISTS" == 1 ]]; then
++        log_error "The recorded old-binary backup is missing; inspect '$XRAY_STATE_RESTORE_STAGE' before manual recovery."
++    else
++        log_error "Manual recovery for the interrupted fresh install: remove '$XRAY_BIN' after confirming Xray is stopped."
++    fi
++    [[ "$XRAY_STATE_WAS_ACTIVE" == 1 ]] && log_error "Then restart Xray with your system service manager."
++    return 1
++}
++
++recover_pending_xray_update_locked() {
++    [[ -e "$XRAY_UPDATE_STATE_FILE" || -L "$XRAY_UPDATE_STATE_FILE" ]] || return 0
++    command -v flock >/dev/null 2>&1 || {
++        log_error "Cannot recover the pending Xray update because flock is unavailable"
++        return 1
++    }
++    _xray_prepare_managed_file_parent "$XRAY_LIFECYCLE_LOCK" || return 1
++    (
++        exec 8>>"$XRAY_LIFECYCLE_LOCK" || exit 1
++        flock -n 8 || {
++            log_error "Another Xray lifecycle operation is already running"
++            exit 1
++        }
++        recover_pending_xray_update
++    )
++}
++
++_xray_prune_backups() {
++    local bin_dir backup base timestamp remove_count i removed=0 backup_keep
++    local -a backups=()
++    _xray_validate_backup_keep || return 1
++    backup_keep=$((10#$XRAY_BACKUP_KEEP))
++    bin_dir=$(dirname "$XRAY_BIN")
++    while IFS= read -r backup; do
++        base=$(basename "$backup")
++        [[ "$base" =~ ^xray\.bak-v[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?-[0-9]{8}-[0-9]{6}$ ]] || continue
++        [[ -f "$backup" && ! -L "$backup" ]] || continue
++        timestamp="${base: -15}"
++        backups+=("$timestamp|$backup")
++    done < <(find "$bin_dir" -maxdepth 1 -type f -name 'xray.bak-v*-????????-??????' -print 2>/dev/null)
++    mapfile -t backups < <(printf '%s\n' "${backups[@]}" | LC_ALL=C sort)
++    remove_count=$((${#backups[@]} - backup_keep))
++    ((remove_count > 0)) || return 0
++    for ((i = 0; i < remove_count; i++)); do
++        backup="${backups[$i]#*|}"
++        rm -f -- "$backup" || return 1
++        removed=1
++    done
++    ((removed == 0)) || _xray_sync_path "$bin_dir"
++}
++
++_xray_cleanup_private_tmp() {
++    local tmp_dir="${XRAY_TXN_TMP_DIR:-}"
++    [[ -n "$tmp_dir" ]] || return 0
++    identity_bound_tmp_cleanup "$tmp_dir" "$XRAY_TXN_TMP_ID" \
++        "$XRAY_TXN_TMP_PARENT" proxy-hub-xray. || {
++        log_error "Refusing to remove an unexpected Xray temporary path: $tmp_dir"
++        return 1
++    }
++    XRAY_TXN_TMP_DIR=""
++    XRAY_TXN_TMP_ID=""
++}
++
++_xray_transaction_rollback() {
++    local rollback_ok=1 bin_dir
++    [[ "${XRAY_TXN_COMMITTED:-0}" == 0 ]] || return 0
++    [[ "${XRAY_TXN_PREPARED:-0}" == 1 ]] || return 0
++    if [[ "$XRAY_TXN_PHASE" == committed ]]; then
++        log_warn "Xray update had already reached its durable commit point"
++        XRAY_TXN_COMMITTED=1
++        return 0
++    fi
++    log_warn "Xray update failed; restoring the previous state"
++    bin_dir=$(dirname "$XRAY_BIN")
++    [[ "$XRAY_RECOVERY_EXTERNAL_CONFLICT" != 1 ]] || rollback_ok=0
++
++    if ((rollback_ok)) && [[ "$XRAY_TXN_PHASE" == displaced || "$XRAY_TXN_PHASE" == activated ]]; then
++        xray_restore_transaction_binary "$XRAY_TXN_OLD_EXISTS" "$XRAY_TXN_OLD_DIGEST" \
++            "$XRAY_TXN_OLD_MODE" "$XRAY_TXN_NEW_DIGEST" "$XRAY_TXN_RESTORE_STAGE" "$XRAY_TXN_BACKUP" \
++            "$XRAY_TXN_WAS_ACTIVE" "$XRAY_TXN_TOKEN" || rollback_ok=0
++    fi
++
++    if ((rollback_ok)) && [[ "$XRAY_TXN_WAS_ACTIVE" == 1 ]]; then
++        if ! service_is_active xray; then
++            service_start_strict xray || rollback_ok=0
++        fi
++        ((rollback_ok)) && xray_runtime_healthy "$XRAY_BIN" || rollback_ok=0
++    fi
++    if ((rollback_ok)) && [[ "$XRAY_TXN_PHASE" != prepared ]]; then
++        _xray_restore_restart_schedule_values \
++            "$XRAY_TXN_SCHEDULE_ENABLED" "$XRAY_TXN_SCHEDULE_LABEL" \
++            "$XRAY_TXN_SCHEDULE_CRON" "$XRAY_TXN_SCHEDULE_CALENDAR" || rollback_ok=0
++    fi
++    if ((rollback_ok)); then
++        _xray_write_state rolled-back >/dev/null 2>&1 || rollback_ok=0
++        ((rollback_ok)) && xray_finalize_transaction_evidence rolled-back \
++            "$XRAY_TXN_OLD_EXISTS" "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" \
++            "$XRAY_TXN_NEW_DIGEST" "$XRAY_TXN_WAS_ACTIVE" "$bin_dir" \
++            "$XRAY_TXN_TOKEN" "$XRAY_TXN_RESTORE_STAGE" "$XRAY_TXN_STATE_ID" || rollback_ok=0
++    fi
++    if ((rollback_ok)); then
++        _xray_prune_backups || log_warn "Could not prune managed Xray backups after rollback"
++        log_info "Previous Xray state restored"
++        return 0
++    fi
++
++    log_error "AUTOMATIC XRAY ROLLBACK FAILED"
++    if [[ "$XRAY_RECOVERY_EXTERNAL_CONFLICT" == 1 ]]; then
++        log_error "An external Xray target or runtime state was preserved at '$XRAY_BIN'; do not overwrite or remove it until its owner and purpose are identified."
++        if [[ "$XRAY_TXN_OLD_EXISTS" == 1 && -f "$XRAY_TXN_BACKUP" && ! -L "$XRAY_TXN_BACKUP" ]]; then
++            log_error "After preserving the external target elsewhere, verify SHA-256 '$XRAY_TXN_OLD_DIGEST', then restore with: install -m $XRAY_TXN_OLD_MODE '$XRAY_TXN_BACKUP' '$XRAY_BIN'"
++        else
++            log_error "Inspect '$XRAY_UPDATE_STATE_FILE' and the managed staged binaries before choosing which binary to keep."
++        fi
++    elif [[ "$XRAY_TXN_OLD_EXISTS" == 1 ]]; then
++        log_error "Manual recovery: install -m $XRAY_TXN_OLD_MODE '$XRAY_TXN_BACKUP' '$XRAY_BIN'"
++    else
++        log_error "Manual recovery: remove the incomplete binary '$XRAY_BIN'"
++    fi
++    [[ "$XRAY_TXN_WAS_ACTIVE" == 1 ]] && log_error "Then restart Xray with your system service manager."
++    return 1
++}
++
++_xray_transaction_exit() {
++    local original_status="$1" final_status="$1" rollback_ok=1 bin_dir
++    trap - EXIT INT TERM HUP
++    if [[ "${XRAY_TXN_COMMITTED:-0}" != 1 ]]; then
++        _xray_transaction_rollback || { final_status=1; rollback_ok=0; }
++        if ((rollback_ok)) && [[ "${XRAY_TXN_PREPARED:-0}" != 1 ]]; then
++            bin_dir=$(dirname "$XRAY_BIN")
++            [[ -z "${XRAY_TXN_TOKEN:-}" || -z "${XRAY_TXN_RESTORE_STAGE:-}" ]] || \
++                _xray_cleanup_managed_stages "$bin_dir" "$XRAY_TXN_TOKEN" \
++                    "$XRAY_TXN_RESTORE_STAGE" >/dev/null 2>&1 || final_status=1
++        fi
++    fi
++    _xray_cleanup_private_tmp || final_status=1
++    exit "$final_status"
++}
++
++_xray_transaction_signal() {
++    local signal="$1" status="$2"
++    if [[ "${XRAY_TXN_COMMIT_PUBLISHING:-0}" == 1 ]]; then
++        [[ "${XRAY_TXN_PENDING_SIGNAL_STATUS:-0}" != 0 ]] || XRAY_TXN_PENDING_SIGNAL_STATUS="$status"
++        log_warn "Received $signal while publishing the durable Xray commit; deferring termination"
++        return 0
++    fi
++    log_warn "Received $signal during Xray update; rolling back"
++    exit "$status"
++}
++install_xray_release() (
++    set +e
++    local requested_target="${1:-}" intent="${2:-fixed-update}" arch candidate reported current_label
++    local bin_dir stage_size old_size=0 timestamp active_pid current_id current_digest backup_copy intent_rc=0
++    XRAY_TXN_COMMITTED=0
++    XRAY_TXN_COMMIT_PUBLISHING=0
++    XRAY_TXN_PENDING_SIGNAL_STATUS=0
++    XRAY_TXN_STATE_ID=""
++    XRAY_RECOVERY_EXTERNAL_CONFLICT=0
++    XRAY_TXN_PREPARED=0
++    XRAY_TXN_PHASE="initial"
++    XRAY_TXN_TMP_DIR=""
++    XRAY_TXN_TMP_ID=""
++    XRAY_TXN_TMP_PARENT=""
++    XRAY_TXN_BACKUP=""
++    XRAY_TXN_RESTORE_STAGE=""
++    XRAY_TXN_OLD_EXISTS=0
++    XRAY_TXN_OLD_DIGEST=""
++    XRAY_TXN_OLD_ID=""
++    XRAY_TXN_NEW_DIGEST=""
++    XRAY_TXN_OLD_MODE="0755"
++    XRAY_TXN_WAS_ACTIVE=0
++    XRAY_TXN_SCHEDULE_ENABLED=0
++    XRAY_TXN_SCHEDULE_LABEL=""
++    XRAY_TXN_SCHEDULE_CRON=""
++    XRAY_TXN_SCHEDULE_CALENDAR=""
++    XRAY_TXN_TOKEN="$(date +%s)-$$-${RANDOM}-${RANDOM}"
++    XRAY_TXN_TARGET=$(normalize_xray_version "$requested_target") || {
++        log_error "Invalid Xray target version: $requested_target"
++        return 1
++    }
++    case "$intent" in ordinary-install|channel-update|fixed-update) ;; *) return 1 ;; esac
++    trap '_xray_transaction_exit $?' EXIT
++    trap '_xray_transaction_signal INT 130' INT
++    trap '_xray_transaction_signal TERM 143' TERM
++    trap '_xray_transaction_signal HUP 129' HUP
++
++    _xray_release_capability_check || return 1
++    _xray_prepare_managed_file_parent "$XRAY_LIFECYCLE_LOCK" || return 1
++    exec 9>>"$XRAY_LIFECYCLE_LOCK" || return 1
++    flock -n 9 || {
++        log_error "Another Xray lifecycle operation is already running"
++        return 1
++    }
++    recover_pending_xray_update || return 1
++    xray_revalidate_release_request "$intent" "$XRAY_TXN_TARGET" || intent_rc=$?
++    case "$intent_rc" in
++        0) ;;
++        10) XRAY_TXN_COMMITTED=1; return 0 ;;
++        *) return 1 ;;
++    esac
++
++    bin_dir=$(dirname "$XRAY_BIN")
++    mkdir -p "$bin_dir" "$(dirname "$XRAY_CONF")" || return 1
++    if [[ -L "$XRAY_BIN" ]]; then
++        log_error "Refusing to replace a symlinked Xray binary: $XRAY_BIN"
++        return 1
++    fi
++    if [[ -e "$XRAY_BIN" ]]; then
++        [[ -f "$XRAY_BIN" ]] || {
++            log_error "Existing Xray path is not a regular file: $XRAY_BIN"
++            return 1
++        }
++        XRAY_TXN_OLD_EXISTS=1
++        XRAY_TXN_OLD_MODE=$(stat -c '%a' "$XRAY_BIN" 2>/dev/null) || return 1
++        [[ "$XRAY_TXN_OLD_MODE" =~ ^[0-7]{3,4}$ ]] || return 1
++        XRAY_TXN_OLD_DIGEST=$(_xray_sha256_file "$XRAY_BIN") || return 1
++        _xray_binary_matches "$XRAY_BIN" "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" || return 1
++        XRAY_TXN_OLD_ID=$(stat -Lc '%d:%i' "$XRAY_BIN" 2>/dev/null) || return 1
++        old_size=$(stat -c '%s' "$XRAY_BIN" 2>/dev/null) || return 1
++    fi
++    service_is_active xray && XRAY_TXN_WAS_ACTIVE=1
++    if [[ "$XRAY_TXN_WAS_ACTIVE" == 1 ]]; then
++        active_pid=$(service_main_pid xray 2>/dev/null) || {
++            log_error "Xray is active but its main process cannot be identified safely"
++            return 1
++        }
++        xray_pid_uses_binary "$active_pid" "$XRAY_BIN" || {
++            log_error "Xray service PID does not execute the managed Xray binary"
++            return 1
++        }
++        xray_runtime_has_only_service_pid "$active_pid" || {
++            log_error "Another managed or unmanaged Xray process is running"
++            return 1
++        }
++    elif xray_process_exists; then
++        log_error "An unmanaged or stale Xray process exists; stop it before updating"
++        return 1
++    fi
++
++    identity_bound_tmp_create "${TMPDIR:-/tmp}" proxy-hub-xray. || return 1
++    XRAY_TXN_TMP_DIR="$IDENTITY_TMP_PATH"
++    XRAY_TXN_TMP_ID="$IDENTITY_TMP_ID"
++    XRAY_TXN_TMP_PARENT="$IDENTITY_TMP_PARENT"
++    arch=$(map_xray_arch) || return 1
++    candidate=$(download_xray_release "$XRAY_TXN_TARGET" "$arch" "$XRAY_TXN_TMP_DIR") || return 1
++    identity_bound_tmp_intact "$XRAY_TXN_TMP_DIR" "$XRAY_TXN_TMP_ID" \
++        "$XRAY_TXN_TMP_PARENT" proxy-hub-xray. || return 1
++    validate_xray_binary "$candidate" "$XRAY_TXN_TARGET" "$XRAY_TXN_VALIDATION_MODE" || return 1
++    XRAY_TXN_NEW_DIGEST=$(_xray_sha256_file "$candidate") || return 1
++    reported=$(get_installed_xray_version "$candidate") || return 1
++    log_info "Validated Xray release $reported ($arch)"
++
++    stage_size=$(stat -c '%s' "$candidate" 2>/dev/null) || return 1
++    _xray_check_disk_space "$bin_dir" "$((stage_size + old_size))" || return 1
++    timestamp=$(date '+%Y%m%d-%H%M%S') || return 1
++    if [[ "$XRAY_TXN_OLD_EXISTS" == 1 ]]; then
++        current_label=$(get_installed_xray_version "$XRAY_BIN" 2>/dev/null || printf '%s\n' v0.0-unknown)
++    else
++        current_label="v0.0-absent"
++    fi
++    XRAY_TXN_BACKUP="$bin_dir/xray.bak-${current_label}-${timestamp}"
++    XRAY_TXN_RESTORE_STAGE="$bin_dir/.xray.restore.${XRAY_TXN_TOKEN}"
++    backup_copy="$bin_dir/.xray.backup-copy.${XRAY_TXN_TOKEN}"
++    [[ ! -e "$XRAY_TXN_BACKUP" && ! -L "$XRAY_TXN_BACKUP" &&
++       ! -e "$XRAY_TXN_RESTORE_STAGE" && ! -L "$XRAY_TXN_RESTORE_STAGE" &&
++       ! -e "$backup_copy" && ! -L "$backup_copy" ]] || {
++        log_error "Xray backup name collision; retry the update"
++        return 1
++    }
++
++    _xray_capture_restart_schedule || return 1
++    _xray_write_state prepared || return 1
++    install -m 0755 "$candidate" "$bin_dir/.xray.new.${XRAY_TXN_TOKEN}" || return 1
++    _xray_sync_path "$bin_dir/.xray.new.${XRAY_TXN_TOKEN}" || return 1
++    if [[ "$XRAY_TXN_OLD_EXISTS" == 1 ]]; then
++        current_id=$(stat -Lc '%d:%i' "$XRAY_BIN" 2>/dev/null) || return 1
++        current_digest=$(_xray_sha256_file "$XRAY_BIN") || return 1
++        [[ "$current_id" == "$XRAY_TXN_OLD_ID" && "$current_digest" == "$XRAY_TXN_OLD_DIGEST" ]] &&
++            _xray_binary_metadata_matches "$XRAY_BIN" "$XRAY_TXN_OLD_MODE" || {
++            log_error "Existing Xray binary changed during candidate validation"
++            return 1
++        }
++        ln "$XRAY_BIN" "$XRAY_TXN_RESTORE_STAGE" || return 1
++        [[ "$(stat -Lc '%d:%i' "$XRAY_TXN_RESTORE_STAGE" 2>/dev/null)" == "$XRAY_TXN_OLD_ID" ]] || return 1
++        _xray_sync_path "$XRAY_TXN_RESTORE_STAGE" || return 1
++        xray_copy_verified_backup "$XRAY_BIN" "$backup_copy" "$XRAY_TXN_BACKUP" \
++            "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" || return 1
++    fi
++    _xray_sync_path "$bin_dir" || return 1
++
++    XRAY_TXN_PHASE=schedule-paused
++    _xray_pause_restart_schedule || return 1
++    _xray_write_state schedule-paused || return 1
++    if [[ "$XRAY_TXN_WAS_ACTIVE" == 1 ]]; then
++        XRAY_TXN_PHASE=stopped
++        _xray_stop_and_wait "$XRAY_BIN" "$XRAY_TXN_OLD_DIGEST" || return 1
++    elif service_is_active xray || xray_process_exists; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Xray runtime state changed during candidate validation; retry the update"
++        return 1
++    fi
++    _xray_write_state stopped || return 1
++
++    if service_is_active xray || xray_process_exists; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Xray runtime reappeared before binary activation"
++        return 1
++    fi
++
++    _xray_write_state displaced || return 1
++    xray_activate_transaction_binary "$XRAY_TXN_OLD_EXISTS" "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" \
++        "$bin_dir/.xray.new.${XRAY_TXN_TOKEN}" "$XRAY_TXN_NEW_DIGEST" "$XRAY_TXN_TOKEN" || return 1
++    _xray_write_state activated || return 1
++
++    if [[ "$XRAY_TXN_WAS_ACTIVE" == 1 ]]; then
++        _xray_start_and_verify || return 1
++    fi
++    _xray_restore_restart_schedule_values \
++        "$XRAY_TXN_SCHEDULE_ENABLED" "$XRAY_TXN_SCHEDULE_LABEL" \
++        "$XRAY_TXN_SCHEDULE_CRON" "$XRAY_TXN_SCHEDULE_CALENDAR" || return 1
++    XRAY_TXN_COMMIT_PUBLISHING=1
++    if ! _xray_write_state committed; then
++        XRAY_TXN_COMMIT_PUBLISHING=0
++        return 1
++    fi
++    XRAY_TXN_COMMITTED=1
++    XRAY_TXN_COMMIT_PUBLISHING=0
++    if [[ "$XRAY_TXN_PENDING_SIGNAL_STATUS" != 0 ]]; then
++        return "$XRAY_TXN_PENDING_SIGNAL_STATUS"
++    fi
++    xray_finalize_transaction_evidence committed "$XRAY_TXN_OLD_EXISTS" \
++        "$XRAY_TXN_OLD_DIGEST" "$XRAY_TXN_OLD_MODE" "$XRAY_TXN_NEW_DIGEST" \
++        "$XRAY_TXN_WAS_ACTIVE" "$bin_dir" "$XRAY_TXN_TOKEN" \
++        "$XRAY_TXN_RESTORE_STAGE" "$XRAY_TXN_STATE_ID" || {
++        log_error "Committed Xray evidence could not be finalized safely; journal retained"
++        return 1
++    }
++    _xray_prune_backups || log_warn "Could not prune older managed Xray backups"
++    log_info "Xray $XRAY_TXN_TARGET installed successfully"
++    return 0
++)
++
++install_xray_fresh() {
++    local target
++    target=$(resolve_xray_target_version) || return 1
++    install_xray_release "$target" ordinary-install
++}
++
++_xray_configured_channel_label() {
++    local requested_version requested_channel
++    requested_version=$(xray_requested_version)
++    requested_channel=$(xray_requested_channel)
++    if [[ -n "$requested_version" ]]; then
++        requested_version=$(normalize_xray_version "$requested_version" 2>/dev/null || printf '%s' invalid)
++        printf 'pinned (%s)\n' "$requested_version"
++    else
++        printf '%s\n' "${requested_channel:-stable}"
++    fi
++}
++
++_xray_version_relation() {
++    local current="$1" remote="$2" label="$3" cmp
++    [[ -n "$remote" ]] || {
++        printf '%s unavailable' "$label"
++        return 0
++    }
++    cmp=$(xray_compare_versions "$current" "$remote") || {
++        printf 'comparison unavailable'
++        return 0
++    }
++    case "$cmp" in
++        0) printf 'up to date with %s' "$label" ;;
++        -1) printf 'behind %s' "$label" ;;
++        1) printf 'newer than %s' "$label" ;;
++    esac
++}
++
++cmd_xray_version() {
++    local current="" stable="" latest="" channel stable_status latest_status
++    current=$(get_installed_xray_version "$XRAY_BIN" 2>/dev/null || true)
++    stable=$(get_xray_stable_version || true)
++    latest=$(get_xray_latest_version || true)
++    channel=$(_xray_configured_channel_label)
++
++    printf '%-25s %s\n' 'Current installed:' "${current:-Not installed}"
++    printf '%-25s %s\n' 'Latest stable:' "${stable:-Unavailable}"
++    printf '%-25s %s\n' 'Latest incl. prerelease:' "${latest:-Unavailable}"
++    printf '%-25s %s\n' 'Configured channel:' "$channel"
++    if [[ -z "$current" ]]; then
++        printf '%-25s %s\n' 'Status:' 'Not installed'
++        return 0
++    fi
++    stable_status=$(_xray_version_relation "$current" "$stable" stable)
++    latest_status=$(_xray_version_relation "$current" "$latest" 'latest release')
++    printf '%-25s %s; %s\n' 'Status:' "$stable_status" "$latest_status"
++}
++
++_xray_set_request_override() {
++    XRAY_REQUEST_OVERRIDE_SET=1
++    XRAY_REQUEST_VERSION_OVERRIDE="${1:-}"
++    XRAY_REQUEST_CHANNEL_OVERRIDE="${2:-}"
++}
++
++_xray_clear_request_override() {
++    XRAY_REQUEST_OVERRIDE_SET=0
++    XRAY_REQUEST_VERSION_OVERRIDE=""
++    XRAY_REQUEST_CHANNEL_OVERRIDE=""
++}
++
++_xray_prompt_update_target() {
++    local choice specified
++    echo ""
++    echo "1. $(msg xray_release_latest_stable)"
++    echo "2. $(msg xray_release_latest_all)"
++    echo "3. $(msg xray_release_specify)"
++    echo "0. $(msg xray_release_cancel)"
++    printf '%s [0-3]: ' "$(msg menu_choice)"
++    read -r choice
++    case "$choice" in
++        1) _xray_set_request_override "" stable ;;
++        2) _xray_set_request_override "" prerelease ;;
++        3)
++            printf '%s: ' "$(msg xray_release_version_prompt)"
++            read -r specified
++            normalize_xray_version "$specified" >/dev/null || {
++                log_error "Invalid Xray version: $specified"
++                return 1
++            }
++            _xray_set_request_override "$specified" ""
++            ;;
++        0) return 2 ;;
++        *) log_error "$(msg menu_invalid)"; return 1 ;;
++    esac
++}
++
++cmd_xray_update() {
++    local requested_version requested_channel source target intent prompt_rc=0
++    if ! is_root; then
++        log_error "$(msg run_as_root)"
++        return 1
++    fi
++    recover_pending_xray_update_locked || return 1
++    requested_version=$(xray_requested_version)
++    requested_channel=$(xray_requested_channel)
++    if [[ -z "$requested_version" && -z "$requested_channel" && -t 0 && -t 1 ]]; then
++        _xray_prompt_update_target || prompt_rc=$?
++        case "$prompt_rc" in
++            0) ;;
++            2) return 0 ;;
++            *) return 1 ;;
++        esac
++        requested_version=$(xray_requested_version)
++        requested_channel=$(xray_requested_channel)
++    fi
++    source=channel
++    [[ -n "$requested_version" ]] && source=version
++    target=$(resolve_xray_target_version) || return 1
++    intent=channel-update
++    [[ "$source" != version ]] || intent=fixed-update
++    install_xray_release "$target" "$intent" || return 1
++    ensure_xray_service_definition
++}
++
++cmd_xray_release_menu() {
++    local choice specified rc
++    while true; do
++        clear
++        echo ""
++        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
++        echo -e "${GREEN}                    $(msg xray_release_title)${NC}"
++        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
++        cmd_xray_version
++        echo ""
++        echo "1. $(msg xray_release_show_status)"
++        echo "2. $(msg xray_release_update_stable)"
++        echo "3. $(msg xray_release_update_latest)"
++        echo "4. $(msg xray_release_install_version)"
++        echo "0. $(msg xray_release_back)"
++        printf '%s [0-4]: ' "$(msg menu_choice)"
++        read -r choice
++        case "$choice" in
++            1) cmd_xray_version ;;
++            2)
++                _xray_set_request_override "" stable
++                rc=0
++                cmd_xray_update || rc=$?
++                _xray_clear_request_override
++                ((rc == 0)) || log_error "Xray update failed"
++                ;;
++            3)
++                _xray_set_request_override "" prerelease
++                rc=0
++                cmd_xray_update || rc=$?
++                _xray_clear_request_override
++                ((rc == 0)) || log_error "Xray update failed"
++                ;;
++            4)
++                printf '%s: ' "$(msg xray_release_version_prompt)"
++                read -r specified
++                if normalize_xray_version "$specified" >/dev/null; then
++                    _xray_set_request_override "$specified" ""
++                    rc=0
++                    cmd_xray_update || rc=$?
++                    _xray_clear_request_override
++                    ((rc == 0)) || log_error "Xray update failed"
++                else
++                    log_error "Invalid Xray version: $specified"
++                fi
++                ;;
++            0) return 0 ;;
++            *) log_error "$(msg menu_invalid)" ;;
++        esac
++        echo ""
++        read -rp "$(msg menu_press_enter)"
++    done
++}
++
+@@ -2146 +3788 @@
+-            required_packages=(curl unzip tar openssl ca-certificates iproute2 qrencode jq cron)
++            required_packages=(curl unzip tar openssl ca-certificates iproute2 qrencode jq cron util-linux)
+@@ -2149 +3791 @@
+-            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq cronie)
++            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq cronie util-linux)
+@@ -2154 +3796 @@
+-            required_packages=(curl unzip tar openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq)
++            required_packages=(curl unzip tar openssl ca-certificates iproute2 libqrencode-tools bash coreutils jq flock)
+@@ -2157 +3799 @@
+-            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq)
++            required_packages=(curl unzip tar openssl ca-certificates iproute qrencode jq util-linux)
+@@ -2185,6 +3827,12 @@
+-install_xray() {
+-    # 检查 Xray 是否已安装
+-    if [[ -f "$XRAY_BIN" ]] && "$XRAY_BIN" version &>/dev/null; then
+-        log_info "Xray already installed, skipping..."
+-        return 0
+-    fi
++xray_list_process_ids() {
++    local proc pid comm verify_comm
++    for proc in /proc/[0-9]*; do
++        [[ -d "$proc" && -r "$proc/comm" ]] || continue
++        IFS= read -r comm < "$proc/comm" 2>/dev/null || continue
++        [[ "$comm" == xray ]] || continue
++        pid="${proc##*/}"
++        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
++        IFS= read -r verify_comm < "$proc/comm" 2>/dev/null || continue
++        [[ "$verify_comm" == xray ]] && printf '%s\n' "$pid"
++    done
++}
+@@ -2192 +3840,3 @@
+-    log_info "$(msg install_xray)"
++xray_process_exists() {
++    [[ -n "$(xray_list_process_ids)" ]]
++}
+@@ -2194,8 +3844,11 @@
+-    # Alpine Linux 需要手动安装（官方脚本依赖 systemd）
+-    if [[ "$PKG_MANAGER" == "apk" ]]; then
+-        install_xray_alpine
+-    else
+-        # Security: Download script to temp file first, then execute
+-        # This allows for potential verification and avoids direct pipe-to-bash
+-        local installer_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+-        local tmp_installer="/tmp/xray-install-$$.sh"
++xray_runtime_has_only_service_pid() {
++    local expected_pid="$1" pid count=0
++    [[ "$expected_pid" =~ ^[1-9][0-9]*$ ]] || return 1
++    while IFS= read -r pid; do
++        [[ -n "$pid" ]] || continue
++        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
++        ((++count))
++        [[ "$pid" == "$expected_pid" ]] || return 1
++    done < <(xray_list_process_ids)
++    ((count == 1))
++}
+@@ -2203,5 +3856,7 @@
+-        if ! secure_curl "$installer_url" -o "$tmp_installer"; then
+-            log_error "Failed to download Xray installer"
+-            rm -f "$tmp_installer"
+-            return 1
+-        fi
++xray_pid_uses_binary() {
++    local pid="$1" binary="$2" expected_id actual_id
++    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/exe" ]] || return 1
++    expected_id=$(stat -Lc '%d:%i' "$binary" 2>/dev/null) || return 1
++    actual_id=$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null) || return 1
++    [[ "$actual_id" == "$expected_id" ]]
++}
+@@ -2209,8 +3864,6 @@
+-        # Execute downloaded script
+-        if ! bash "$tmp_installer" >/dev/null 2>&1; then
+-            log_error "Failed to install Xray. Please check your network connection."
+-            rm -f "$tmp_installer"
+-            return 1
+-        fi
+-        rm -f "$tmp_installer"
+-    fi
++_xray_binary_metadata_matches() {
++    local path="$1" expected_mode="$2" owner mode
++    [[ -f "$path" && ! -L "$path" && "$expected_mode" =~ ^[0-7]{3,4}$ ]] || return 1
++    IFS=: read -r owner mode < <(stat -c '%u:%a' "$path" 2>/dev/null) || return 1
++    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
++    ((8#$mode == 8#$expected_mode))
+@@ -2219,5 +3872,6 @@
+-# Alpine Linux 专用 Xray 安装函数
+-install_xray_alpine() {
+-    local arch
+-    arch=$(uname -m)
+-    local xray_arch
++_xray_binary_matches() {
++    local path="$1" expected_digest="$2" expected_mode="$3" actual_digest
++    _xray_binary_metadata_matches "$path" "$expected_mode" || return 1
++    actual_digest=$(_xray_sha256_file "$path" 2>/dev/null) || return 1
++    [[ "$actual_digest" == "$expected_digest" ]]
++}
+@@ -2225,16 +3879,20 @@
+-    # 映射架构名称
+-    case "$arch" in
+-        x86_64)
+-            xray_arch="64"
+-            ;;
+-        aarch64|arm64)
+-            xray_arch="arm64-v8a"
+-            ;;
+-        armv7l)
+-            xray_arch="arm32-v7a"
+-            ;;
+-        *)
+-            log_error "Unsupported architecture: $arch"
+-            return 1
+-            ;;
+-    esac
++_xray_discard_state_payload() {
++    local payload="$1" expected_id="$2" actual_id owner links
++    [[ ! -e "$payload" && ! -L "$payload" ]] && return 0
++    [[ -f "$payload" && ! -L "$payload" ]] || return 1
++    actual_id=$(stat -Lc '%d:%i' "$payload" 2>/dev/null) || return 1
++    IFS=: read -r owner links < <(stat -c '%u:%h' "$payload" 2>/dev/null) || return 1
++    [[ "$actual_id" == "$expected_id" && "$owner" == "$EUID" && "$links" == 1 ]] || return 1
++    unlink "$payload" || return 1
++    _xray_sync_path "$(dirname "$payload")"
++}
++
++_xray_check_disk_space() {
++    local directory="$1" required="$2" available_kb
++    available_kb=$(df -Pk "$directory" 2>/dev/null | awk 'NR == 2 {print $4}') || return 1
++    [[ "$available_kb" =~ ^[0-9]+$ ]] || return 1
++    ((available_kb * 1024 >= required + 1048576)) || {
++        log_error "Not enough free space in $directory for the Xray update"
++        return 1
++    }
++}
+@@ -2242,5 +3900,16 @@
+-    # 获取最新版本号（使用安全的 API 解析）
+-    local latest_version
+-    latest_version=$(fetch_github_release_tag "XTLS/Xray-core")
+-    if [[ -z "$latest_version" ]]; then
+-        log_error "Failed to get Xray latest version"
++xray_preserve_transaction_target() {
++    local target="$1" preserved="$2" expected_digest="$3" expected_mode="$4" actual_digest
++    if ! _xray_binary_metadata_matches "$target" "$expected_mode"; then
++        [[ ! -e "$target" && ! -L "$target" ]] || XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Refusing to move an unclassifiable Xray transaction target: $target"
++        return 1
++    fi
++    if [[ -e "$preserved" || -L "$preserved" ]]; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Refusing to overwrite an existing Xray transaction stage: $preserved"
++        return 1
++    fi
++    mv -n -T -- "$target" "$preserved" || return 1
++    if [[ -e "$target" || -L "$target" ]]; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "No-clobber Xray staging did not move the canonical target"
+@@ -2248,0 +3918,19 @@
++    _xray_binary_metadata_matches "$preserved" "$expected_mode" || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    _xray_sync_path "$preserved" || return 1
++    _xray_sync_path "$(dirname "$target")" || return 1
++    actual_digest=$(_xray_sha256_file "$preserved" 2>/dev/null) || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    if [[ "$actual_digest" != "$expected_digest" ]]; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Xray target changed at the transaction cutover; preserving it at $preserved"
++        if [[ ! -e "$target" && ! -L "$target" ]]; then
++            ln "$preserved" "$target" 2>/dev/null && _xray_sync_path "$(dirname "$target")" || true
++        fi
++        return 1
++    fi
++}
+@@ -2250 +3938,18 @@
+-    log_info "Installing Xray $latest_version for Alpine (${xray_arch})..."
++xray_copy_verified_backup() {
++    local source="$1" copy_stage="$2" backup="$3" expected_digest="$4" mode="$5"
++    local copy_id source_id backup_id
++    _xray_binary_matches "$source" "$expected_digest" "$mode" || return 1
++    [[ ! -e "$copy_stage" && ! -L "$copy_stage" && ! -e "$backup" && ! -L "$backup" ]] || return 1
++    (umask 077; set -o noclobber; command cat -- "$source" > "$copy_stage") 2>/dev/null || return 1
++    chmod "$mode" "$copy_stage" || return 1
++    _xray_sync_path "$copy_stage" || return 1
++    source_id=$(stat -Lc '%d:%i' "$source" 2>/dev/null) || return 1
++    copy_id=$(stat -Lc '%d:%i' "$copy_stage" 2>/dev/null) || return 1
++    [[ "$copy_id" != "$source_id" ]] || return 1
++    _xray_binary_matches "$copy_stage" "$expected_digest" "$mode" || return 1
++    ln "$copy_stage" "$backup" || return 1
++    backup_id=$(stat -Lc '%d:%i' "$backup" 2>/dev/null) || return 1
++    [[ "$backup_id" == "$copy_id" ]] || return 1
++    _xray_sync_path "$backup" || return 1
++    _xray_sync_path "$(dirname "$backup")"
++}
+@@ -2252,4 +3957,18 @@
+-    # 下载 Xray（使用安全的 curl 封装）
+-    local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-linux-${xray_arch}.zip"
+-    local tmp_dir
+-    tmp_dir=$(mktemp -d)
++xray_link_transaction_target() {
++    local source="$1" target="$2" expected_digest="$3" expected_mode="$4"
++    _xray_binary_matches "$source" "$expected_digest" "$expected_mode" || return 1
++    if [[ -e "$target" || -L "$target" ]]; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    fi
++    ln "$source" "$target" || {
++        [[ ! -e "$target" && ! -L "$target" ]] || XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    _xray_sync_path "$target" || return 1
++    _xray_sync_path "$(dirname "$target")" || return 1
++    _xray_binary_matches "$target" "$expected_digest" "$expected_mode" || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++}
+@@ -2257,3 +3976,57 @@
+-    if ! secure_curl "$download_url" -o "${tmp_dir}/xray.zip"; then
+-        log_error "Failed to download Xray"
+-        rm -rf "$tmp_dir"
++xray_activate_transaction_binary() {
++    local old_exists="$1" old_digest="$2" old_mode="$3" new_stage="$4" new_digest="$5" token="$6"
++    local bin_dir displaced
++    bin_dir=$(dirname "$XRAY_BIN")
++    displaced="$bin_dir/.xray.displaced.$token"
++    if [[ "$old_exists" == 1 ]]; then
++        xray_preserve_transaction_target "$XRAY_BIN" "$displaced" "$old_digest" "$old_mode" || return 1
++    elif [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "An Xray binary appeared during fresh-install validation; preserving it"
++        return 1
++    fi
++    xray_link_transaction_target "$new_stage" "$XRAY_BIN" "$new_digest" 0755 || {
++        log_error "Xray activation target appeared or changed; no existing target was overwritten"
++        return 1
++    }
++}
++
++xray_terminal_target_matches_state() {
++    local phase="$1" old_exists="$2" old_digest="$3" old_mode="$4" new_digest="$5"
++    local expected_digest="$new_digest" expected_mode=0755
++    if [[ "$phase" == rolled-back && "$old_exists" == 0 ]]; then
++        if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Fresh-install rollback journal conflicts with an existing Xray target"
++            return 1
++        fi
++        return 0
++    fi
++    if [[ "$phase" == rolled-back ]]; then
++        expected_digest="$old_digest"
++        expected_mode="$old_mode"
++    fi
++    _xray_binary_matches "$XRAY_BIN" "$expected_digest" "$expected_mode" || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Terminal Xray journal does not match the current target content or metadata"
++        return 1
++    }
++}
++
++xray_terminal_runtime_matches_state() {
++    local was_active="$1" pid
++    if [[ "$was_active" == 1 ]]; then
++        service_is_active xray && pid=$(service_main_pid xray 2>/dev/null) &&
++            xray_pid_uses_binary "$pid" "$XRAY_BIN" &&
++            xray_runtime_has_only_service_pid "$pid" || {
++                XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++                log_error "Terminal Xray journal conflicts with the current service process set"
++                return 1
++            }
++    elif [[ "$was_active" == 0 ]]; then
++        if service_is_active xray || xray_process_exists; then
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Terminal inactive Xray journal conflicts with a running process"
++            return 1
++        fi
++    else
+@@ -2261,0 +4035 @@
++}
+@@ -2263,7 +4037,86 @@
+-    # 解压安装
+-    unzip -q "${tmp_dir}/xray.zip" -d "${tmp_dir}"
+-    mkdir -p /usr/local/bin /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+-
+-    install -m 755 "${tmp_dir}/xray" /usr/local/bin/xray
+-    [[ -f "${tmp_dir}/geoip.dat" ]] && install -m 644 "${tmp_dir}/geoip.dat" /usr/local/share/xray/
+-    [[ -f "${tmp_dir}/geosite.dat" ]] && install -m 644 "${tmp_dir}/geosite.dat" /usr/local/share/xray/
++xray_finalize_transaction_evidence() {
++    local phase="$1" old_exists="$2" old_digest="$3" old_mode="$4" new_digest="$5"
++    local was_active="$6" bin_dir="$7" token="$8" restore_stage="$9" expected_state_id="${10}" state_id
++    [[ "${XRAY_RECOVERY_EXTERNAL_CONFLICT:-0}" != 1 ]] || return 1
++    state_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    [[ "$state_id" == "$expected_state_id" ]] || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    grep -Fxq "phase=$phase" "$XRAY_UPDATE_STATE_FILE" 2>/dev/null || return 1
++    xray_terminal_target_matches_state "$phase" "$old_exists" "$old_digest" "$old_mode" "$new_digest" || return 1
++    xray_terminal_runtime_matches_state "$was_active" || return 1
++    _xray_cleanup_managed_stages "$bin_dir" "$token" "$restore_stage" || return 1
++    xray_terminal_target_matches_state "$phase" "$old_exists" "$old_digest" "$old_mode" "$new_digest" || return 1
++    xray_terminal_runtime_matches_state "$was_active" || return 1
++    state_id=$(stat -Lc '%d:%i' "$XRAY_UPDATE_STATE_FILE" 2>/dev/null) || return 1
++    [[ "$state_id" == "$expected_state_id" ]] || {
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        return 1
++    }
++    [[ "${XRAY_RECOVERY_EXTERNAL_CONFLICT:-0}" != 1 ]] || return 1
++    unlink "$XRAY_UPDATE_STATE_FILE" || return 1
++    _xray_sync_path "$(dirname "$XRAY_UPDATE_STATE_FILE")"
++}
++
++xray_adopt_loaded_transaction_state() {
++    XRAY_TXN_TOKEN="$XRAY_STATE_TOKEN"
++    XRAY_TXN_TARGET="$XRAY_STATE_TARGET"
++    XRAY_TXN_NEW_DIGEST="$XRAY_STATE_NEW_DIGEST"
++    XRAY_TXN_OLD_EXISTS="$XRAY_STATE_OLD_EXISTS"
++    XRAY_TXN_OLD_DIGEST="$XRAY_STATE_OLD_DIGEST"
++    XRAY_TXN_OLD_MODE="$XRAY_STATE_OLD_MODE"
++    XRAY_TXN_BACKUP="$XRAY_STATE_BACKUP"
++    XRAY_TXN_RESTORE_STAGE="$XRAY_STATE_RESTORE_STAGE"
++    XRAY_TXN_WAS_ACTIVE="$XRAY_STATE_WAS_ACTIVE"
++    XRAY_TXN_SCHEDULE_ENABLED="$XRAY_STATE_SCHEDULE_ENABLED"
++    XRAY_TXN_SCHEDULE_LABEL="$XRAY_STATE_SCHEDULE_LABEL"
++    XRAY_TXN_SCHEDULE_CRON="$XRAY_STATE_SCHEDULE_CRON"
++    XRAY_TXN_SCHEDULE_CALENDAR="$XRAY_STATE_SCHEDULE_CALENDAR"
++    XRAY_TXN_STATE_ID="$XRAY_STATE_FILE_ID"
++    XRAY_TXN_PREPARED=1
++}
++
++xray_revalidate_release_request() {
++    local intent="$1" target="$2" current="" decision
++    case "$intent" in
++        ordinary-install|channel-update|fixed-update) ;;
++        *) return 1 ;;
++    esac
++    XRAY_TXN_VALIDATION_MODE=install
++    XRAY_TXN_LOCKED_ACTION=install
++    if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++        [[ -f "$XRAY_BIN" && ! -L "$XRAY_BIN" ]] || {
++            log_error "Existing Xray target is not a regular file"
++            return 1
++        }
++        current=$(get_installed_xray_version "$XRAY_BIN" 2>/dev/null || true)
++        if [[ -z "$current" ]]; then
++            [[ "$intent" == fixed-update ]] || {
++                log_error "Only a fixed version may repair an unidentifiable Xray binary"
++                return 1
++            }
++            XRAY_TXN_VALIDATION_MODE=update
++            XRAY_TXN_LOCKED_ACTION=repair
++            return 0
++        fi
++        if [[ "$intent" == ordinary-install ]]; then
++            log_info "Xray already installed: $current (leaving it unchanged)"
++            return 10
++        fi
++        XRAY_TXN_VALIDATION_MODE=update
++        if [[ "$intent" == channel-update ]]; then
++            decision=$(xray_update_decision "$current" "$target" channel) || return 1
++        else
++            decision=$(xray_update_decision "$current" "$target" version) || return 1
++        fi
++        XRAY_TXN_LOCKED_ACTION="$decision"
++        log_info "Current Xray: $current; target: $target"
++        case "$decision" in
++            noop) log_info "Xray is already at the selected channel target; no changes made"; return 10 ;;
++            refuse) log_warn "Installed Xray $current is newer than channel target $target; refusing automatic downgrade"; return 10 ;;
++            reinstall) log_warn "Explicit version request will reinstall $target" ;;
++            downgrade) log_warn "Explicit version request will downgrade Xray to $target" ;;
++        esac
++    fi
++}
+@@ -2271 +4124,50 @@
+-    rm -rf "$tmp_dir"
++xray_restore_transaction_binary() {
++    local old_exists="$1" old_digest="$2" old_mode="$3" new_digest="$4" restore_stage="$5"
++    local backup="$6" was_active="$7" token="$8" bin_dir current_digest="" source failed displaced
++    bin_dir=$(dirname "$XRAY_BIN")
++    failed="$bin_dir/.xray.failed.$token"
++    displaced="$bin_dir/.xray.displaced.$token"
++    [[ "${XRAY_RECOVERY_EXTERNAL_CONFLICT:-0}" != 1 ]] || return 1
++    if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++        if [[ ! -f "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Refusing recovery because the current Xray target is unclassifiable"
++            return 1
++        fi
++        current_digest=$(_xray_sha256_file "$XRAY_BIN" 2>/dev/null) || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            return 1
++        }
++        if [[ "$old_exists" == 1 && "$current_digest" == "$old_digest" ]] &&
++           _xray_binary_metadata_matches "$XRAY_BIN" "$old_mode"; then
++            if [[ "$was_active" == 0 ]] && (service_is_active xray || xray_process_exists); then
++                XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++                log_error "Refusing recovery because Xray became active outside the transaction"
++                return 1
++            fi
++            return 0
++        fi
++        [[ "$current_digest" == "$new_digest" ]] &&
++            _xray_binary_metadata_matches "$XRAY_BIN" 0755 || {
++            XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++            log_error "Refusing recovery because the current Xray binary is external to the journal"
++            return 1
++        }
++        if service_is_active xray || xray_process_exists; then
++            _xray_stop_and_wait "$XRAY_BIN" "$new_digest" || return 1
++        fi
++        xray_preserve_transaction_target "$XRAY_BIN" "$failed" "$new_digest" 0755 || return 1
++    elif service_is_active xray || xray_process_exists; then
++        XRAY_RECOVERY_EXTERNAL_CONFLICT=1
++        log_error "Refusing recovery while an unidentifiable Xray process exists"
++        return 1
++    fi
++    [[ "$old_exists" == 1 ]] || return 0
++    for source in "$restore_stage" "$displaced" "$backup"; do
++        [[ -f "$source" && ! -L "$source" ]] || continue
++        xray_link_transaction_target "$source" "$XRAY_BIN" "$old_digest" "$old_mode" && return 0
++        [[ ! -e "$XRAY_BIN" && ! -L "$XRAY_BIN" ]] || return 1
++    done
++    log_error "No verified old Xray binary is available for recovery"
++    return 1
++}
+@@ -2273,2 +4175,19 @@
+-    # 创建 OpenRC 服务脚本
+-    create_xray_openrc_service
++install_xray() {
++    local current
++    recover_pending_xray_update_locked || return 1
++    if current=$(get_installed_xray_version "$XRAY_BIN" 2>/dev/null); then
++        # Creating a node must never silently replace or downgrade an existing
++        # healthy Xray, even when a channel/version environment variable exists.
++        ensure_xray_service_definition || return 1
++        log_info "Xray already installed: $current (leaving it unchanged)"
++        return 0
++    fi
++    if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
++        log_error "An existing Xray binary cannot report a valid version; repair it with XRAY_VERSION=... xray-update"
++        return 1
++    fi
++    log_info "$(msg install_xray)"
++    install_xray_fresh || return 1
++    ensure_xray_service_definition || return 1
++    log_info "Xray installed successfully"
++}
+@@ -2276 +4195,23 @@
+-    log_info "Xray installed successfully on Alpine"
++# Backward-compatible internal entry point.
++install_xray_alpine() {
++    install_xray_fresh && ensure_xray_service_definition
++}
++
++_xray_definition_should_publish() {
++    local target="$1" legacy="$3" marker='# proxy-hub-managed: xray-service-v1' size
++    [[ ! -e "$target" && ! -L "$target" ]] && return 0
++    [[ -f "$target" && ! -L "$target" ]] || return 1
++    grep -Fxq "$marker" "$target" 2>/dev/null && return 0
++    size=$(stat -c '%s' "$target" 2>/dev/null) || return 1
++    [[ "$size" =~ ^[0-9]+$ && "$size" -le "$(stat -c '%s' "$legacy")" ]] || return 1
++    cmp -n "$size" "$target" "$legacy" >/dev/null 2>&1
++}
++
++_xray_publish_managed_definition() {
++    local source="$1" target="$2" mode="$3"
++    _xray_prepare_managed_file_parent "$target" || return 1
++    chmod "$mode" "$source" || return 1
++    _xray_sync_path "$source" || return 1
++    mv -f -T -- "$source" "$target" || return 1
++    _xray_sync_path "$target" || return 1
++    _xray_sync_path "$(dirname "$target")"
+@@ -2281 +4222,6 @@
+-    cat > /etc/init.d/xray <<'OPENRC_SERVICE'
++    local target=/etc/init.d/xray tmp legacy
++    _xray_prepare_managed_file_parent "$target" || return 1
++    mkdir -p /var/log/xray
++    tmp=$(mktemp /etc/init.d/.xray.proxy-hub.XXXXXXXX) || return 1
++    legacy="${tmp}.legacy"
++    cat > "$tmp" <<'OPENRC_SERVICE'
+@@ -2282,0 +4229 @@
++# proxy-hub-managed: xray-service-v1
+@@ -2302,0 +4250,64 @@
++    grep -Fv '# proxy-hub-managed: xray-service-v1' "$tmp" > "$legacy" || {
++        rm -f -- "$tmp" "$legacy"
++        return 1
++    }
++    if ! _xray_definition_should_publish "$target" "$tmp" "$legacy"; then
++        rm -f -- "$tmp" "$legacy"
++        return 0
++    fi
++    bash -n "$tmp" || {
++        rm -f -- "$tmp" "$legacy"
++        return 1
++    }
++    rm -f -- "$legacy"
++    _xray_publish_managed_definition "$tmp" "$target" 0755 || {
++        rm -f -- "$tmp"
++        return 1
++    }
++}
++
++create_xray_systemd_service() {
++    local unit_path=/etc/systemd/system/xray.service tmp legacy
++    if [[ ! -e "$unit_path" && ! -L "$unit_path" ]] && systemctl cat xray.service >/dev/null 2>&1; then
++        return 0
++    fi
++    _xray_prepare_managed_file_parent "$unit_path" || return 1
++    mkdir -p /var/log/xray
++    tmp=$(mktemp /etc/systemd/system/.xray.service.proxy-hub.XXXXXXXX) || return 1
++    legacy="${tmp}.legacy"
++    cat > "$tmp" <<'UNIT'
++# proxy-hub-managed: xray-service-v1
++[Unit]
++Description=Xray Service
++Documentation=https://github.com/XTLS/Xray-core
++After=network.target nss-lookup.target
++
++[Service]
++Type=simple
++ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
++Restart=on-failure
++RestartSec=5
++LimitNOFILE=infinity
++
++[Install]
++WantedBy=multi-user.target
++UNIT
++    grep -Fv '# proxy-hub-managed: xray-service-v1' "$tmp" > "$legacy" || {
++        rm -f -- "$tmp" "$legacy"
++        return 1
++    }
++    if ! _xray_definition_should_publish "$unit_path" "$tmp" "$legacy"; then
++        rm -f -- "$tmp" "$legacy"
++        return 0
++    fi
++    grep -Fxq 'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json' "$tmp" || {
++        rm -f -- "$tmp" "$legacy"
++        return 1
++    }
++    rm -f -- "$legacy"
++    _xray_publish_managed_definition "$tmp" "$unit_path" 0644 || {
++        rm -f -- "$tmp"
++        return 1
++    }
++    systemctl daemon-reload
++}
+@@ -2304 +4315,6 @@
+-    chmod 755 /etc/init.d/xray
++ensure_xray_service_definition() {
++    if [[ "$INIT_SYSTEM" == openrc ]]; then
++        create_xray_openrc_service
++    else
++        create_xray_systemd_service
++    fi
+@@ -2482,0 +4499 @@
++XRAY_RESTART_HELPER="/usr/local/libexec/proxy-hub-xray-restart"
+@@ -2528,0 +4546,64 @@
++install_xray_restart_helper() {
++    local target="$XRAY_RESTART_HELPER" tmp marker='# proxy-hub-managed: xray-restart-helper-v1'
++    [[ "$target" == /usr/local/libexec/proxy-hub-xray-restart ]] || return 1
++    _xray_prepare_managed_file_parent "$target" || return 1
++    if [[ -e "$target" || -L "$target" ]]; then
++        [[ -f "$target" && ! -L "$target" ]] || return 1
++        grep -Fxq "$marker" "$target" 2>/dev/null || {
++            log_error "Refusing to overwrite an unmanaged restart helper: $target"
++            return 1
++        }
++    fi
++    tmp=$(mktemp /usr/local/libexec/.proxy-hub-xray-restart.XXXXXXXX) || return 1
++    cat > "$tmp" <<'RESTART_HELPER'
++#!/usr/bin/env bash
++# proxy-hub-managed: xray-restart-helper-v1
++set -u
++PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
++export PATH
++lock=/run/proxy-hub-xray-lifecycle.lock
++
++[[ "${EUID:-$(id -u)}" == 0 ]] || exit 1
++[[ -d /run && ! -L /run && "$(stat -c '%u' /run 2>/dev/null)" == 0 ]] || exit 1
++run_mode=$(stat -c '%a' /run 2>/dev/null) || exit 1
++[[ "$run_mode" =~ ^[0-7]{3,4}$ ]] || exit 1
++(((8#$run_mode & 022) == 0)) || exit 1
++if [[ -e "$lock" || -L "$lock" ]]; then
++    [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%u' "$lock" 2>/dev/null)" == 0 ]] || exit 1
++    lock_mode=$(stat -c '%a' "$lock" 2>/dev/null) || exit 1
++    [[ "$lock_mode" =~ ^[0-7]{3,4}$ ]] || exit 1
++    (((8#$lock_mode & 022) == 0)) || exit 1
++fi
++umask 077
++exec 9>>"$lock" || exit 1
++[[ -f "$lock" && ! -L "$lock" && "$(stat -c '%u' "$lock" 2>/dev/null)" == 0 ]] || exit 1
++path_id=$(stat -Lc '%d:%i' "$lock" 2>/dev/null) || exit 1
++fd_id=$(stat -Lc '%d:%i' "/proc/$$/fd/9" 2>/dev/null) || exit 1
++[[ "$path_id" == "$fd_id" ]] || exit 1
++flock -n 9 || exit 0
++
++status=0
++if command -v systemctl >/dev/null 2>&1; then
++    for unit in xray sing-box; do
++        systemctl is-active --quiet "$unit.service" 2>/dev/null || continue
++        systemctl restart "$unit.service" >/dev/null 2>&1 || status=1
++    done
++elif command -v rc-service >/dev/null 2>&1; then
++    for service in xray sing-box; do
++        [[ -e "/etc/init.d/$service" ]] || continue
++        rc-service "$service" status >/dev/null 2>&1 || continue
++        rc-service "$service" restart >/dev/null 2>&1 || status=1
++    done
++fi
++exit "$status"
++RESTART_HELPER
++    bash -n "$tmp" || {
++        rm -f -- "$tmp"
++        return 1
++    }
++    _xray_publish_managed_definition "$tmp" "$target" 0755 || {
++        rm -f -- "$tmp"
++        return 1
++    }
++}
++
+@@ -2531,0 +4613,2 @@
++    [[ "$XRAY_LIFECYCLE_LOCK" == "$XRAY_PRODUCTION_LIFECYCLE_LOCK" ]] || return 1
++    install_xray_restart_helper || return 1
+@@ -2540 +4623 @@
+-ExecStart=/bin/sh -c 'for u in xray sing-box; do systemctl try-restart "\$u".service 2>/dev/null; done; true'
++ExecStart=$XRAY_RESTART_HELPER
+@@ -2565,0 +4649 @@
++    [[ "$XRAY_LIFECYCLE_LOCK" == "$XRAY_PRODUCTION_LIFECYCLE_LOCK" ]] || return 1
+@@ -2572,9 +4656,2 @@
+-    # 重启所有在用的代理内核（Xray 和/或 sing-box），而不仅是 Xray
+-    local restart_cmd
+-    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+-        restart_cmd="/bin/sh -c 'for s in xray sing-box; do [ -e /etc/init.d/\$s ] && rc-service \$s restart; done'"
+-    else
+-        restart_cmd="/bin/sh -c 'for u in xray sing-box; do systemctl try-restart \"\$u\".service 2>/dev/null; done'"
+-    fi
+-
+-    local cron_line="$cron_expr $restart_cmd >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
++    install_xray_restart_helper || return 1
++    local cron_line="$cron_expr $XRAY_RESTART_HELPER >/dev/null 2>&1 $XRAY_RESTART_CRON_MARKER"
+@@ -2622,0 +4700,4 @@
++    # Publish the validated fixed-path lock helper before disturbing an existing
++    # schedule, so helper creation failure leaves the current schedule intact.
++    install_xray_restart_helper || return 1
++
+@@ -2690 +4771,2 @@
+-            if [[ -z "$custom_cron" ]] || [[ $(echo "$custom_cron" | awk '{print NF}') -ne 5 ]]; then
++            if [[ -z "$custom_cron" || ! "$custom_cron" =~ ^[0-9*/?,[:space:]-]+$ ]] \
++                || [[ $(awk '{print NF}' <<< "$custom_cron") -ne 5 ]]; then
+@@ -8155,0 +10238 @@
++        echo -e "  ${GREEN}9.${NC} $(msg xray_release_title)"
+@@ -8158 +10241 @@
+-        echo -e "  ${GREEN}9.${NC} 安装独立工具命令"
++        echo -e "  ${GREEN}10.${NC} 安装独立工具命令"
+@@ -8162 +10245 @@
+-        echo -n "  $(msg menu_choice) [0-9]: "
++        echo -n "  $(msg menu_choice) [0-10]: "
+@@ -8174 +10257,2 @@
+-            9)
++            9) cmd_xray_release_menu ;;
++            10)
+@@ -8343,0 +10428,2 @@
++    echo "  xray-version  Show installed/stable/prerelease Xray versions"
++    echo "  xray-update   Safely update Xray with config test and rollback"
+@@ -8381,0 +10468,6 @@
++    echo "Xray release management:"
++    echo "  XRAY_CHANNEL=stable|prerelease  Select the release channel (default: stable)"
++    echo "  XRAY_VERSION=v26.7.11           Install an explicit Xray version (highest priority)"
++    echo "  xray_channel=stable|prerelease  Lowercase compatibility alias"
++    echo "  xray_version=v26.7.11           Lowercase compatibility alias"
++    echo ""
+@@ -8393,0 +10486,2 @@
++    echo "  XRAY_CHANNEL=prerelease bash $0 xray-update  # Update including prereleases"
++    echo "  XRAY_VERSION=v26.7.11 bash $0 xray-update    # Install a specified Xray version"
+@@ -8511,0 +10606,7 @@
++        ;;
++    xray-version)
++        cmd_xray_version
++        ;;
++    xray-update)
++        check_lock_for_write_ops
++        cmd_xray_update

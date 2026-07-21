@@ -8,6 +8,7 @@ BUNDLE_FILE="$ROOT_DIR/dist/proxy-hub.bundle.sh"
 MODULES=(
     00_security_state.sh
     10_runtime_platform_ui.sh
+    15_xray_release.sh
     20_installers_restart.sh
     30_provision_network.sh
     40_config_share.sh

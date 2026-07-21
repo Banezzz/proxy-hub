@@ -40,6 +40,7 @@ refresh_local_manifest() {
     local -a modules=(
         00_security_state.sh
         10_runtime_platform_ui.sh
+        15_xray_release.sh
         20_installers_restart.sh
         30_provision_network.sh
         40_config_share.sh
@@ -341,7 +342,7 @@ case_dir=$(mutate_trailer_case trailer-build-id '^# build-id=[0-9a-f]*$' '# buil
 rc=$(run_remote_failure "$case_dir" ok main)
 assert_failed_before_main "bundle build-id mismatch" "$case_dir" "$rc"
 
-case_dir=$(mutate_trailer_case trailer-module-count 'module-count=10' 'module-count=9')
+case_dir=$(mutate_trailer_case trailer-module-count 'module-count=11' 'module-count=10')
 rc=$(run_remote_failure "$case_dir" ok main)
 assert_failed_before_main "bundle module count mismatch" "$case_dir" "$rc"
 
@@ -418,7 +419,7 @@ new_body_sha=$(sha256_file "$syntax_body")
     printf '# header-bytes=%s header-sha256=%s\n' "$header_bytes" "$header_sha"
     printf '# body-bytes=%s body-sha256=%s\n' "$new_body_bytes" "$new_body_sha"
     printf '# build-id=%s\n' "$new_body_sha"
-    printf '%s\n' '# module-count=10'
+    printf '%s\n' '# module-count=11'
     printf '%s\n' '# proxy-hub-bundle-end-v1'
 } >"$case_dir/assets/proxy-hub.bundle.sh"
 rc=$(run_remote_failure "$case_dir" ok main)

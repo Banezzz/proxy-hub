@@ -668,6 +668,71 @@ service_stop() {
     fi
 }
 
+# Strict variants are used by transactional lifecycle operations that must
+# distinguish a real service-manager failure from an already-stopped service.
+service_start_strict() {
+    local svc="$1"
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service "$svc" start
+    else
+        systemctl start "$svc"
+    fi
+}
+
+service_stop_strict() {
+    local svc="$1"
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service "$svc" stop
+    else
+        systemctl stop "$svc"
+    fi
+}
+
+openrc_service_pidfile() {
+    local svc="$1" script="${2:-/etc/init.d/$1}" line value="" count=0
+    [[ -f "$script" && ! -L "$script" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*pidfile=(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            ((++count))
+        fi
+    done < "$script"
+    [[ "$count" == 1 ]] || return 1
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    value="${value//'${RC_SVCNAME}'/$svc}"
+    value="${value//'$RC_SVCNAME'/$svc}"
+    [[ "$value" =~ ^/[A-Za-z0-9_./-]+$ && "$value" != *'..'* ]] || return 1
+    printf '%s\n' "$value"
+}
+
+service_main_pid() {
+    local svc="$1" pid pidfile
+    local -a pids=()
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        pidfile=$(openrc_service_pidfile "$svc" 2>/dev/null || true)
+        if [[ -n "$pidfile" && -f "$pidfile" && ! -L "$pidfile" ]]; then
+            IFS= read -r pid < "$pidfile" || return 1
+        else
+            if [[ "$svc" == xray ]] && declare -F xray_list_process_ids >/dev/null; then
+                mapfile -t pids < <(xray_list_process_ids)
+            else
+                mapfile -t pids < <(pgrep -x "$svc" 2>/dev/null || true)
+            fi
+            [[ ${#pids[@]} -eq 1 ]] || return 1
+            pid="${pids[0]}"
+        fi
+    else
+        pid=$(systemctl show --property MainPID --value "$svc" 2>/dev/null) || return 1
+    fi
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
 # 重启服务
 service_restart() {
     local svc="$1"
@@ -913,6 +978,17 @@ msg() {
             "xray_restart_action_set") echo "Enable / Modify schedule" ;;
             "xray_restart_action_disable") echo "Disable periodic restart" ;;
             "xray_restart_back") echo "Back" ;;
+            "xray_release_title") echo "Xray Version / Update" ;;
+            "xray_release_show_status") echo "Show version status" ;;
+            "xray_release_update_stable") echo "Update to latest stable" ;;
+            "xray_release_update_latest") echo "Update to latest release including prerelease" ;;
+            "xray_release_install_version") echo "Install specified version" ;;
+            "xray_release_latest_stable") echo "Latest stable" ;;
+            "xray_release_latest_all") echo "Latest release, including prerelease" ;;
+            "xray_release_specify") echo "Specify version" ;;
+            "xray_release_version_prompt") echo "Xray version (for example v26.7.11)" ;;
+            "xray_release_cancel") echo "Cancel" ;;
+            "xray_release_back") echo "Back" ;;
             *) echo "$key" ;;
         esac
     else
@@ -1101,6 +1177,17 @@ msg() {
             "xray_restart_action_set") echo "启用 / 修改计划" ;;
             "xray_restart_action_disable") echo "禁用定时重启" ;;
             "xray_restart_back") echo "返回" ;;
+            "xray_release_title") echo "Xray 版本 / 更新" ;;
+            "xray_release_show_status") echo "显示版本状态" ;;
+            "xray_release_update_stable") echo "更新到最新稳定版" ;;
+            "xray_release_update_latest") echo "更新到最新版本（含预发布版）" ;;
+            "xray_release_install_version") echo "安装指定版本" ;;
+            "xray_release_latest_stable") echo "最新稳定版" ;;
+            "xray_release_latest_all") echo "最新版本（含预发布版）" ;;
+            "xray_release_specify") echo "指定版本" ;;
+            "xray_release_version_prompt") echo "Xray 版本（例如 v26.7.11）" ;;
+            "xray_release_cancel") echo "取消" ;;
+            "xray_release_back") echo "返回" ;;
             *) echo "$key" ;;
         esac
     fi
@@ -1315,4 +1402,62 @@ select_language() {
             ;;
     esac
     save_lang
+}
+
+# Resolve a temporary parent that cannot be renamed by an unrelated user:
+# either a private directory owned by this process UID or a root-owned sticky
+# directory such as /tmp.
+secure_resolve_tmp_parent() {
+    local candidate="${1:-${TMPDIR:-/tmp}}" resolved current owner mode
+    [[ "$candidate" != *$'\n'* && "$candidate" != *$'\r'* &&
+       -d "$candidate" && ! -L "$candidate" && -w "$candidate" ]] || return 1
+    resolved=$(cd -P -- "$candidate" 2>/dev/null && pwd) || return 1
+    current="$resolved"
+    while :; do
+        [[ -d "$current" && ! -L "$current" ]] || return 1
+        owner=$(stat -c '%u' "$current" 2>/dev/null) || return 1
+        mode=$(stat -c '%a' "$current" 2>/dev/null) || return 1
+        [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+        if [[ "$owner" == "$EUID" || "$owner" == 0 ]] && (((8#$mode & 022) == 0)); then
+            :
+        elif [[ "$owner" == 0 ]] && (((8#$mode & 01000) != 0)); then
+            :
+        else
+            return 1
+        fi
+        [[ "$current" == / ]] && break
+        current=$(dirname "$current") || return 1
+    done
+    SECURE_TMP_PARENT="$resolved"
+}
+
+identity_bound_tmp_create() {
+    local parent="$1" prefix="$2" path owner identity
+    [[ "$prefix" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    secure_resolve_tmp_parent "$parent" || return 1
+    parent="$SECURE_TMP_PARENT"
+    path=$(mktemp -d "${parent%/}/${prefix}XXXXXXXX") || return 1
+    [[ -d "$path" && ! -L "$path" ]] || { rmdir -- "$path" 2>/dev/null || true; return 1; }
+    owner=$(stat -c '%u' "$path" 2>/dev/null) || { rmdir -- "$path"; return 1; }
+    [[ "$owner" == "$EUID" ]] || { rmdir -- "$path"; return 1; }
+    chmod 0700 "$path" || { rmdir -- "$path"; return 1; }
+    identity=$(stat -c '%d:%i' "$path" 2>/dev/null) || { rmdir -- "$path"; return 1; }
+    IDENTITY_TMP_PATH="$path"
+    IDENTITY_TMP_ID="$identity"
+    IDENTITY_TMP_PARENT="$parent"
+}
+
+identity_bound_tmp_intact() {
+    local path="$1" expected_id="$2" parent="$3" prefix="$4" owner current_id
+    [[ "$path" == "${parent%/}/${prefix}"* && -d "$path" && ! -L "$path" ]] || return 1
+    owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
+    current_id=$(stat -c '%d:%i' "$path" 2>/dev/null) || return 1
+    [[ "$owner" == "$EUID" && "$current_id" == "$expected_id" ]]
+}
+
+identity_bound_tmp_cleanup() {
+    local path="$1" expected_id="$2" parent="$3" prefix="$4"
+    [[ -n "$path" ]] || return 0
+    identity_bound_tmp_intact "$path" "$expected_id" "$parent" "$prefix" || return 1
+    rm -rf -- "$path"
 }
