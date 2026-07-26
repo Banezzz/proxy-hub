@@ -223,6 +223,85 @@ run_lock_scenario signal-releases-owned-lock '
     bash -c "set -euo pipefail; source /mnt/lib/00_security_state.sh; lock_acquire_smart; lock_release_smart"
 '
 
+run_lock_scenario hup-releases-owned-lock '
+    set -euo pipefail
+    rm -f -- /srv/lock.ready
+    setsid bash -c '\''
+        set -euo pipefail
+        export TMPDIR=/srv/tmp
+        source /mnt/lib/00_security_state.sh
+        source /mnt/lib/10_runtime_platform_ui.sh
+        lock_acquire_smart
+        printf "%s\n" "$LOCK_DIR" > /srv/lock.ready
+        while :; do sleep 0.1; done
+    '\'' &
+    child=$!
+    for _ in $(seq 1 100); do
+        [[ -s /srv/lock.ready ]] && break
+        sleep 0.02
+    done
+    [[ -s /srv/lock.ready ]]
+    lock_dir=$(cat /srv/lock.ready)
+    kill -HUP -- "-$child"
+    for _ in $(seq 1 100); do
+        ! kill -0 "$child" 2>/dev/null && break
+        sleep 0.02
+    done
+    ! kill -0 "$child" 2>/dev/null
+    child_rc=0
+    wait "$child" || child_rc=$?
+    [[ "$child_rc" -eq 129 ]]
+    [[ ! -d "$lock_dir" ]]
+    [[ -f /srv/tmp/tmp.foreign/keep ]]
+    bash -c "set -euo pipefail; source /mnt/lib/00_security_state.sh; lock_acquire_smart; lock_release_smart"
+'
+
+run_lock_scenario stale-owner-diagnosed-not-reclaimed '
+    set -euo pipefail
+    source /mnt/lib/00_security_state.sh
+    lock_acquire_smart
+
+    # The recorded PID is this process and reads back as alive.
+    [[ "$(lock_recorded_pid)" == "$$" ]]
+    lock_pid_liveness "$$"
+
+    # A provably-dead PID is classified stale (return 1) but the lock is left
+    # intact: diagnostics never auto-reclaim (docs/audits.md).
+    dead=4000000
+    while [[ -e "/proc/$dead" ]]; do dead=$((dead + 1)); done
+    printf "%s\n" "$dead" > "$PID_FILE"
+    liveness=0
+    lock_pid_liveness "$dead" || liveness=$?
+    [[ "$liveness" -eq 1 ]]
+    [[ "$(lock_recorded_pid)" == "$dead" ]]
+    [[ -d "$LOCK_DIR" && -f "$PID_FILE" && -f "$LOCK_OWNER_FILE" ]]
+
+    # Malformed metadata is rejected and unparseable PIDs are indeterminate (2).
+    printf "not-a-pid\n" > "$PID_FILE"
+    if lock_recorded_pid >/dev/null; then
+        echo "malformed pid unexpectedly accepted" >&2
+        exit 1
+    fi
+    liveness=0
+    lock_pid_liveness "garbage" || liveness=$?
+    [[ "$liveness" -eq 2 ]]
+
+    # A symlinked PID file is refused even when its target is a live PID.
+    rm -f -- "$PID_FILE"
+    printf "%s\n" "$$" > /srv/real-pid
+    ln -s /srv/real-pid "$PID_FILE"
+    if lock_recorded_pid >/dev/null; then
+        echo "symlinked pid file unexpectedly accepted" >&2
+        exit 1
+    fi
+
+    # Restore well-formed metadata so the owner can release its own lock.
+    rm -f -- "$PID_FILE"
+    printf "%s\n" "$$" > "$PID_FILE"
+    lock_release_smart
+    [[ ! -d "$LOCK_DIR" ]]
+'
+
 run_lock_scenario parent-term-waits-for-resistant-writer '
     set -euo pipefail
     rm -f -- /srv/resistant.ready /srv/resistant.pid /srv/resistant.log

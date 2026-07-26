@@ -310,7 +310,9 @@ HTTPS 提供传输完整性，但不是独立的发布者认证。若 manifest �
 device/inode identity；cleanup 只释放本进程取得且 identity/token 仍匹配的锁、
 只结束本 shell 拥有的后台进程树。锁发布临界区把 INT/TERM 记录为 pending，子进程
 忽略可捕获信号并原子创建目录、owner 与 PID 元数据，发布完成后才恢复并重新投递
-信号。INT/TERM cleanup 先完成或验证 SSH rollback，再对其他后台进程树 TERM、有界
+信号。交互主流程对 INT、TERM 与 HUP 使用同一条 cleanup 路径，因此 `Ctrl+C`、
+被终止以及 SSH 断开或终端关闭（HUP 可捕获）都会释放写锁，而不是留下残留锁。
+INT/TERM/HUP cleanup 先完成或验证 SSH rollback，再对其他后台进程树 TERM、有界
 等待、必要时 KILL 并 reap，确认回滚与进程树都结束后才释放写锁，再重新发送
 原信号。进程身份由 PID 加 `/proc` start time 绑定；
 对可证明归属的进程组还绑定 leader start time，并在每轮从 `/proc` 重扫 PGID，捕获
@@ -338,9 +340,12 @@ owner、device/inode identity 均与创建时一致，且模板为
 删除该路径，因此无法与新版锁安全滚动共存。部署新版前必须停止并确认所有旧版
 进程退出，切换期间禁止再次启动旧版；这是一项发布门限，不宣称跨版本在线互斥。
 
-`SIGKILL` 无法执行 shell trap，因此会留下新版锁目录；当前实现
-不会根据 PID 自动接管 stale 锁，以免 PID reuse 或伪造元数据导致误删。管理员
-核实无写操作后需人工清理。该限制记录在 `docs/audits.md`。
+只有 `SIGKILL`、宿主机崩溃或断电无法执行 shell trap，才会留下新版锁目录（可捕获的
+INT/TERM/HUP 已经过 cleanup 释放）。当前实现仍不会根据 PID 自动接管 stale 锁，以免
+PID reuse 或伪造元数据导致误删；改为在获取写锁失败时做只读诊断：owner 进程仍存活则
+提示另有实例正在运行，`/proc` 可证明其已退出则判定为残留锁并打印“确认无写操作后可
+执行的精确删除命令”。诊断只读取 PID 与 `/proc`，从不移动、删除或接管锁；管理员据此
+核实无写操作后人工清理。该限制记录在 `docs/audits.md`。
 
 ## 构建与验证
 

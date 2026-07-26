@@ -324,7 +324,7 @@ cleanup() {
 
 cleanup_signal() {
     local signal="$1" fallback_status="$2"
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     cleanup
     kill -s "$signal" "$$" 2>/dev/null || exit "$fallback_status"
     exit "$fallback_status"
@@ -333,6 +333,9 @@ cleanup_signal() {
 trap cleanup EXIT
 trap 'cleanup_signal INT 130' INT
 trap 'cleanup_signal TERM 143' TERM
+# SIGHUP (SSH disconnect / terminal close) is catchable: release the write lock
+# through the same cleanup path as INT/TERM instead of dying and orphaning it.
+trap 'cleanup_signal HUP 129' HUP
 
 # ============== Spinner 动画执行器 ==============
 
@@ -892,6 +895,9 @@ msg() {
             "swap_size") echo "Swap Size" ;;
             "fail2ban_status") echo "Fail2ban Status" ;;
             "script_running") echo "Script is already running!" ;;
+            "lock_owner_alive") echo "Another instance appears to be running" ;;
+            "lock_stale_hint") echo "The recorded owner process is gone; the lock looks stale (left over from an unclean exit)" ;;
+            "lock_stale_action") echo "If no proxy-hub write operation is running, remove the stale lock with:" ;;
             "enable_xhttp") echo "Enable XHTTP protocol? (y/n)" ;;
             "xhttp_enabled") echo "XHTTP protocol enabled" ;;
             "detecting_ip") echo "Detecting server IP..." ;;
@@ -1091,6 +1097,9 @@ msg() {
             "swap_size") echo "Swap 大小" ;;
             "fail2ban_status") echo "Fail2ban 状态" ;;
             "script_running") echo "脚本已在运行中！" ;;
+            "lock_owner_alive") echo "检测到另一个实例正在运行" ;;
+            "lock_stale_hint") echo "锁记录的进程已不存在，可能是上次异常退出残留的锁" ;;
+            "lock_stale_action") echo "确认没有 proxy-hub 写操作在运行后，可用以下命令清理残留锁：" ;;
             "enable_xhttp") echo "是否启用 XHTTP 协议？(y/n)" ;;
             "xhttp_enabled") echo "XHTTP 协议已启用" ;;
             "detecting_ip") echo "检测服务器 IP..." ;;

@@ -1,8 +1,13 @@
 --- a/proxy-hub.sh
 +++ b/proxy-hub.sh
-@@ -18,2 +18,25 @@
+@@ -18,7 +18,24 @@
 -LOCK_DIR="/tmp/reality_vision_lock"
 -PID_FILE="$LOCK_DIR/pid"
+-
+-lock_acquire() {
+-    if mkdir "$LOCK_DIR" 2>/dev/null; then
+-        echo "$$" > "$PID_FILE"
+-        return 0
 +LOCK_PARENT=""
 +LOCK_DIR=""
 +PID_FILE=""
@@ -27,16 +32,7 @@
 +        :
 +    else
 +        return 1
-+    fi
-@@ -21,4 +44,3 @@
--lock_acquire() {
--    if mkdir "$LOCK_DIR" 2>/dev/null; then
--        echo "$$" > "$PID_FILE"
--        return 0
-+    LOCK_PARENT="${base_dir%/}/proxy-hub-${EUID}"
-+    if [[ ! -e "$LOCK_PARENT" ]]; then
-+        (umask 077; mkdir -m 700 "$LOCK_PARENT") 2>/dev/null || return 1
-@@ -26,11 +48,92 @@
+@@ -26,11 +43,4 @@
 -    # 检查持有锁的进程是否还活着
 -    if [[ -f "$PID_FILE" ]]; then
 -        local old_pid
@@ -49,6 +45,12 @@
 -            return 0
 -        fi
 +
++    LOCK_PARENT="${base_dir%/}/proxy-hub-${EUID}"
++    if [[ ! -e "$LOCK_PARENT" ]]; then
++        (umask 077; mkdir -m 700 "$LOCK_PARENT") 2>/dev/null || return 1
+@@ -38 +48,11 @@
+-    return 1
++
 +    [[ -d "$LOCK_PARENT" && ! -L "$LOCK_PARENT" ]] || return 1
 +    owner=$(stat -c '%u' "$LOCK_PARENT" 2>/dev/null) || return 1
 +    mode=$(stat -c '%a' "$LOCK_PARENT" 2>/dev/null) || return 1
@@ -59,15 +61,19 @@
 +    PID_FILE="$LOCK_DIR/pid"
 +    LOCK_OWNER_FILE="$LOCK_DIR/owner"
 +    LOCK_FILE=""
-+}
-+
+@@ -41,2 +61,2 @@
+-lock_release() {
+-    rm -rf "$LOCK_DIR" 2>/dev/null
 +lock_dir_identity() {
 +    stat -c '%d:%i' "$1" 2>/dev/null
-+}
-+
+@@ -45 +65,2 @@
+-# ============== Security Helper Functions ==============
 +lock_acquire() {
 +    local candidate_token dir_id="" pending_signal rc=1 saved_int saved_term
-+
+@@ -47,3 +68,28 @@
+-# Atomic lock using flock (preferred) with mkdir fallback
+-LOCK_FILE="/var/lock/reality_vision.lock"
+-LOCK_FD=200
 +    [[ -z "$LOCK_HELD_METHOD" ]] || return 1
 +    lock_prepare_parent || return 1
 +    candidate_token="${EUID}-$$-${RANDOM}-${RANDOM}"
@@ -96,7 +102,14 @@
 +                rmdir "$LOCK_DIR" 2>/dev/null || true
 +            fi
 +        }
-+
+@@ -51,7 +97,43 @@
+-# Try flock-based locking first (atomic, no TOCTOU race)
+-lock_acquire_flock() {
+-    # Create lock file directory if needed
+-    local lock_dir
+-    lock_dir=$(dirname "$LOCK_FILE")
+-    if [[ ! -d "$lock_dir" ]]; then
+-        LOCK_FILE="/tmp/reality_vision.lock"
 +        mkdir "$LOCK_DIR" 2>/dev/null || exit 1
 +        candidate_id=$(lock_dir_identity "$LOCK_DIR") || {
 +            cleanup_candidate
@@ -140,11 +153,18 @@
 +    LOCK_SIGNAL_PENDING=""
 +    if [[ -n "$pending_signal" ]]; then
 +        kill -s "$pending_signal" "$$" 2>/dev/null || true
-@@ -38 +141 @@
--    return 1
+@@ -58,0 +141,2 @@
 +    return "$rc"
-@@ -42 +145,15 @@
--    rm -rf "$LOCK_DIR" 2>/dev/null
++}
+@@ -60,7 +144,45 @@
+-    # Open lock file descriptor
+-    exec 200>"$LOCK_FILE" || return 1
+-
+-    # Try non-blocking lock
+-    if flock -n 200; then
+-        echo "$$" >&200
+-        return 0
++lock_release() {
 +    local owner_token=""
 +
 +    [[ "$LOCK_HELD_METHOD" == "mkdir" && -n "$LOCK_DIR_ID" && -n "$LOCK_TOKEN" ]] || return 0
@@ -160,61 +180,76 @@
 +    LOCK_HELD_METHOD=""
 +    LOCK_TOKEN=""
 +    LOCK_DIR_ID=""
-@@ -47,5 +164,2 @@
--# Atomic lock using flock (preferred) with mkdir fallback
--LOCK_FILE="/var/lock/reality_vision.lock"
--LOCK_FD=200
--
--# Try flock-based locking first (atomic, no TOCTOU race)
++}
++
++# ---------------- Stale-lock diagnostics (read-only) ----------------
++# These helpers never modify, remove, or steal the lock. Per docs/audits.md the
++# lock is deliberately not auto-reclaimed from PID metadata (PID reuse / forged
++# metadata risk); they only let a caller tell a human whether the recorded owner
++# is still alive, so manual recovery becomes a single obvious command.
++
++# Print the PID recorded in the current lock, or return non-zero when the lock
++# metadata is missing, unreadable, a symlink, or malformed.
++lock_recorded_pid() {
++    local pid=""
++    [[ -n "${PID_FILE:-}" && -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
++    IFS= read -r pid < "$PID_FILE" 2>/dev/null || return 1
++    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
++    printf '%s\n' "$pid"
++}
++
++# Classify a recorded owner PID without touching the lock:
++#   0 -> still alive (a real instance may be running)
++#   1 -> provably gone (the lock is stale)
++#   2 -> liveness cannot be determined; treat conservatively as maybe-alive
++lock_pid_liveness() {
++    local pid="${1:-}"
++    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
++    [[ "$pid" == "$$" ]] && return 0
++    if [[ -d /proc/self ]]; then
++        [[ -e "/proc/$pid" ]] && return 0
++        return 1
+@@ -68 +190,10 @@
+-    return 1
++    kill -0 "$pid" 2>/dev/null && return 0
++    return 2
++}
++
++# ============== Security Helper Functions ==============
++
 +# Compatibility names intentionally use the same mkdir exclusion domain. A
 +# separate flock file would allow mixed-mode processes to write concurrently.
-@@ -53,16 +167 @@
--    # Create lock file directory if needed
--    local lock_dir
--    lock_dir=$(dirname "$LOCK_FILE")
--    if [[ ! -d "$lock_dir" ]]; then
--        LOCK_FILE="/tmp/reality_vision.lock"
--    fi
--
--    # Open lock file descriptor
--    exec 200>"$LOCK_FILE" || return 1
--
--    # Try non-blocking lock
--    if flock -n 200; then
--        echo "$$" >&200
--        return 0
--    fi
--    return 1
++lock_acquire_flock() {
 +    lock_acquire
-@@ -72,2 +171 @@
+@@ -72,2 +203 @@
 -    flock -u 200 2>/dev/null || true
 -    exec 200>&- 2>/dev/null || true
 +    lock_release
-@@ -76 +174 @@
+@@ -76 +206 @@
 -# Smart lock acquire: use flock if available, fallback to mkdir
 +# All current entry points acquire the same private mkdir lock.
-@@ -78,5 +176 @@
+@@ -78,5 +208 @@
 -    if command -v flock &>/dev/null; then
 -        lock_acquire_flock
 -    else
 -        lock_acquire
 -    fi
 +    lock_acquire
-@@ -86,4 +180 @@
+@@ -86,4 +212 @@
 -    if command -v flock &>/dev/null; then
 -        lock_release_flock
 -    fi
 -    lock_release  # Always clean up mkdir lock too
 +    lock_release
-@@ -198 +289 @@
+@@ -198 +321 @@
 -#                 SS_METHOD, SS_PASSWORD
 +#                 SS_METHOD, SS_PASSWORD, ANYTLS_PASSWORD, HY2_PASSWORD
-@@ -207 +298 @@
+@@ -207 +330 @@
 -    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD=""
 +    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD="" HY2_PASSWORD=""
-@@ -225,0 +317 @@
+@@ -225,0 +349 @@
 +    HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
-@@ -441,0 +534,64 @@
+@@ -441,0 +566,64 @@
 +# Validate a TLS server name before it is written to JSON or a share URI.
 +# IPv4 literals are accepted; empty labels, URI delimiters, and overlong labels
 +# are rejected. Hysteria2 uses this value as TLS SNI, so IPv6 literals are not
@@ -279,10 +314,10 @@
 +        }'
 +}
 +
-@@ -498 +654 @@
+@@ -498 +686 @@
 -# sing-box（用于 AnyTLS / AnyTLS + REALITY 协议，Xray 暂不支持 AnyTLS）
 +# sing-box（用于 AnyTLS / AnyTLS + REALITY / Hysteria2）
-@@ -665,0 +822,292 @@
+@@ -665,0 +854,292 @@
 +declare -a CLEANUP_JOB_ROOTS=()
 +declare -a CLEANUP_TREE_PIDS=()
 +declare -A CLEANUP_TREE_SEEN=()
@@ -575,9 +610,9 @@
 +    return 1
 +}
 +
-@@ -667,0 +1116 @@
+@@ -667,0 +1148 @@
 +    local jobs_stopped=0 rollback_safe=1
-@@ -670,6 +1119,23 @@
+@@ -670,6 +1151,23 @@
 -    # 终止所有后台作业
 -    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
 -    # 清理可能残留的临时目录
@@ -607,12 +642,12 @@
 +    else
 +        printf 'proxy-hub: cleanup could not prove quiescence and rollback completion; retaining the write lock\n' >&2
 +    fi
-@@ -677 +1143,12 @@
+@@ -677 +1175,15 @@
 -trap cleanup EXIT INT TERM
 +
 +cleanup_signal() {
 +    local signal="$1" fallback_status="$2"
-+    trap - EXIT INT TERM
++    trap - EXIT INT TERM HUP
 +    cleanup
 +    kill -s "$signal" "$$" 2>/dev/null || exit "$fallback_status"
 +    exit "$fallback_status"
@@ -621,17 +656,28 @@
 +trap cleanup EXIT
 +trap 'cleanup_signal INT 130' INT
 +trap 'cleanup_signal TERM 143' TERM
-@@ -1193 +1670 @@
++# SIGHUP (SSH disconnect / terminal close) is catchable: release the write lock
++# through the same cleanup path as INT/TERM instead of dying and orphaning it.
++trap 'cleanup_signal HUP 129' HUP
+@@ -1171,0 +1684,3 @@
++            "lock_owner_alive") echo "Another instance appears to be running" ;;
++            "lock_stale_hint") echo "The recorded owner process is gone; the lock looks stale (left over from an unclean exit)" ;;
++            "lock_stale_action") echo "If no proxy-hub write operation is running, remove the stale lock with:" ;;
+@@ -1193 +1708 @@
 -            "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Install time sync now? (y/n)" ;;
 +            "timesync_ss2022_hint") echo "SS2022 requires accurate system time. Choose how to verify or enable synchronization." ;;
-@@ -1216,0 +1694 @@
+@@ -1216,0 +1732 @@
 +            "timesync_skip") echo "Skip" ;;
-@@ -1380 +1858 @@
+@@ -1358,0 +1875,3 @@
++            "lock_owner_alive") echo "检测到另一个实例正在运行" ;;
++            "lock_stale_hint") echo "锁记录的进程已不存在，可能是上次异常退出残留的锁" ;;
++            "lock_stale_action") echo "确认没有 proxy-hub 写操作在运行后，可用以下命令清理残留锁：" ;;
+@@ -1380 +1899 @@
 -            "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，是否立即安装时间同步？(y/n)" ;;
 +            "timesync_ss2022_hint") echo "SS2022 需要精确的系统时间，请选择校验或启用时间同步。" ;;
-@@ -1403,0 +1882 @@
+@@ -1403,0 +1923 @@
 +            "timesync_skip") echo "跳过" ;;
-@@ -1457,2 +1936,18 @@
+@@ -1457,2 +1977,18 @@
 -    # 更精确的端口匹配：检查 :port 结尾，避免 80 匹配 8080
 -    ! ss -lnt | awk '{print $4}' | grep -qE ":${port}$"
 +    local transport="${2:-tcp}"
@@ -652,43 +698,43 @@
 +    fi
 +
 +    ! $tcp_busy && ! $udp_busy
-@@ -1568,0 +2064,3 @@
+@@ -1568,0 +2105,3 @@
 +        elif [[ "$proto" == "hysteria2" ]]; then
 +            display_port="${PORT:-N/A} (UDP)"
 +            display_info="Hysteria2"
-@@ -1809 +2307 @@
+@@ -1809 +2348 @@
 -# ============== sing-box 安装（AnyTLS 支持） ==============
 +# ============== sing-box 安装（AnyTLS / Hysteria2 支持） ==============
-@@ -1815 +2313 @@
+@@ -1815 +2354 @@
 -Description=sing-box service (AnyTLS)
 +Description=sing-box service (AnyTLS / Hysteria2)
-@@ -1838 +2336 @@
+@@ -1838 +2377 @@
 -description="sing-box service (AnyTLS)"
 +description="sing-box service (AnyTLS / Hysteria2)"
-@@ -1856 +2354 @@
+@@ -1856 +2395 @@
 -# AnyTLS 协议需要 sing-box >= 1.12.0
 +# AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
-@@ -1863 +2361 @@
+@@ -1863 +2402 @@
 -    log_info "Installing sing-box (required for AnyTLS)..."
 +    log_info "Installing sing-box (required for AnyTLS / Hysteria2)..."
-@@ -2337 +2835 @@
+@@ -2337 +2876 @@
 -# 协议类型: vision, xhttp, both, shadowsocks
 +# 协议类型: vision, xhttp, both, shadowsocks, anytls, anytls_reality, hysteria2
-@@ -2349,0 +2848,3 @@
+@@ -2349,0 +2889,3 @@
 +# Hysteria2 相关变量（由 sing-box 承载）
 +HY2_PASSWORD=""
 +
-@@ -2373,0 +2875 @@
+@@ -2373,0 +2916 @@
 +    echo -e "  ${GREEN}7.${NC} Hysteria2                ${GRAY}(sing-box, QUIC/UDP)${NC}"
-@@ -2375 +2877 @@
+@@ -2375 +2918 @@
 -    echo -n "  请选择 [1-6] (默认 1): "
 +    echo -n "  请选择 [1-7] (默认 1): "
-@@ -2401,0 +2904,4 @@
+@@ -2401,0 +2945,4 @@
 +        7)
 +            PROTOCOL_TYPE="hysteria2"
 +            log_info "已选择: Hysteria2"
 +            ;;
-@@ -2467,0 +2974,16 @@
+@@ -2467,0 +3015,16 @@
 +# Hysteria2 authentication is embedded in config and URI output. Restrict it
 +# to the URI-unreserved subset so user input cannot alter either structure.
 +validate_hy2_password() {
@@ -705,17 +751,17 @@
 +    log_info "Hysteria2 密码已生成"
 +}
 +
-@@ -2474,0 +2997 @@
+@@ -2474,0 +3038 @@
 +    local transport="${2:-tcp}"
-@@ -2478 +3001 @@
+@@ -2478 +3042 @@
 -        if is_port_free "$port" && [[ "$port" != "$exclude_port" ]]; then
 +        if is_port_free "$port" "$transport" && [[ "$port" != "$exclude_port" ]]; then
-@@ -2490,0 +3014 @@
+@@ -2490,0 +3055 @@
 +    local transport="${4:-tcp}"
-@@ -2522 +3046 @@
+@@ -2522 +3087 @@
 -        if ! is_port_free "$user_port"; then
 +        if ! is_port_free "$user_port" "$transport"; then
-@@ -2585,0 +3110,19 @@
+@@ -2585,0 +3151,19 @@
 +    # Hysteria2 使用 QUIC/UDP，端口占用检查必须查询 UDP socket。
 +    if [[ "$PROTOCOL_TYPE" == "hysteria2" ]]; then
 +        if [[ -n "${hy2pt:-}" ]]; then
@@ -735,7 +781,7 @@
 +        return 0
 +    fi
 +
-@@ -2761,0 +3305,27 @@
+@@ -2761,0 +3346,27 @@
 +# 统计由 sing-box 承载的节点数量（AnyTLS 与 Hysteria2）。
 +singbox_node_count() {
 +    local count=0 f t
@@ -763,28 +809,28 @@
 +    echo "$count"
 +}
 +
-@@ -3497,2 +4067,2 @@
+@@ -3497,2 +4108,2 @@
 -        # AnyTLS 节点由 sing-box 处理，Xray 配置中跳过
 -        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" ]]; then
 +        # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
 +        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
-@@ -3665 +4235 @@
+@@ -3665 +4276 @@
 -# 根据所有 AnyTLS 节点生成 sing-box 配置文件
 +# 根据所有 AnyTLS / Hysteria2 节点生成 sing-box 配置文件
-@@ -3676 +4246 @@
+@@ -3676 +4287 @@
 -        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" ]] || continue
 +        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" || "$n_proto" == "hysteria2" ]] || continue
-@@ -3684 +4254,5 @@
+@@ -3684 +4295,5 @@
 -        n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
 +        if [[ "$n_proto" == "hysteria2" ]]; then
 +            n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
 +        else
 +            n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
 +        fi
-@@ -3696 +4270 @@
+@@ -3696 +4311 @@
 -            log_warn "Invalid AnyTLS port for node '$n_name', skipping"
 +            log_warn "Invalid sing-box port for node '$n_name', skipping"
-@@ -3700,4 +4274,19 @@
+@@ -3700,4 +4315,19 @@
 -        # 还原 padding scheme（base64 -> 多行文本）；缺失时即时生成一个随机方案
 -        n_pad=""
 -        if [[ -n "$n_pad_b64" ]]; then
@@ -808,42 +854,42 @@
 +                n_pad=$(echo "$n_pad_b64" | base64 -d 2>/dev/null)
 +            fi
 +            [[ -z "$n_pad" ]] && n_pad=$(gen_anytls_padding)
-@@ -3705 +4293,0 @@
+@@ -3705 +4334,0 @@
 -        [[ -z "$n_pad" ]] && n_pad=$(gen_anytls_padding)
-@@ -3707 +4294,0 @@
+@@ -3707 +4335,0 @@
 -        local inbound
-@@ -3711 +4298 @@
+@@ -3711 +4339 @@
 -        else
 +        elif [[ "$n_proto" == "anytls" ]]; then
-@@ -3723 +4310 @@
+@@ -3723 +4351 @@
 -            log_error "Failed to build AnyTLS inbound for node '$n_name'"
 +            log_error "Failed to build $n_proto inbound for node '$n_name'"
-@@ -3731 +4318 @@
+@@ -3731 +4359 @@
 -            log_error "Failed to add AnyTLS inbound for node '$n_name': $new_inbounds"
 +            log_error "Failed to add $n_proto inbound for node '$n_name': $new_inbounds"
-@@ -3760 +4347 @@
+@@ -3760 +4388 @@
 -# 同步 sing-box 状态：有 AnyTLS 节点则（安装并）写配置、启动服务；
 +# 同步 sing-box 状态：有 AnyTLS / Hysteria2 节点则（安装并）写配置、启动服务；
-@@ -3764 +4351 @@
+@@ -3764 +4392 @@
 -    count=$(anytls_node_count)
 +    count=$(singbox_node_count)
-@@ -3789 +4376,4 @@
+@@ -3789 +4417,4 @@
 -    service_restart "$SINGBOX_SERVICE"
 +    if ! service_restart "$SINGBOX_SERVICE"; then
 +        log_error "sing-box service restart failed"
 +        return 1
 +    fi
-@@ -3793 +4383,2 @@
+@@ -3793 +4424,2 @@
 -        log_warn "sing-box service may not have started correctly."
 +        log_error "sing-box service failed to become active"
 +        return 1
-@@ -3819,0 +4411 @@
+@@ -3819,0 +4452 @@
 +    local save_hy2_password="${HY2_PASSWORD:-}"
-@@ -3825,0 +4418 @@
+@@ -3825,0 +4459 @@
 +        [[ -n "$save_hy2_password" ]] && save_hy2_password=$(encrypt_value "$HY2_PASSWORD")
-@@ -3845,0 +4439 @@
+@@ -3845,0 +4480 @@
 +HY2_PASSWORD=$save_hy2_password
-@@ -3925,0 +4520,13 @@
+@@ -3925,0 +4561,13 @@
 +# 生成 Hysteria2 分享链接。密码被限制在 URI-unreserved 字符集内。
 +get_hy2_link() {
 +    local ip="$1"
@@ -857,16 +903,16 @@
 +    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +}
 +
-@@ -3933 +4540 @@
+@@ -3933 +4581 @@
 -    local ip="${SERVER_IPV4:-$SERVER_IP}"
 +    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
-@@ -3937 +4544,4 @@
+@@ -3937 +4585,4 @@
 -    if [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
 +    if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
 +        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
 +        get_hy2_link "$ip" "${node_label}_Hysteria2"
 +    elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
-@@ -3957,0 +4568,35 @@
+@@ -3957,0 +4609,35 @@
 +# 显示当前节点的全部二维码。get_share_link 保持单链接兼容契约；only
 +# the presentation path expands a `both` node into Vision + XHTTP.
 +show_node_qrcodes() {
@@ -902,9 +948,9 @@
 +    fi
 +}
 +
-@@ -4008,0 +4654 @@
+@@ -4008,0 +4695 @@
 +        hysteria2)       proto_label="Hysteria2" ;;
-@@ -4054,0 +4701,24 @@
+@@ -4054,0 +4742,24 @@
 +    elif [[ "$proto_type" == "hysteria2" ]]; then
 +        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
 +        echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
@@ -929,14 +975,14 @@
 +            echo -e "  ${YELLOW}Hysteria2:${NC}"
 +            echo -e "  $(get_hy2_link "$SERVER_IPV6" "${hostname}_Hysteria2_v6")"
 +        fi
-@@ -4165,5 +4835 @@
+@@ -4165,5 +4876 @@
 -        if [[ "$proto_type" == "vision" || "$proto_type" == "both" ]] && [[ -n "${PORT:-}" ]]; then
 -            echo -e "${YELLOW}$(get_vision_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}")${NC}"
 -        elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
 -            echo -e "${YELLOW}$(get_xhttp_link "$SERVER_IP" "${NODE_NAME:-RV-Reality}_XHTTP")${NC}"
 -        fi
 +        echo -e "${YELLOW}$(get_share_link)${NC}"
-@@ -4175,0 +4842,93 @@
+@@ -4175,0 +4883,93 @@
 +show_proxy_service_failure_logs() {
 +    local service_name="$1"
 +    local fallback_log="${2:-}"
@@ -1030,31 +1076,31 @@
 +    return 0
 +}
 +
-@@ -4191 +4950,5 @@
+@@ -4191 +4991,5 @@
 -        CURRENT_NODE_NAME="$name"
 +        CURRENT_NODE_NAME=$(printf '%s' "$name" | tr -cd 'a-zA-Z0-9_-')
 +        if [[ -z "$CURRENT_NODE_NAME" || "$CURRENT_NODE_NAME" != "$name" ]]; then
 +            log_error "Node name may contain only letters, numbers, underscore, and dash"
 +            return 1
 +        fi
-@@ -4197 +4960 @@
+@@ -4197 +5001 @@
 -            ((counter++))
 +            ((++counter))
-@@ -4206 +4969 @@
+@@ -4206 +5010 @@
 -        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality
 +        # 支持环境变量 proto=vision/xhttp/both/shadowsocks/ss/anytls/anytls-reality/hysteria2
-@@ -4212,0 +4976 @@
+@@ -4212,0 +5017 @@
 +            hysteria2|hy2) PROTOCOL_TYPE="hysteria2" ;;
-@@ -4226,2 +4990 @@
+@@ -4226,2 +5031 @@
 -    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS 用 sing-box
 -    # （sing-box 在下方 AnyTLS 分支中安装，便于复用安装失败的回滚处理）
 +    # 按所选协议安装对应内核：VLESS / Shadowsocks 用 Xray；AnyTLS / Hysteria2 用 sing-box。
-@@ -4229,2 +4992,2 @@
+@@ -4229,2 +5033,2 @@
 -        anytls|anytls_reality)
 -            : # sing-box 在 AnyTLS 分支中安装
 +        anytls|anytls_reality|hysteria2)
 +            : # sing-box 在对应协议分支中安装
-@@ -4264,0 +5028,21 @@
+@@ -4264,0 +5069,21 @@
 +        ANYTLS_PASSWORD=""
 +        ANYTLS_PADDING_B64=""
 +        HY2_PASSWORD=""
@@ -1076,13 +1122,13 @@
 +        SS_PASSWORD=""
 +        ANYTLS_PASSWORD=""
 +        ANYTLS_PADDING_B64=""
-@@ -4294,0 +5079 @@
+@@ -4294,0 +5120 @@
 +        HY2_PASSWORD=""
-@@ -4309,0 +5095,3 @@
+@@ -4309,0 +5136,3 @@
 +        ANYTLS_PASSWORD=""
 +        ANYTLS_PADDING_B64=""
 +        HY2_PASSWORD=""
-@@ -4317,5 +5105,9 @@
+@@ -4317,5 +5146,9 @@
 -    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 -        # AnyTLS 节点：由 sing-box 处理
 -        # plain AnyTLS 需要自签名证书
@@ -1097,7 +1143,7 @@
 +                    log_error "Manual recovery may be required for sing-box"
 +                return 1
 +            fi
-@@ -4325,6 +5117,4 @@
+@@ -4325,6 +5158,4 @@
 -            log_error "Failed to configure sing-box, rolling back..."
 -            local node_file
 -            node_file=$(get_node_file "$CURRENT_NODE_NAME")
@@ -1108,17 +1154,17 @@
 +            show_proxy_service_failure_logs "$SINGBOX_SERVICE" /var/log/sing-box.log
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +                log_error "Manual recovery may be required for sing-box"
-@@ -4332,0 +5123,2 @@
+@@ -4332,0 +5164,2 @@
 +
 +        open_node_firewall_ports "$PROTOCOL_TYPE"
-@@ -4337,4 +5129,2 @@
+@@ -4337,4 +5170,2 @@
 -            # 删除刚保存的节点配置
 -            local node_file
 -            node_file=$(get_node_file "$CURRENT_NODE_NAME")
 -            rm -f "$node_file" 2>/dev/null
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +                log_error "Manual recovery may be required for Xray"
-@@ -4345 +5135,7 @@
+@@ -4345 +5176,7 @@
 -        service_restart xray
 +        if ! service_restart xray; then
 +            log_error "Xray service restart failed after install"
@@ -1127,40 +1173,40 @@
 +                log_error "Manual recovery may be required for Xray"
 +            return 1
 +        fi
-@@ -4347 +5142,0 @@
+@@ -4347 +5183,0 @@
 -        # 验证服务启动成功
-@@ -4350 +5145,5 @@
+@@ -4350 +5186,5 @@
 -            log_warn "Xray service may not have started correctly. Run 'xray health' to check."
 +            log_error "Xray service failed to become active after install"
 +            show_proxy_service_failure_logs xray /var/log/xray/error.log
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +                log_error "Manual recovery may be required for Xray"
 +            return 1
-@@ -4351,0 +5151,2 @@
+@@ -4351,0 +5192,2 @@
 +
 +        open_node_firewall_ports "$PROTOCOL_TYPE"
-@@ -4358,4 +5159 @@
+@@ -4358,4 +5200 @@
 -    # 显示主要链接的二维码
 -    local link
 -    link=$(get_share_link)
 -    show_qrcode "$link"
 +    show_node_qrcodes
-@@ -4386,3 +5184 @@
+@@ -4386,3 +5225 @@
 -    local link
 -    link=$(get_share_link)
 -    show_qrcode "$link"
 +    show_node_qrcodes
-@@ -4417,0 +5214,2 @@
+@@ -4417,0 +5255,2 @@
 +        elif [[ "$proto" == "hysteria2" ]]; then
 +            display_port="${PORT:-N/A} (UDP)"
-@@ -4428,0 +5227,3 @@
+@@ -4428,0 +5268,3 @@
 +        elif [[ "$proto" == "hysteria2" ]]; then
 +            echo -e "     Port: $display_port | Type: Hysteria2"
 +            echo -e "     Password: ${HY2_PASSWORD:0:12}..."
-@@ -4443 +5244 @@
+@@ -4443 +5285 @@
 -        ((i++))
 +        ((++i))
-@@ -4456,4 +5257,6 @@
+@@ -4456,4 +5298,6 @@
 -    if service_is_active xray; then
 -        echo -e "  Xray: ${GREEN}● Running${NC}"
 -    else
@@ -1171,20 +1217,20 @@
 +        else
 +            echo -e "  Xray: ${RED}○ Stopped${NC}"
 +        fi
-@@ -4462,2 +5265 @@
+@@ -4462,2 +5306 @@
 -    # sing-box（AnyTLS）状态：仅在已安装时显示
 -    if [[ -f "$SINGBOX_BIN" ]]; then
 +    if [[ "$(singbox_node_count)" -gt 0 ]]; then
-@@ -4465 +5267 @@
+@@ -4465 +5308 @@
 -            echo -e "  sing-box (AnyTLS): ${GREEN}● Running${NC}"
 +            echo -e "  sing-box (AnyTLS/Hysteria2): ${GREEN}● Running${NC}"
-@@ -4467 +5269 @@
+@@ -4467 +5310 @@
 -            echo -e "  sing-box (AnyTLS): ${RED}○ Stopped${NC}"
 +            echo -e "  sing-box (AnyTLS/Hysteria2): ${RED}○ Stopped${NC}"
-@@ -4481 +5283 @@
+@@ -4481 +5324 @@
 -            local n_name n_port
 +            local n_name n_port n_proto
-@@ -4483 +5285,6 @@
+@@ -4483 +5326,6 @@
 -            n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
 +            n_port=$(safe_read_config_value "$node_file" "PORT")
 +            n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
@@ -1192,11 +1238,11 @@
 +                echo -e "    $n_name (UDP $n_port): Hysteria2"
 +                continue
 +            fi
-@@ -4491 +5298,2 @@
+@@ -4491 +5339,2 @@
 -    service_status xray
 +    [[ "$(xray_node_count)" -gt 0 ]] && service_status xray
 +    [[ "$(singbox_node_count)" -gt 0 ]] && service_status "$SINGBOX_SERVICE"
-@@ -4497 +5305,13 @@
+@@ -4497 +5346,13 @@
 -    service_restart xray
 +    local restarted=false
 +    if [[ "$(xray_node_count)" -gt 0 ]]; then
@@ -1211,18 +1257,18 @@
 +        log_error "No configured proxy nodes"
 +        return 1
 +    fi
-@@ -4503 +5323,4 @@
+@@ -4503 +5364,4 @@
 -    log_info "Regenerating Xray config from node files..."
 +    log_info "Regenerating proxy configs from node files..."
 +
 +    local xray_count
 +    xray_count=$(xray_node_count)
-@@ -4505,2 +5328,2 @@
+@@ -4505,2 +5369,2 @@
 -    # 备份当前配置
 -    if [[ -f "$XRAY_CONF" ]]; then
 +    # 仅在存在 Xray 节点时重建并验证 Xray；Hysteria2-only 不应依赖 Xray。
 +    if [[ "$xray_count" -gt 0 && -f "$XRAY_CONF" ]]; then
-@@ -4511,7 +5334,18 @@
+@@ -4511,7 +5375,18 @@
 -    # 重新生成配置
 -    if write_config; then
 -        log_info "Config regenerated successfully"
@@ -1248,14 +1294,14 @@
 +                fi
 +                return 1
 +            fi
-@@ -4519 +5353 @@
+@@ -4519 +5394 @@
 -            log_error "Xray service failed to start. Restoring backup..."
 +            log_error "Failed to regenerate Xray config"
-@@ -4520,0 +5355 @@
+@@ -4520,0 +5396 @@
 +                log_info "Restoring backup config..."
-@@ -4522 +5356,0 @@
+@@ -4522 +5397,0 @@
 -                service_restart xray
-@@ -4527,6 +5361 @@
+@@ -4527,6 +5402 @@
 -        log_error "Failed to regenerate config"
 -        if [[ -f "${XRAY_CONF}.bak" ]]; then
 -            log_info "Restoring backup config..."
@@ -1263,17 +1309,17 @@
 -        fi
 -        return 1
 +        service_stop xray
-@@ -4535 +5364 @@
+@@ -4535 +5405 @@
 -    # 同步 sing-box（AnyTLS）配置
 +    # 同步 sing-box（AnyTLS / Hysteria2）配置。
-@@ -4537 +5366,2 @@
+@@ -4537 +5407,2 @@
 -        log_warn "sing-box config sync failed"
 +        log_error "sing-box config sync failed"
 +        return 1
-@@ -4565 +5395 @@
+@@ -4565 +5436 @@
 -    # 清理可能存在的 AnyTLS 自签名证书
 +    # 清理可能存在的 AnyTLS / Hysteria2 自签名证书
-@@ -4569,6 +5399,4 @@
+@@ -4569,6 +5440,4 @@
 -    # 重新生成 xray 配置
 -    write_config
 -    service_restart xray
@@ -1284,19 +1330,19 @@
 +        log_error "Node removed, but the remaining proxy configuration could not be applied"
 +        return 1
 +    fi
-@@ -4591,0 +5420 @@
+@@ -4591,0 +5461 @@
 +    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-@@ -4636,0 +5466,5 @@
+@@ -4636,0 +5507,5 @@
 +            hysteria2)
 +                echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
 +                echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
 +                echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
 +                ;;
-@@ -4665,0 +5500,3 @@
+@@ -4665,0 +5541,3 @@
 +            hysteria2:1)
 +                PORT=$(prompt_port "新 UDP 端口 / New UDP port" "${PORT}" 0 udp)
 +                changed=true ;;
-@@ -4673,0 +5511,12 @@
+@@ -4673,0 +5552,12 @@
 +            hysteria2:2)
 +                local new_hy2_sni
 +                echo -n "  TLS SNI [${SNI:-www.bing.com}]: " >/dev/tty
@@ -1309,31 +1355,31 @@
 +                else
 +                    log_warn "Invalid TLS SNI"
 +                fi ;;
-@@ -4708,0 +5558,4 @@
+@@ -4708,0 +5599,4 @@
 +            hysteria2:3)
 +                unset hy2pwd
 +                gen_hy2_password
 +                changed=true ;;
-@@ -4731,3 +5584,3 @@
+@@ -4731,3 +5625,3 @@
 -    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
 -        # plain AnyTLS 改了 SNI：重新生成自签名证书（CN 跟随新 SNI）
 -        if [[ "$proto_type" == "anytls" ]] && $sni_changed; then
 +    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
 +        # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
 +        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
-@@ -4735 +5588 @@
+@@ -4735 +5629 @@
 -            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"
 +            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
-@@ -4740,0 +5594 @@
+@@ -4740,0 +5635 @@
 +        open_node_firewall_ports "$proto_type"
-@@ -4746 +5600,2 @@
+@@ -4746 +5641,2 @@
 -        service_restart xray
 +        service_restart xray || return 1
 +        open_node_firewall_ports "$proto_type"
-@@ -4778 +5633 @@
+@@ -4778 +5674 @@
 -    # 卸载 sing-box（AnyTLS）
 +    # 卸载 sing-box（AnyTLS / Hysteria2）
-@@ -4834,6 +5689,8 @@
+@@ -4834,6 +5730,8 @@
 -    # 1. 检查 Xray 服务状态
 -    if service_is_active xray; then
 -        echo -e "  ${GREEN}✓${NC} Xray service is running"
@@ -1348,17 +1394,17 @@
 +            echo -e "  ${RED}✗${NC} Xray service is not running"
 +            all_ok=false
 +        fi
-@@ -4842,2 +5699 @@
+@@ -4842,2 +5740 @@
 -    # 1b. 检查 sing-box（AnyTLS）服务状态（仅当存在 AnyTLS 节点时校验）
 -    if [[ "$(anytls_node_count)" -gt 0 ]]; then
 +    if [[ "$(singbox_node_count)" -gt 0 ]]; then
-@@ -4845 +5701 @@
+@@ -4845 +5742 @@
 -            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS)"
 +            echo -e "  ${GREEN}✓${NC} sing-box service is running (AnyTLS/Hysteria2)"
-@@ -4847 +5703 @@
+@@ -4847 +5744 @@
 -            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS)"
 +            echo -e "  ${RED}✗${NC} sing-box service is not running (AnyTLS/Hysteria2)"
-@@ -4867,4 +5723,4 @@
+@@ -4867,4 +5764,4 @@
 -        n_port=$(grep "^PORT=" "$node_file" | cut -d= -f2)
 -        n_sni=$(grep "^SNI=" "$node_file" | cut -d= -f2)
 -        n_xhttp_port=$(grep "^XHTTP_PORT=" "$node_file" | cut -d= -f2)
@@ -1367,7 +1413,7 @@
 +        n_sni=$(safe_read_config_value "$node_file" "SNI")
 +        n_xhttp_port=$(safe_read_config_value "$node_file" "XHTTP_PORT")
 +        n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
-@@ -4913,0 +5770,10 @@
+@@ -4913,0 +5811,10 @@
 +        if [[ "$n_protocol_type" == "hysteria2" ]] && [[ -n "$n_port" ]]; then
 +            if ss -lnu 2>/dev/null | grep -qE ":${n_port}([[:space:]]|$)"; then
 +                echo -e "    ${GREEN}✓${NC} Hysteria2 UDP port $n_port is listening"
@@ -1378,16 +1424,16 @@
 +            continue
 +        fi
 +
-@@ -4915 +5781 @@
+@@ -4915 +5822 @@
 -        if timeout 3 openssl s_client -connect "${n_sni}:443" -servername "$n_sni" </dev/null &>/dev/null; then
 +        if [[ -n "$n_sni" ]] && timeout 3 openssl s_client -connect "${n_sni}:443" -servername "$n_sni" </dev/null &>/dev/null; then
-@@ -4917 +5783 @@
+@@ -4917 +5824 @@
 -        else
 +        elif [[ -n "$n_sni" ]]; then
-@@ -5034 +5900 @@
+@@ -5034 +5941 @@
 -    # 重新生成 Xray 配置（分享链接使用 .env 中的 IP，配置本身不含 IP，但为安全起见重新生成）
 +    # 重新同步所有实际使用的代理内核。
-@@ -5036,10 +5902,3 @@
+@@ -5036,10 +5943,3 @@
 -    if write_config; then
 -        log_info "$(msg update_ip_restarting)"
 -        service_restart xray
@@ -1401,14 +1447,14 @@
 +    if cmd_regenerate; then
 +        echo ""
 +        echo -e "  ${GREEN}✓${NC} $(msg update_ip_complete)"
-@@ -5047 +5906,2 @@
+@@ -5047 +5947,2 @@
 -        log_error "Failed to regenerate config"
 +        log_error "Failed to synchronize proxy config after IP update"
 +        return 1
-@@ -5537,0 +6398,2 @@
+@@ -5537,0 +6439,2 @@
 +# Usage: open_firewall_port PORT [tcp|udp|both]
 +# 未安装或未启用任何防火墙时视为无需处理；任一活跃后端配置失败则返回非零。
-@@ -5539,6 +6401,15 @@
+@@ -5539,6 +6442,15 @@
 -    local port="$1"
 -
 -    # iptables (if available)
@@ -1430,7 +1476,7 @@
 +            return 1
 +            ;;
 +    esac
-@@ -5546,4 +6417,6 @@
+@@ -5546,4 +6458,6 @@
 -        # IPv6
 -        if [[ -f /proc/net/if_inet6 ]] && command -v ip6tables &>/dev/null; then
 -            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
@@ -1441,7 +1487,7 @@
 +        command -v "$backend" >/dev/null 2>&1 || continue
 +        if [[ "$backend" == "ip6tables" && ! -f /proc/net/if_inet6 ]]; then
 +            continue
-@@ -5552,4 +6425,18 @@
+@@ -5552,4 +6466,18 @@
 -        # 持久化 (如果有 netfilter-persistent)
 -        if command -v netfilter-persistent &>/dev/null; then
 -            netfilter-persistent save 2>/dev/null || true
@@ -1464,7 +1510,7 @@
 +    # 仅在本次新增了 netfilter 规则时持久化；重复调用不反复 save。
 +    if ((netfilter_changed == 1)) && command -v netfilter-persistent >/dev/null 2>&1; then
 +        netfilter-persistent save >/dev/null 2>&1 || failed=1
-@@ -5558,5 +6445,17 @@
+@@ -5558,5 +6486,17 @@
 -    # firewalld (if available)
 -    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
 -        firewall-cmd --permanent --add-port="${port}/tcp" 2>/dev/null || true
@@ -1487,7 +1533,7 @@
 +        if ((firewalld_changed == 1)); then
 +            firewall-cmd --reload >/dev/null 2>&1 || failed=1
 +        fi
-@@ -5565,3 +6464,12 @@
+@@ -5565,3 +6505,12 @@
 -    # ufw (if available)
 -    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
 -        ufw allow "$port" 2>/dev/null || true
@@ -1503,10 +1549,10 @@
 +            # 安装了 ufw 但无法读取状态，不能安全当作“未启用”。
 +            failed=1
 +        fi
-@@ -5568,0 +6477,2 @@
+@@ -5568,0 +6518,2 @@
 +
 +    ((failed == 0))
-@@ -5592,2 +6502,386 @@
+@@ -5592,2 +6543,386 @@
 -# SSH rollback helper: restore original port
 -_ssh_rollback() {
 +SSH_ROLLBACK_PID=""
@@ -1895,7 +1941,7 @@
 +
 +# SSH rollback helper: restore original port after atomically claiming rollback.
 +_ssh_rollback_claimed() {
-@@ -5598,3 +6892,11 @@
+@@ -5598,3 +6933,11 @@
 -    if [[ -f "$backup_file" ]]; then
 -        cp "$backup_file" "$ssh_config"
 -        rm -f "$backup_file"
@@ -1910,7 +1956,7 @@
 +
 +    echo -e "\n${YELLOW}[AUTO-ROLLBACK]${NC} SSH 端口已自动恢复为 ${original_port}"
 +}
-@@ -5602,3 +6904,74 @@
+@@ -5602,3 +6945,74 @@
 -        # Restart SSH with original config
 -        if [[ "$INIT_SYSTEM" == "openrc" ]]; then
 -            rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
@@ -1988,7 +2034,7 @@
 +        # identity and must never authorize a second restore.
 +        if ((claim_status == 0)); then
 +            _ssh_rollback_claimed "$ssh_config" "$backup_file" "$original_port"
-@@ -5606 +6979,51 @@
+@@ -5606 +7020,51 @@
 -            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 +            local observed_phase
 +            observed_phase=$(ssh_rollback_phase_current 2>/dev/null || true)
@@ -2041,7 +2087,7 @@
 +        if ! ssh_rollback_wait_for_timer_completion; then
 +            echo -e "${RED}[ERROR]${NC} 确认输掉回滚竞态，且无法验证回滚完成；状态已保留。" >&2
 +            return 1
-@@ -5607,0 +7031,8 @@
+@@ -5607,0 +7072,8 @@
 +        ssh_rollback_remove_state || return 1
 +        clear_ssh_rollback_state
 +        echo -e "${YELLOW}[ROLLBACK WON]${NC} 确认输掉回滚竞态；已等待并验证回滚完成。" >&2
@@ -2050,7 +2096,7 @@
 +    echo -e "${RED}[ERROR]${NC} 无法安全提交确认；phase 状态已保留。" >&2
 +    return 1
 +}
-@@ -5609 +7040,10 @@
+@@ -5609 +7081,10 @@
 -        echo -e "\n${YELLOW}[AUTO-ROLLBACK]${NC} SSH 端口已自动恢复为 ${original_port}"
 +cleanup_pending_ssh_rollback() {
 +    local phase claim_status=0
@@ -2062,7 +2108,7 @@
 +        ssh_rollback_discard_unstarted_state || return 1
 +        clear_ssh_rollback_state
 +        return 0
-@@ -5610,0 +7051,39 @@
+@@ -5610,0 +7092,39 @@
 +    phase=$(ssh_rollback_phase_current) || return 1
 +    case "$phase" in
 +        pending)
@@ -2102,11 +2148,11 @@
 +        *) return 1 ;;
 +    esac
 +    clear_ssh_rollback_state
-@@ -5616 +7095,2 @@
+@@ -5616 +7136,2 @@
 -    local backup_file="/tmp/sshd_config.backup.$$"
 +    local backup_file=""
 +    local rollback_marker=""
-@@ -5654,2 +7134,18 @@
+@@ -5654,2 +7175,18 @@
 -    # Step 1: Create backup BEFORE any changes
 -    cp "$ssh_config" "$backup_file"
 +    # Step 1: Create an owned private rollback state and backup BEFORE any changes.
@@ -2127,14 +2173,14 @@
 +        return 1
 +    fi
 +    backup_file="$SSH_ROLLBACK_BACKUP"
-@@ -5660 +7156,5 @@
+@@ -5660 +7197,5 @@
 -        sed -i "s/^Port.*/Port $new_port/" "$ssh_config"
 +        if ! sed -i "s/^Port.*/Port $new_port/" "$ssh_config"; then
 +            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
 +                echo -e "${RED}[ERROR]${NC} 配置写入及自动恢复均失败；安全备份已保留。" >&2
 +            return 1
 +        fi
-@@ -5662 +7162,12 @@
+@@ -5662 +7203,12 @@
 -        echo "Port $new_port" >> "$ssh_config"
 +        if ! echo "Port $new_port" >> "$ssh_config"; then
 +            _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
@@ -2148,7 +2194,7 @@
 +        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH" || \
 +            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份已保留在 $backup_file" >&2
 +        return 1
-@@ -5668,10 +7179,8 @@
+@@ -5668,10 +7220,8 @@
 -    # Step 4: Start background rollback timer
 -    (
 -        sleep "$rollback_timeout"
@@ -2167,7 +2213,7 @@
 +            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份已保留在 $backup_file" >&2
 +        return 1
 +    fi
-@@ -5681,4 +7190,6 @@
+@@ -5681,4 +7231,6 @@
 -    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
 -        rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null || true
 -    else
@@ -2178,7 +2224,7 @@
 +            echo -e "${RED}[ERROR]${NC} 自动恢复失败；安全备份和状态已保留。" >&2
 +        fi
 +        return 1
-@@ -5711,7 +7222,8 @@
+@@ -5711,7 +7263,8 @@
 -        # User confirmed, create marker and clean up
 -        touch "/tmp/ssh_port_confirmed.$$"
 -        rm -f "$backup_file"
@@ -2194,24 +2240,24 @@
 +                echo -e "${RED}[ERROR]${NC} 无法安全提交确认；回滚状态已保留。" >&2
 +            return 1
 +        fi
-@@ -5722,2 +7234,4 @@
+@@ -5722,2 +7275,4 @@
 -        kill $rollback_pid 2>/dev/null || true
 -        _ssh_rollback "$ssh_config" "$backup_file" "$CURRENT_SSH"
 +        if ! cleanup_pending_ssh_rollback; then
 +            echo -e "${RED}[ERROR]${NC} SSH 自动回滚未完整成功；安全备份和状态已保留。" >&2
 +            return 1
 +        fi
-@@ -6587,0 +8102 @@
+@@ -6587,0 +8143 @@
 +    echo ""
-@@ -6589 +8104 @@
+@@ -6589 +8145 @@
 -    # 容器环境且无权限: 自动运行时间校验而非安装
 +    # 容器环境且无权限: 只允许校验或跳过，绝不尝试修改宿主机时钟。
-@@ -6591 +8105,0 @@
+@@ -6591 +8146,0 @@
 -        echo ""
-@@ -6592,0 +8107,2 @@
+@@ -6592,0 +8148,2 @@
 +        echo -e "  ${GREEN}1.${NC} $(msg timesync_check)"
 +        echo -e "  ${RED}0.${NC} $(msg timesync_skip)"
-@@ -6594,2 +8110,7 @@
+@@ -6594,2 +8151,7 @@
 -        timesync_check
 -        return
 +        echo -n "  $(msg menu_choice) [0-1]: "
@@ -2221,15 +2267,15 @@
 +            timesync_check
 +        fi
 +        return 0
-@@ -6597,0 +8119,3 @@
+@@ -6597,0 +8160,3 @@
 +    echo -e "  ${GREEN}1.${NC} $(msg timesync_install)"
 +    echo -e "  ${GREEN}2.${NC} $(msg timesync_check)"
 +    echo -e "  ${RED}0.${NC} $(msg timesync_skip)"
-@@ -6599 +8123,2 @@
+@@ -6599 +8164,2 @@
 -    echo -n "  [y/N]: "
 +    echo -n "  $(msg menu_choice) [0-2]: "
 +    local answer
-@@ -6601,3 +8126,5 @@
+@@ -6601,3 +8167,5 @@
 -    if [[ "$answer" =~ ^[Yy]$ ]]; then
 -        timesync_install
 -    fi
@@ -2238,20 +2284,37 @@
 +        2) timesync_check ;;
 +        *) return 0 ;;
 +    esac
-@@ -6826 +8353 @@
+@@ -6826 +8394 @@
 -    echo "                anytls, or anytls-reality"
 +    echo "                anytls, anytls-reality, or hysteria2 (hy2)"
-@@ -6842,0 +8370,5 @@
+@@ -6842,0 +8411,5 @@
 +    echo "Hysteria2 parameters (powered by sing-box):"
 +    echo "  hy2pt=xxx     Specify Hysteria2 UDP port"
 +    echo "  hy2pwd=xxx    Specify 8-128 character URI-safe password"
 +    echo "  hy2sni=xxx    Specify TLS SNI (default: www.bing.com)"
 +    echo ""
-@@ -6857,0 +8390 @@
+@@ -6857,0 +8431 @@
 +    echo "  name=hy2 proto=hysteria2 bash $0 install   # Add Hysteria2 UDP node"
-@@ -6878 +8411 @@
+@@ -6878,4 +8452,2 @@
 -    if ! lock_acquire; then
-+    if ! lock_acquire_smart; then
-@@ -6880 +8413 @@
+-        log_error "$(msg script_running)"
 -        log_error "If you are sure no other instance is running, remove: $LOCK_DIR"
-+        log_error "Lock path: ${LOCK_FILE:-${LOCK_DIR:-unknown}}"
+-        exit 1
++    if lock_acquire_smart; then
++        return 0
+@@ -6882,0 +8455,15 @@
++    local lock_path="${LOCK_FILE:-${LOCK_DIR:-unknown}}"
++    local owner_pid="" liveness=0
++    owner_pid=$(lock_recorded_pid) || owner_pid=""
++    log_error "$(msg script_running)"
++    log_error "Lock path: $lock_path"
++    if [[ -n "$owner_pid" ]]; then
++        lock_pid_liveness "$owner_pid" || liveness=$?
++        if ((liveness == 1)); then
++            log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
++            log_warn "$(msg lock_stale_action) rm -rf -- $lock_path"
++        elif ((liveness == 0)); then
++            log_error "$(msg lock_owner_alive) (PID $owner_pid)"
++        fi
++    fi
++    exit 1

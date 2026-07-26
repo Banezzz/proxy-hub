@@ -38,10 +38,13 @@
 
 - 严重性：low
 - 影响范围：使用新版每 UID 私有 `write.lock.d` 排他域的写操作。
-- 触发条件：进程收到 `SIGKILL`、宿主机崩溃或断电，shell cleanup 无法运行。
+- 触发条件：进程收到 `SIGKILL`、宿主机崩溃或断电，shell cleanup 无法运行。可捕获的
+  INT/TERM/HUP（含 `Ctrl+C`、SSH 断开、终端关闭）已走 cleanup 释放锁，不再触发本项。
 - 影响：锁目录可能保留；无法安全证明 stale 时，后续写操作会拒绝启动。
-- 临时缓解：确认记录 PID 已不存在且没有 Proxy Hub 写操作运行后，管理员人工删除
-  `/tmp/proxy-hub-<uid>/write.lock.d`。不要仅凭 PID 自动化删除。
+- 临时缓解：为便于恢复，获取写锁失败时脚本会只读诊断记录的 PID——owner 仍存活则提示
+  另有实例正在运行，`/proc` 可证明其已退出则判定为残留锁并直接打印可复制的删除命令。
+  管理员确认没有 Proxy Hub 写操作运行后，据此人工删除 `/tmp/proxy-hub-<uid>/write.lock.d`。
+  诊断仅读取 PID/`/proc`，不会仅凭 PID 自动化删除或接管锁。
 
 ## 同 UID 恶意进程不属于锁机制的防护范围
 

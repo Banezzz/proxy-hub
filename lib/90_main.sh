@@ -288,11 +288,24 @@ init_language_if_needed() {
 
 # 单实例锁检查（对于可能冲突的操作）
 check_lock_for_write_ops() {
-    if ! lock_acquire_smart; then
-        log_error "$(msg script_running)"
-        log_error "Lock path: ${LOCK_FILE:-${LOCK_DIR:-unknown}}"
-        exit 1
+    if lock_acquire_smart; then
+        return 0
     fi
+    local lock_path="${LOCK_FILE:-${LOCK_DIR:-unknown}}"
+    local owner_pid="" liveness=0
+    owner_pid=$(lock_recorded_pid) || owner_pid=""
+    log_error "$(msg script_running)"
+    log_error "Lock path: $lock_path"
+    if [[ -n "$owner_pid" ]]; then
+        lock_pid_liveness "$owner_pid" || liveness=$?
+        if ((liveness == 1)); then
+            log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            log_warn "$(msg lock_stale_action) rm -rf -- $lock_path"
+        elif ((liveness == 0)); then
+            log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+        fi
+    fi
+    exit 1
 }
 
 case "${1:-}" in
