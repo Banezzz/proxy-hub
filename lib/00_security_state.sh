@@ -143,6 +143,38 @@ lock_release() {
     LOCK_DIR_ID=""
 }
 
+# ---------------- Stale-lock diagnostics (read-only) ----------------
+# These helpers never modify, remove, or steal the lock. Per docs/audits.md the
+# lock is deliberately not auto-reclaimed from PID metadata (PID reuse / forged
+# metadata risk); they only let a caller tell a human whether the recorded owner
+# is still alive, so manual recovery becomes a single obvious command.
+
+# Print the PID recorded in the current lock, or return non-zero when the lock
+# metadata is missing, unreadable, a symlink, or malformed.
+lock_recorded_pid() {
+    local pid=""
+    [[ -n "${PID_FILE:-}" && -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
+    IFS= read -r pid < "$PID_FILE" 2>/dev/null || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+# Classify a recorded owner PID without touching the lock:
+#   0 -> still alive (a real instance may be running)
+#   1 -> provably gone (the lock is stale)
+#   2 -> liveness cannot be determined; treat conservatively as maybe-alive
+lock_pid_liveness() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+    [[ "$pid" == "$$" ]] && return 0
+    if [[ -d /proc/self ]]; then
+        [[ -e "/proc/$pid" ]] && return 0
+        return 1
+    fi
+    kill -0 "$pid" 2>/dev/null && return 0
+    return 2
+}
+
 # ============== Security Helper Functions ==============
 
 # Compatibility names intentionally use the same mkdir exclusion domain. A

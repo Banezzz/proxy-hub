@@ -159,6 +159,38 @@ lock_release() {
     LOCK_DIR_ID=""
 }
 
+# ---------------- Stale-lock diagnostics (read-only) ----------------
+# These helpers never modify, remove, or steal the lock. Per docs/audits.md the
+# lock is deliberately not auto-reclaimed from PID metadata (PID reuse / forged
+# metadata risk); they only let a caller tell a human whether the recorded owner
+# is still alive, so manual recovery becomes a single obvious command.
+
+# Print the PID recorded in the current lock, or return non-zero when the lock
+# metadata is missing, unreadable, a symlink, or malformed.
+lock_recorded_pid() {
+    local pid=""
+    [[ -n "${PID_FILE:-}" && -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
+    IFS= read -r pid < "$PID_FILE" 2>/dev/null || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+# Classify a recorded owner PID without touching the lock:
+#   0 -> still alive (a real instance may be running)
+#   1 -> provably gone (the lock is stale)
+#   2 -> liveness cannot be determined; treat conservatively as maybe-alive
+lock_pid_liveness() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+    [[ "$pid" == "$$" ]] && return 0
+    if [[ -d /proc/self ]]; then
+        [[ -e "/proc/$pid" ]] && return 0
+        return 1
+    fi
+    kill -0 "$pid" 2>/dev/null && return 0
+    return 2
+}
+
 # ============== Security Helper Functions ==============
 
 # Compatibility names intentionally use the same mkdir exclusion domain. A
@@ -1143,7 +1175,7 @@ cleanup() {
 
 cleanup_signal() {
     local signal="$1" fallback_status="$2"
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     cleanup
     kill -s "$signal" "$$" 2>/dev/null || exit "$fallback_status"
     exit "$fallback_status"
@@ -1152,6 +1184,9 @@ cleanup_signal() {
 trap cleanup EXIT
 trap 'cleanup_signal INT 130' INT
 trap 'cleanup_signal TERM 143' TERM
+# SIGHUP (SSH disconnect / terminal close) is catchable: release the write lock
+# through the same cleanup path as INT/TERM instead of dying and orphaning it.
+trap 'cleanup_signal HUP 129' HUP
 
 # ============== Spinner 动画执行器 ==============
 
@@ -1711,6 +1746,9 @@ msg() {
             "swap_size") echo "Swap Size" ;;
             "fail2ban_status") echo "Fail2ban Status" ;;
             "script_running") echo "Script is already running!" ;;
+            "lock_owner_alive") echo "Another instance appears to be running" ;;
+            "lock_stale_hint") echo "The recorded owner process is gone; the lock looks stale (left over from an unclean exit)" ;;
+            "lock_stale_action") echo "If no proxy-hub write operation is running, remove the stale lock with:" ;;
             "enable_xhttp") echo "Enable XHTTP protocol? (y/n)" ;;
             "xhttp_enabled") echo "XHTTP protocol enabled" ;;
             "detecting_ip") echo "Detecting server IP..." ;;
@@ -1910,6 +1948,9 @@ msg() {
             "swap_size") echo "Swap 大小" ;;
             "fail2ban_status") echo "Fail2ban 状态" ;;
             "script_running") echo "脚本已在运行中！" ;;
+            "lock_owner_alive") echo "检测到另一个实例正在运行" ;;
+            "lock_stale_hint") echo "锁记录的进程已不存在，可能是上次异常退出残留的锁" ;;
+            "lock_stale_action") echo "确认没有 proxy-hub 写操作在运行后，可用以下命令清理残留锁：" ;;
             "enable_xhttp") echo "是否启用 XHTTP 协议？(y/n)" ;;
             "xhttp_enabled") echo "XHTTP 协议已启用" ;;
             "detecting_ip") echo "检测服务器 IP..." ;;
@@ -10502,11 +10543,24 @@ init_language_if_needed() {
 
 # 单实例锁检查（对于可能冲突的操作）
 check_lock_for_write_ops() {
-    if ! lock_acquire_smart; then
-        log_error "$(msg script_running)"
-        log_error "Lock path: ${LOCK_FILE:-${LOCK_DIR:-unknown}}"
-        exit 1
+    if lock_acquire_smart; then
+        return 0
     fi
+    local lock_path="${LOCK_FILE:-${LOCK_DIR:-unknown}}"
+    local owner_pid="" liveness=0
+    owner_pid=$(lock_recorded_pid) || owner_pid=""
+    log_error "$(msg script_running)"
+    log_error "Lock path: $lock_path"
+    if [[ -n "$owner_pid" ]]; then
+        lock_pid_liveness "$owner_pid" || liveness=$?
+        if ((liveness == 1)); then
+            log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            log_warn "$(msg lock_stale_action) rm -rf -- $lock_path"
+        elif ((liveness == 0)); then
+            log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+        fi
+    fi
+    exit 1
 }
 
 case "${1:-}" in
@@ -10634,7 +10688,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=406618 body-sha256=b979e2b7c8933a4f5ff3aff8a3f4fb6aeecc41b8641842fe0cff09821859334a
-# build-id=b979e2b7c8933a4f5ff3aff8a3f4fb6aeecc41b8641842fe0cff09821859334a
+# body-bytes=409251 body-sha256=b2ab0f8d69b6f33ab11fc332a87f552b08f72e63a73dc770457a7aadcc842958
+# build-id=b2ab0f8d69b6f33ab11fc332a87f552b08f72e63a73dc770457a7aadcc842958
 # module-count=11
 # proxy-hub-bundle-end-v1
