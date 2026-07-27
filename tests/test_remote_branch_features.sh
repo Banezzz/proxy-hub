@@ -706,4 +706,51 @@ assert_eq "bare" "$(node_field "$NODES_DIR/bare.env" NODE_NAME)" \
     "save_env must write a node file from freshly reset state"
 SCENARIO
 
+# When every SNI probe fails, the operator must still get the selection menu.
+#
+# select_best_sni handles the zero-results case by calling prompt_sni_choice, which
+# binds its two array arguments with `local -n`. Passing empty strings makes that
+# binding fail, leaving the nameref undefined, and the next expansion of it aborts
+# under `set -u`. The abort was masked by a `2>/dev/null` on the same line, so the
+# script simply vanished with status 1 and no message -- mid-install or mid-edit,
+# on exactly the hosts (blocked egress, filtered DNS) where every probe fails.
+run_scenario sni-zero-results-contract <<'SCENARIO'
+command -v script >/dev/null || fail_case "util-linux script is required for a pty-backed prompt"
+
+cat >/srv/sni-probe.sh <<'PROBE'
+set -euo pipefail
+source /mnt/lib/00_security_state.sh
+source /mnt/lib/10_runtime_platform_ui.sh
+source /mnt/lib/20_installers_restart.sh
+source /mnt/lib/30_provision_network.sh
+
+msg() { printf '%s\n' "$1"; }
+log_info() { :; }
+log_warn() { :; }
+
+# Reproduce "every domain timed out": the real test_domains_parallel always
+# assigns the (possibly empty) map and publishes BEST_LATENCY before returning.
+test_domains_parallel() { local -n _m=$1; _m=(); BEST_LATENCY=9999; }
+load_latency_cache() { return 1; }
+save_latency_cache() { :; }
+
+SNI=""
+select_best_sni
+printf 'SNI=%s\n' "${SNI:-<empty>}" >/srv/sni-result
+PROBE
+
+# 'D' selects the documented fallback domain and exits the prompt immediately.
+printf 'D\n' >/srv/sni-answers
+probe_rc=0
+script -qec "bash /srv/sni-probe.sh" /dev/null </srv/sni-answers >/srv/sni.out 2>&1 || probe_rc=$?
+
+if ((probe_rc != 0)); then
+    sed -n '1,40p' /srv/sni.out >&2
+    fail_case "select_best_sni aborted when every SNI probe failed (exit $probe_rc)"
+fi
+[[ -f /srv/sni-result ]] || fail_case "select_best_sni exited without reaching the SNI prompt"
+assert_eq "SNI=www.tesla.com" "$(cat /srv/sni-result)" \
+    "zero-results SNI selection must fall back to the default domain"
+SCENARIO
+
 printf '%s\n' "All remote-branch feature contract tests passed."

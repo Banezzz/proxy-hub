@@ -5894,8 +5894,10 @@ select_best_sni() {
     # 检查是否有可用域名
     if [[ ${#latency_map[@]} -eq 0 ]]; then
         log_warn "$(msg sni_timeout)"
-        # 即使测试失败也让用户选择
-        prompt_sni_choice "" ""
+        # 即使测试失败也让用户选择。必须传入真实的空数组名而非空字符串：
+        # prompt_sni_choice 用 `local -n` 建立 nameref，空名会建立失败。
+        local -a no_domains=() no_latencies=()
+        prompt_sni_choice no_domains no_latencies
         return
     fi
 
@@ -5976,13 +5978,23 @@ _run_custom_sni_test() {
 }
 
 prompt_sni_choice() {
-    local -n _in_domains=$1 2>/dev/null || true
-    local -n _in_latencies=$2 2>/dev/null || true
     # 拷贝到本地可变数组；选择"测试自定义域名"后会用自定义结果替换它们
     local -a td=() tl=()
-    if [[ ${#_in_domains[@]} -gt 0 ]] 2>/dev/null; then
-        td=("${_in_domains[@]}")
-        tl=("${_in_latencies[@]}")
+
+    # 空数组名必须先挡掉：`local -n x=` 会建立失败，nameref 根本不存在，随后展开
+    # 它会在 `set -u` 下终止整个进程。此前这里写成
+    #   local -n _in_domains=$1 2>/dev/null || true
+    #   if [[ ${#_in_domains[@]} -gt 0 ]] 2>/dev/null; then
+    # 那个 `2>/dev/null` 连 "unbound variable" 一并吞掉，表现为脚本无声退出、
+    # 状态码 1、没有任何提示——测速全部失败时正好走到这里。
+    # 现在退化为空列表，用户仍可手动输入域名。
+    if [[ -n "${1:-}" && -n "${2:-}" ]]; then
+        local -n _in_domains="$1"
+        local -n _in_latencies="$2"
+        if [[ ${#_in_domains[@]} -gt 0 ]]; then
+            td=("${_in_domains[@]}")
+            tl=("${_in_latencies[@]}")
+        fi
     fi
 
     while true; do
@@ -10723,7 +10735,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=412593 body-sha256=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
-# build-id=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
+# body-bytes=413367 body-sha256=a30bbe8dd2b1ce75e83c7acb282fbf98f66ba71e0e9b2122e2fa538ba5a71a03
+# build-id=a30bbe8dd2b1ce75e83c7acb282fbf98f66ba71e0e9b2122e2fa538ba5a71a03
 # module-count=11
 # proxy-hub-bundle-end-v1

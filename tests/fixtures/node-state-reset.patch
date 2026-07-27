@@ -64,10 +64,39 @@
 +# 全局 IP 变量（SERVER_IP / SERVER_IPV4 / SERVER_IPV6）统一由
 +# lib/00_security_state.sh 的 reset_node_state() 初始化。此处曾只声明 IPv4/IPv6
 +# 两个而漏掉旧字段 SERVER_IP，导致 IPv6 Only 主机在 save_env 处触发 unbound variable。
-@@ -6526 +6546 @@
+@@ -5877,2 +5897,4 @@
+-        # 即使测试失败也让用户选择
+-        prompt_sni_choice "" ""
++        # 即使测试失败也让用户选择。必须传入真实的空数组名而非空字符串：
++        # prompt_sni_choice 用 `local -n` 建立 nameref，空名会建立失败。
++        local -a no_domains=() no_latencies=()
++        prompt_sni_choice no_domains no_latencies
+@@ -5959,2 +5980,0 @@
+-    local -n _in_domains=$1 2>/dev/null || true
+-    local -n _in_latencies=$2 2>/dev/null || true
+@@ -5963,3 +5983,15 @@
+-    if [[ ${#_in_domains[@]} -gt 0 ]] 2>/dev/null; then
+-        td=("${_in_domains[@]}")
+-        tl=("${_in_latencies[@]}")
++
++    # 空数组名必须先挡掉：`local -n x=` 会建立失败，nameref 根本不存在，随后展开
++    # 它会在 `set -u` 下终止整个进程。此前这里写成
++    #   local -n _in_domains=$1 2>/dev/null || true
++    #   if [[ ${#_in_domains[@]} -gt 0 ]] 2>/dev/null; then
++    # 那个 `2>/dev/null` 连 "unbound variable" 一并吞掉，表现为脚本无声退出、
++    # 状态码 1、没有任何提示——测速全部失败时正好走到这里。
++    # 现在退化为空列表，用户仍可手动输入域名。
++    if [[ -n "${1:-}" && -n "${2:-}" ]]; then
++        local -n _in_domains="$1"
++        local -n _in_latencies="$2"
++        if [[ ${#_in_domains[@]} -gt 0 ]]; then
++            td=("${_in_domains[@]}")
++            tl=("${_in_latencies[@]}")
++        fi
+@@ -6526 +6558 @@
 -    local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
 +    local save_ipv4="${SERVER_IPV4:-${SERVER_IP:-}}"
-@@ -6529,3 +6549,6 @@
+@@ -6529,3 +6561,6 @@
 -    # Optional: encrypt sensitive values if encryption is enabled
 -    local save_uuid="$UUID"
 -    local save_private_key="$PRIVATE_KEY"
@@ -77,43 +106,43 @@
 +    # 已保证这些变量始终有定义，这里再兜一层，避免将来新增协议时重蹈覆辙。
 +    local save_uuid="${UUID:-}"
 +    local save_private_key="${PRIVATE_KEY:-}"
-@@ -6537,2 +6560,3 @@
+@@ -6537,2 +6572,3 @@
 -        save_uuid=$(encrypt_value "$UUID")
 -        save_private_key=$(encrypt_value "$PRIVATE_KEY")
 +        # encrypt_value 对空串直接返回空串，因此无需额外判空。
 +        save_uuid=$(encrypt_value "$save_uuid")
 +        save_private_key=$(encrypt_value "$save_private_key")
-@@ -6551,2 +6575,2 @@
+@@ -6551,2 +6587,2 @@
 -SNI=$SNI
 -PUBLIC_KEY=$PUBLIC_KEY
 +SNI=${SNI:-}
 +PUBLIC_KEY=${PUBLIC_KEY:-}
-@@ -6554 +6578 @@
+@@ -6554 +6590 @@
 -SHORT_ID=$SHORT_ID
 +SHORT_ID=${SHORT_ID:-}
-@@ -7065,0 +7090,4 @@
+@@ -7065,0 +7102,4 @@
 +    # 清空上一次操作残留的节点变量。这些是进程级全局量：同一次菜单会话里连续安装
 +    # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
 +    reset_node_state
 +
-@@ -7193,0 +7222,5 @@
+@@ -7193,0 +7234,5 @@
 +        # AnyTLS 两种变体都以密码认证，不使用 UUID；REALITY 变体额外需要密钥对。
 +        # UUID 必须在分支之外显式置空：gen_reality_keys 只产出 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，
 +        # 若把 UUID="" 留在 else 分支里，anytls_reality 路径就会带着未赋值的 UUID 走到
 +        # save_env，在 `set -u` 下直接以 "UUID: unbound variable" 终止安装。
 +        UUID=""
-@@ -7195 +7228 @@
+@@ -7195 +7240 @@
 -            gen_reality_keys
 +            gen_reality_keys || return 1
-@@ -7197 +7229,0 @@
+@@ -7197 +7241,0 @@
 -            UUID=""
-@@ -7201,0 +7234,2 @@
+@@ -7201,0 +7246,2 @@
 +        SS_METHOD=""
 +        SS_PASSWORD=""
-@@ -8018 +8052,2 @@
+@@ -8018 +8064,2 @@
 -    # 更新全局变量
 +    # 更新全局变量。IPv6 Only 主机上 current_ipv4 为空，此时保留原值；
 +    # SERVER_IP 没有独立的探测来源，必须按 `set -u` 安全的方式展开。
-@@ -8021 +8056 @@
+@@ -8021 +8068 @@
 -    SERVER_IP="${current_ipv4:-$SERVER_IP}"
 +    SERVER_IP="${current_ipv4:-${SERVER_IP:-}}"

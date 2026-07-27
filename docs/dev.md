@@ -114,6 +114,14 @@ Hysteria2 两者都没有。这两个事实叠加，会产生两类缺陷：
 2. **跨节点串值**。同一次菜单会话里连续安装两个节点时，未重置的字段会把上一个
    节点的凭据写进新节点的 `.env`。
 
+同类陷阱还有两个 bash 细节，新增代码时需一并注意：**空数组在 `set -u` 下等同未定义**
+（`declare -A m` 后直接展开 `${#m[@]}` 会终止进程，必须先 `m=()` 赋值过），以及
+**`local -n x=` 对空名会建立失败**，此后展开该 nameref 同样会终止进程。后者曾发生在
+`prompt_sni_choice`：`select_best_sni` 在全部域名测速失败时以空名调用它，而同一行的
+`2>/dev/null` 把 "unbound variable" 一并吞掉，表现为脚本无声退出、状态码 1、没有任何
+提示。切勿用 `2>/dev/null || true` 掩盖 `local -n` 的失败——那只会把致命错误变成无法
+诊断的静默退出。
+
 因此约定：`lib/00_security_state.sh` 的 `reset_node_state()` 是这些变量的**唯一**
 权威清单。它在模块加载时执行一次以建立基线，并由 `install_node` 在进入协议分支前
 再次调用；`safe_load_node_config` 也复用它。不要在其他模块另建平行的默认值清单
@@ -436,6 +444,8 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
   `set -u` 下留下未赋值的节点变量；AnyTLS/AnyTLS+REALITY 的 UUID 与 REALITY
   字段划分；同一会话内连续安装不串用上一个节点的凭据；IPv6 Only 主机上
   `SERVER_IP` 回退路径；以及 `reset_node_state` 覆盖 `save_env` 全部写出字段；
+- 全部 SNI 域名测速失败时（出口被墙、DNS 被拦的主机）仍能进入域名选择菜单并
+  回退到默认域名，而不是在 `prompt_sni_choice` 的 nameref 上无声崩溃；
 - 生成 bundle 与历史基线 `8ca0766e66278ce22377ce81040a98c8159d9c6e` 加显式
   安全补丁的逐字等价性。该字节级门限覆盖
   未单独触发的只读/写命令 dispatch、协议实现和旧节点兼容代码，确保它们没有在
