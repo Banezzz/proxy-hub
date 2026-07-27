@@ -314,6 +314,34 @@ safe_read_config_value() {
     echo "$value"
 }
 
+# 节点作用域全局变量的唯一权威清单。
+#
+# 程序以 `set -u` 运行，因此任何一个未被赋值的变量在展开时都会立刻终止整个脚本。
+# 各协议分支只会赋值它自己用得到的字段（例如 AnyTLS 不需要 UUID，Shadowsocks
+# 不需要 REALITY 密钥），所以必须有一个统一的地方把全部字段都置为已定义状态，
+# 否则某个协议路径漏掉一个字段就会在 save_env 等下游函数里炸掉。
+#
+# 同样重要的是：这些变量是进程级全局量。同一次菜单会话里连续安装两个节点时，
+# 若不重置，第二个节点会继承第一个节点残留的密钥/端口，把不属于它的凭据写进
+# 自己的 .env。因此 install_node 也必须在进入协议分支之前调用本函数。
+# 注意：CURRENT_NODE_NAME 不在此列表内。它表示“当前选中的节点”，由 select_node /
+# install_node 在读取配置之前设置，属于选择状态而非节点内容；清空它会让随后的
+# save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
+reset_node_state() {
+    NODE_NAME="" PORT="" UUID="" SNI=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    XHTTP_PORT="" XHTTP_PATH=""
+    SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
+    SS_METHOD="" SS_PASSWORD=""
+    ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
+    HY2_PASSWORD=""
+    PROTOCOL_TYPE="vision"
+}
+
+# 在模块加载时就建立一次基线，使得任何代码路径（包括从未选择过协议的只读命令）
+# 展开上述变量时都不会触发 unbound variable。
+reset_node_state
+
 # Safe load all config values from node file
 # Usage: safe_load_node_config FILE
 # Sets variables: NODE_NAME, PORT, UUID, SNI, PUBLIC_KEY, PRIVATE_KEY, SHORT_ID,
@@ -325,9 +353,9 @@ safe_load_node_config() {
     [[ ! -f "$file" ]] && return 1
 
     # Reset all variables first
-    NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
-    PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
-    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD="" HY2_PASSWORD=""
+    reset_node_state
+    # 本函数按文件内容重新填充；缺失的键保持空值，因此协议类型也从空开始判断。
+    PROTOCOL_TYPE=""
 
     # Load each value safely
     NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")
@@ -4956,20 +4984,12 @@ cmd_xray_restart() {
 # ============== 协议类型选择 ==============
 
 # 协议类型: vision, xhttp, both, shadowsocks, anytls, anytls_reality, hysteria2
-PROTOCOL_TYPE="vision"
-XHTTP_PORT=""
-XHTTP_PATH=""
-
-# Shadowsocks 相关变量
-SS_METHOD=""
-SS_PASSWORD=""
-
-# AnyTLS 相关变量（协议类型: anytls, anytls_reality）
-ANYTLS_PASSWORD=""
-ANYTLS_PADDING_B64=""
-
-# Hysteria2 相关变量（由 sing-box 承载）
-HY2_PASSWORD=""
+#
+# 节点作用域变量（PROTOCOL_TYPE / UUID / SNI / REALITY 密钥 / 各协议密码等）的默认值
+# 统一在 lib/00_security_state.sh 的 reset_node_state() 中定义，并在该模块加载时执行一次。
+# 此处曾经维护一份平行的默认值清单，但它只覆盖了部分字段（缺少 UUID / SNI / REALITY 密钥），
+# 导致 anytls_reality 这类不赋值 UUID 的协议分支在 `set -u` 下于 save_env 处崩溃。
+# 因此不要在这里重新引入清单——新增字段请只改 reset_node_state()。
 
 # Shadowsocks 支持的加密方式
 SS_METHODS_2022=(
@@ -5471,9 +5491,9 @@ is_valid_ipv6() {
     [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
 }
 
-# 全局 IP 变量
-SERVER_IPV4=""
-SERVER_IPV6=""
+# 全局 IP 变量（SERVER_IP / SERVER_IPV4 / SERVER_IPV6）统一由
+# lib/00_security_state.sh 的 reset_node_state() 初始化。此处曾只声明 IPv4/IPv6
+# 两个而漏掉旧字段 SERVER_IP，导致 IPv6 Only 主机在 save_env 处触发 unbound variable。
 
 # 获取 IPv4 地址
 get_ipv4() {
@@ -6523,19 +6543,23 @@ save_env() {
     node_file=$(get_node_file "$node_name")
 
     # 使用检测到的 IP（优先使用 SERVER_IPV4，向后兼容 SERVER_IP）
-    local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
+    local save_ipv4="${SERVER_IPV4:-${SERVER_IP:-}}"
     local save_ipv6="${SERVER_IPV6:-}"
 
-    # Optional: encrypt sensitive values if encryption is enabled
-    local save_uuid="$UUID"
-    local save_private_key="$PRIVATE_KEY"
+    # 所有字段一律使用 ${VAR:-} 展开。节点变量按协议部分赋值（AnyTLS 无 UUID、
+    # Shadowsocks 无 REALITY 密钥……），在 `set -u` 下任何一个漏赋值的字段都会
+    # 让安装在此处中断，且此时节点文件尚未落盘、服务也未配置。reset_node_state()
+    # 已保证这些变量始终有定义，这里再兜一层，避免将来新增协议时重蹈覆辙。
+    local save_uuid="${UUID:-}"
+    local save_private_key="${PRIVATE_KEY:-}"
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
     local save_hy2_password="${HY2_PASSWORD:-}"
 
     if is_encryption_enabled; then
-        save_uuid=$(encrypt_value "$UUID")
-        save_private_key=$(encrypt_value "$PRIVATE_KEY")
+        # encrypt_value 对空串直接返回空串，因此无需额外判空。
+        save_uuid=$(encrypt_value "$save_uuid")
+        save_private_key=$(encrypt_value "$save_private_key")
         [[ -n "$save_ss_password" ]] && save_ss_password=$(encrypt_value "$SS_PASSWORD")
         [[ -n "$save_anytls_password" ]] && save_anytls_password=$(encrypt_value "$ANYTLS_PASSWORD")
         [[ -n "$save_hy2_password" ]] && save_hy2_password=$(encrypt_value "$HY2_PASSWORD")
@@ -6548,10 +6572,10 @@ SERVER_IPV4=${save_ipv4:-}
 SERVER_IPV6=${save_ipv6:-}
 PORT=${PORT:-}
 UUID=$save_uuid
-SNI=$SNI
-PUBLIC_KEY=$PUBLIC_KEY
+SNI=${SNI:-}
+PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
-SHORT_ID=$SHORT_ID
+SHORT_ID=${SHORT_ID:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
@@ -7063,6 +7087,10 @@ cmd_install() {
 
     log_info "$(msg installing)"
 
+    # 清空上一次操作残留的节点变量。这些是进程级全局量：同一次菜单会话里连续安装
+    # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
+    reset_node_state
+
     # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
     # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
     # GeoIP/GeoSite 数据库不再默认下载，仅在启用 WARP 分流时才按需获取。
@@ -7191,14 +7219,20 @@ cmd_install() {
         ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
         log_info "已生成随机化 AnyTLS padding scheme"
 
+        # AnyTLS 两种变体都以密码认证，不使用 UUID；REALITY 变体额外需要密钥对。
+        # UUID 必须在分支之外显式置空：gen_reality_keys 只产出 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，
+        # 若把 UUID="" 留在 else 分支里，anytls_reality 路径就会带着未赋值的 UUID 走到
+        # save_env，在 `set -u` 下直接以 "UUID: unbound variable" 终止安装。
+        UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
-            gen_reality_keys
+            gen_reality_keys || return 1
         else
-            UUID=""
             PUBLIC_KEY=""
             PRIVATE_KEY=""
             SHORT_ID=""
         fi
+        SS_METHOD=""
+        SS_PASSWORD=""
         HY2_PASSWORD=""
     else
         # VLESS 安装流程
@@ -8015,10 +8049,11 @@ cmd_update_ip() {
     echo ""
     log_info "$(msg update_ip_done) ($updated_count)"
 
-    # 更新全局变量
+    # 更新全局变量。IPv6 Only 主机上 current_ipv4 为空，此时保留原值；
+    # SERVER_IP 没有独立的探测来源，必须按 `set -u` 安全的方式展开。
     [[ -n "$current_ipv4" ]] && SERVER_IPV4="$current_ipv4"
     [[ -n "$current_ipv6" ]] && SERVER_IPV6="$current_ipv6"
-    SERVER_IP="${current_ipv4:-$SERVER_IP}"
+    SERVER_IP="${current_ipv4:-${SERVER_IP:-}}"
 
     # 重新同步所有实际使用的代理内核。
     log_info "$(msg update_ip_regen)"
@@ -10688,7 +10723,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=409251 body-sha256=b2ab0f8d69b6f33ab11fc332a87f552b08f72e63a73dc770457a7aadcc842958
-# build-id=b2ab0f8d69b6f33ab11fc332a87f552b08f72e63a73dc770457a7aadcc842958
+# body-bytes=412593 body-sha256=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
+# build-id=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
 # module-count=11
 # proxy-hub-bundle-end-v1

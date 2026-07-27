@@ -98,6 +98,32 @@ SS2022 安装完成后的提示从 y/n 改为显式菜单。普通主机及具�
 不产生新的防火墙规则。来宾系统无法修改云厂商安全组，仍需用户按相同 transport
 在控制台放行；该边界记录在 `docs/audits.md`。
 
+### 节点作用域变量与 `set -u`
+
+入口脚本以 `set -euo pipefail` 运行，因此**任何一个未被赋值的变量在展开时都会立刻
+终止整个进程**，而不是取到空值。节点变量（`UUID` / `SNI` / REALITY 密钥 /
+各协议密码 / `SERVER_IP*` 等）又是进程级全局量，且每个协议分支只赋值自己用得到的
+子集——AnyTLS 以密码认证因而没有 UUID，Shadowsocks 没有 REALITY 密钥，
+Hysteria2 两者都没有。这两个事实叠加，会产生两类缺陷：
+
+1. **未赋值即展开**。某个协议分支漏掉一个字段，安装就会在 `save_env` 处以
+   `VAR: unbound variable` 中断。此前 `anytls_reality` 正是如此：它调用
+   `gen_reality_keys`（只产出 `PUBLIC_KEY`/`PRIVATE_KEY`/`SHORT_ID`）而未置空
+   `UUID`，安装在 sing-box 已安装、节点文件尚未落盘时崩溃。同源问题还出现在
+   IPv6 Only 主机上的旧字段 `SERVER_IP`。
+2. **跨节点串值**。同一次菜单会话里连续安装两个节点时，未重置的字段会把上一个
+   节点的凭据写进新节点的 `.env`。
+
+因此约定：`lib/00_security_state.sh` 的 `reset_node_state()` 是这些变量的**唯一**
+权威清单。它在模块加载时执行一次以建立基线，并由 `install_node` 在进入协议分支前
+再次调用；`safe_load_node_config` 也复用它。不要在其他模块另建平行的默认值清单
+——此前 `lib/20_installers_restart.sh` 与 `lib/30_provision_network.sh` 各维护了一份
+只覆盖部分字段的清单，正是该缺陷的根因。新增协议或新增节点字段时只改
+`reset_node_state()`，并在协议分支内显式把本协议不使用的字段置空以表明意图；
+`save_env` 另以 `${VAR:-}` 兜底。回归覆盖见 `tests/test_remote_branch_features.sh`
+的 `node-state-contract`，它刻意使用真实 `save_env`——把 `save_env` 打桩正是当初
+让该缺陷逃过测试的原因。
+
 ## Xray Release Management
 
 Xray target 由一个 resolver 统一决定，优先级固定为
@@ -361,6 +387,8 @@ bash tests/test_loader.sh
 bash tests/test_loader_failures.sh
 bash tests/test_cleanup_lock.sh
 bash tests/test_ssh_rollback.sh
+bash tests/test_remote_branch_features.sh
+bash tests/test_firewall_protocols.sh
 bash tests/test_xray_release.sh
 bash tests/test_xray_transaction.sh
 git diff --check
@@ -404,6 +432,10 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
   检查失败后的旧 binary 恢复；
 - Xray 更新在停服后的 TERM 回滚，以及 activated 持久 journal 在下一次写操作中的
   旧 binary、active 状态与事务残留恢复；
+- 七种协议各自跑通真实 `cmd_install` + 真实 `save_env`，确保没有协议分支在
+  `set -u` 下留下未赋值的节点变量；AnyTLS/AnyTLS+REALITY 的 UUID 与 REALITY
+  字段划分；同一会话内连续安装不串用上一个节点的凭据；IPv6 Only 主机上
+  `SERVER_IP` 回退路径；以及 `reset_node_state` 覆盖 `save_env` 全部写出字段；
 - 生成 bundle 与历史基线 `8ca0766e66278ce22377ce81040a98c8159d9c6e` 加显式
   安全补丁的逐字等价性。该字节级门限覆盖
   未单独触发的只读/写命令 dispatch、协议实现和旧节点兼容代码，确保它们没有在

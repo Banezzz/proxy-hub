@@ -298,6 +298,34 @@ safe_read_config_value() {
     echo "$value"
 }
 
+# 节点作用域全局变量的唯一权威清单。
+#
+# 程序以 `set -u` 运行，因此任何一个未被赋值的变量在展开时都会立刻终止整个脚本。
+# 各协议分支只会赋值它自己用得到的字段（例如 AnyTLS 不需要 UUID，Shadowsocks
+# 不需要 REALITY 密钥），所以必须有一个统一的地方把全部字段都置为已定义状态，
+# 否则某个协议路径漏掉一个字段就会在 save_env 等下游函数里炸掉。
+#
+# 同样重要的是：这些变量是进程级全局量。同一次菜单会话里连续安装两个节点时，
+# 若不重置，第二个节点会继承第一个节点残留的密钥/端口，把不属于它的凭据写进
+# 自己的 .env。因此 install_node 也必须在进入协议分支之前调用本函数。
+# 注意：CURRENT_NODE_NAME 不在此列表内。它表示“当前选中的节点”，由 select_node /
+# install_node 在读取配置之前设置，属于选择状态而非节点内容；清空它会让随后的
+# save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
+reset_node_state() {
+    NODE_NAME="" PORT="" UUID="" SNI=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    XHTTP_PORT="" XHTTP_PATH=""
+    SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
+    SS_METHOD="" SS_PASSWORD=""
+    ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
+    HY2_PASSWORD=""
+    PROTOCOL_TYPE="vision"
+}
+
+# 在模块加载时就建立一次基线，使得任何代码路径（包括从未选择过协议的只读命令）
+# 展开上述变量时都不会触发 unbound variable。
+reset_node_state
+
 # Safe load all config values from node file
 # Usage: safe_load_node_config FILE
 # Sets variables: NODE_NAME, PORT, UUID, SNI, PUBLIC_KEY, PRIVATE_KEY, SHORT_ID,
@@ -309,9 +337,9 @@ safe_load_node_config() {
     [[ ! -f "$file" ]] && return 1
 
     # Reset all variables first
-    NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
-    PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
-    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD="" HY2_PASSWORD=""
+    reset_node_state
+    # 本函数按文件内容重新填充；缺失的键保持空值，因此协议类型也从空开始判断。
+    PROTOCOL_TYPE=""
 
     # Load each value safely
     NODE_NAME=$(safe_read_config_value "$file" "NODE_NAME")

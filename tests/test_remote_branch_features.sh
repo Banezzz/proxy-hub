@@ -556,4 +556,154 @@ assert_not_contains "$hy2_fail" $'\nqr\n' "failed sing-box rendered a QR code"
 [[ ! -e "$NODES_DIR/hysteria_txn.env" ]] || fail_case "failed sing-box retained the candidate node"
 SCENARIO
 
+# Node-scoped globals must survive `set -u` on every protocol path.
+#
+# The whole program runs under `set -euo pipefail`, so a variable that a protocol
+# branch never assigns kills the install the moment anything expands it. This
+# regression exists: anytls_reality called gen_reality_keys (which only produces
+# PUBLIC_KEY/PRIVATE_KEY/SHORT_ID) and left UUID unassigned, so save_env aborted
+# with "UUID: unbound variable" right after IP detection -- after sing-box had
+# been installed but before any node file was written.
+#
+# Unlike install-transaction-contract above, this scenario deliberately runs the
+# REAL save_env against a REAL nodes directory. Stubbing save_env is exactly what
+# let the original defect through, since the stub never expanded the field set.
+run_scenario node-state-contract <<'SCENARIO'
+source /mnt/lib/00_security_state.sh
+source /mnt/lib/10_runtime_platform_ui.sh
+source /mnt/lib/20_installers_restart.sh
+source /mnt/lib/30_provision_network.sh
+source /mnt/lib/40_config_share.sh
+source /mnt/lib/50_node_commands.sh
+
+NODES_DIR=/srv/state-nodes
+SINGBOX_CERT_DIR=/srv/state-certs
+SINGBOX_SERVICE=sing-box
+ENABLE_CONFIG_ENCRYPTION=false
+mkdir -m 700 -- "$NODES_DIR" "$SINGBOX_CERT_DIR"
+
+msg() { printf '%s\n' "$1"; }
+log_info() { :; }
+log_warn() { :; }
+log_error() { printf '%s\n' "$*" >&2; }
+is_root() { return 0; }
+install_deps() { :; }
+node_exists() { return 1; }
+install_xray() { :; }
+install_singbox() { :; }
+select_best_sni() { SNI=edge.example.com; }
+prompt_ss_method() { SS_METHOD=2022-blake3-aes-256-gcm; }
+gen_reality_keys() {
+    PUBLIC_KEY=PublicKey_123
+    PRIVATE_KEY=PrivateKey_123
+    SHORT_ID=0123456789abcdef
+}
+choose_ports() { PORT=1443; XHTTP_PORT=""; XHTTP_PATH=""; }
+detect_network_stack() {
+    SERVER_IP=192.0.2.10
+    SERVER_IPV4=192.0.2.10
+    SERVER_IPV6=""
+}
+gen_selfsigned_cert() {
+    : >"$SINGBOX_CERT_DIR/$1.crt"
+    : >"$SINGBOX_CERT_DIR/$1.key"
+}
+singbox_sync() { :; }
+write_config() { :; }
+service_enable() { :; }
+service_restart() { :; }
+service_is_active() { :; }
+sleep() { :; }
+open_node_firewall_ports() { :; }
+show_info() { :; }
+show_node_qrcodes() { :; }
+prompt_xray_restart_on_install() { :; }
+prompt_timesync_for_ss2022() { :; }
+
+node_field() {
+    local file="$1" key="$2" line
+    while IFS= read -r line; do
+        [[ "$line" == "$key="* ]] && { printf '%s' "${line#*=}"; return 0; }
+    done <"$file"
+    return 0
+}
+
+# Every protocol must complete a real install, real save_env included. A branch
+# that forgets a field aborts here instead of shipping.
+for spec in vision:node_vision xhttp:node_xhttp both:node_both \
+            shadowsocks:node_ss anytls:node_at anytls-reality:node_atr hy2:node_hy2; do
+    protocol="${spec%%:*}"
+    node="${spec#*:}"
+    rc=0
+    ( name="$node" proto="$protocol" cmd_install ) >/srv/state.out 2>/srv/state.err || rc=$?
+    if ((rc != 0)); then
+        sed -n '1,40p' /srv/state.err >&2
+        fail_case "$protocol install aborted (exit $rc) -- likely an unset node variable under set -u"
+    fi
+    [[ -f "$NODES_DIR/$node.env" ]] || fail_case "$protocol install wrote no node file"
+done
+
+# AnyTLS authenticates by password and has no UUID, but the REALITY variant still
+# needs its key material. Both facts must hold in the persisted file.
+assert_eq "" "$(node_field "$NODES_DIR/node_atr.env" UUID)" \
+    "anytls_reality must persist an empty UUID, not an unset one"
+assert_eq "PublicKey_123" "$(node_field "$NODES_DIR/node_atr.env" PUBLIC_KEY)" \
+    "anytls_reality must persist its REALITY public key"
+assert_eq "0123456789abcdef" "$(node_field "$NODES_DIR/node_atr.env" SHORT_ID)" \
+    "anytls_reality must persist its REALITY short id"
+assert_eq "" "$(node_field "$NODES_DIR/node_at.env" PUBLIC_KEY)" \
+    "plain anytls must not carry REALITY key material"
+
+# Node variables are process globals. Installing a second node in the same menu
+# session must not inherit the previous node's credentials.
+rm -f -- "$NODES_DIR"/*.env
+name=leak_vless proto=vision cmd_install >/srv/state.out 2>/srv/state.err
+leaked_uuid=$(node_field "$NODES_DIR/leak_vless.env" UUID)
+[[ -n "$leaked_uuid" ]] || fail_case "VLESS install produced no UUID to test leakage with"
+
+name=leak_anytls proto=anytls-reality cmd_install >/srv/state.out 2>/srv/state.err
+assert_eq "" "$(node_field "$NODES_DIR/leak_anytls.env" UUID)" \
+    "AnyTLS node inherited the previously installed VLESS node's UUID"
+assert_eq "" "$(node_field "$NODES_DIR/leak_anytls.env" SS_PASSWORD)" \
+    "AnyTLS node inherited a stale Shadowsocks password"
+
+# Installing VLESS after Shadowsocks must not carry the SS password forward.
+rm -f -- "$NODES_DIR"/*.env
+name=leak_ss proto=ss cmd_install >/srv/state.out 2>/srv/state.err
+name=leak_vision proto=vision cmd_install >/srv/state.out 2>/srv/state.err
+assert_eq "" "$(node_field "$NODES_DIR/leak_vision.env" SS_PASSWORD)" \
+    "VLESS node inherited the previously installed Shadowsocks password"
+assert_eq "" "$(node_field "$NODES_DIR/leak_vision.env" SS_METHOD)" \
+    "VLESS node inherited the previously installed Shadowsocks method"
+
+# IPv6-only hosts leave SERVER_IPV4 empty, so save_env falls back to the legacy
+# SERVER_IP field. That fallback has no detection source of its own and must stay
+# `set -u` safe for every protocol.
+rm -f -- "$NODES_DIR"/*.env
+detect_network_stack() {
+    SERVER_IPV4=""
+    SERVER_IPV6="2001:db8::10"
+}
+for spec in vision:v6_vision anytls-reality:v6_atr hy2:v6_hy2; do
+    protocol="${spec%%:*}"
+    node="${spec#*:}"
+    rc=0
+    ( name="$node" proto="$protocol" cmd_install ) >/srv/state.out 2>/srv/state.err || rc=$?
+    if ((rc != 0)); then
+        sed -n '1,40p' /srv/state.err >&2
+        fail_case "$protocol install aborted on an IPv6-only host (exit $rc)"
+    fi
+    assert_eq "2001:db8::10" "$(node_field "$NODES_DIR/$node.env" SERVER_IPV6)" \
+        "$protocol must persist the detected IPv6 address"
+done
+
+# reset_node_state is the single source of truth for these globals. If save_env
+# grows a field that reset_node_state does not define, a fresh shell expanding it
+# under `set -u` must fail here rather than mid-install on a user's server.
+( set -u; reset_node_state; CURRENT_NODE_NAME=bare; NODES_DIR=/srv/state-nodes; save_env ) \
+    || fail_case "save_env expanded a field that reset_node_state does not define"
+assert_eq "bare" "$(node_field "$NODES_DIR/bare.env" NODE_NAME)" \
+    "save_env must write a node file from freshly reset state"
+SCENARIO
+
 printf '%s\n' "All remote-branch feature contract tests passed."

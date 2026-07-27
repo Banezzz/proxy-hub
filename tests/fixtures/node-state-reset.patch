@@ -1,0 +1,119 @@
+--- a/proxy-hub.sh
++++ b/proxy-hub.sh
+@@ -316,0 +317,28 @@
++# 节点作用域全局变量的唯一权威清单。
++#
++# 程序以 `set -u` 运行，因此任何一个未被赋值的变量在展开时都会立刻终止整个脚本。
++# 各协议分支只会赋值它自己用得到的字段（例如 AnyTLS 不需要 UUID，Shadowsocks
++# 不需要 REALITY 密钥），所以必须有一个统一的地方把全部字段都置为已定义状态，
++# 否则某个协议路径漏掉一个字段就会在 save_env 等下游函数里炸掉。
++#
++# 同样重要的是：这些变量是进程级全局量。同一次菜单会话里连续安装两个节点时，
++# 若不重置，第二个节点会继承第一个节点残留的密钥/端口，把不属于它的凭据写进
++# 自己的 .env。因此 install_node 也必须在进入协议分支之前调用本函数。
++# 注意：CURRENT_NODE_NAME 不在此列表内。它表示“当前选中的节点”，由 select_node /
++# install_node 在读取配置之前设置，属于选择状态而非节点内容；清空它会让随后的
++# save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
++reset_node_state() {
++    NODE_NAME="" PORT="" UUID="" SNI=""
++    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
++    XHTTP_PORT="" XHTTP_PATH=""
++    SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
++    SS_METHOD="" SS_PASSWORD=""
++    ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
++    HY2_PASSWORD=""
++    PROTOCOL_TYPE="vision"
++}
++
++# 在模块加载时就建立一次基线，使得任何代码路径（包括从未选择过协议的只读命令）
++# 展开上述变量时都不会触发 unbound variable。
++reset_node_state
++
+@@ -328,3 +356,3 @@
+-    NODE_NAME="" PORT="" UUID="" SNI="" PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+-    PROTOCOL_TYPE="" XHTTP_PORT="" XHTTP_PATH="" SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
+-    SS_METHOD="" SS_PASSWORD="" ANYTLS_PASSWORD="" HY2_PASSWORD=""
++    reset_node_state
++    # 本函数按文件内容重新填充；缺失的键保持空值，因此协议类型也从空开始判断。
++    PROTOCOL_TYPE=""
+@@ -4959,14 +4987,6 @@
+-PROTOCOL_TYPE="vision"
+-XHTTP_PORT=""
+-XHTTP_PATH=""
+-
+-# Shadowsocks 相关变量
+-SS_METHOD=""
+-SS_PASSWORD=""
+-
+-# AnyTLS 相关变量（协议类型: anytls, anytls_reality）
+-ANYTLS_PASSWORD=""
+-ANYTLS_PADDING_B64=""
+-
+-# Hysteria2 相关变量（由 sing-box 承载）
+-HY2_PASSWORD=""
++#
++# 节点作用域变量（PROTOCOL_TYPE / UUID / SNI / REALITY 密钥 / 各协议密码等）的默认值
++# 统一在 lib/00_security_state.sh 的 reset_node_state() 中定义，并在该模块加载时执行一次。
++# 此处曾经维护一份平行的默认值清单，但它只覆盖了部分字段（缺少 UUID / SNI / REALITY 密钥），
++# 导致 anytls_reality 这类不赋值 UUID 的协议分支在 `set -u` 下于 save_env 处崩溃。
++# 因此不要在这里重新引入清单——新增字段请只改 reset_node_state()。
+@@ -5474,3 +5494,3 @@
+-# 全局 IP 变量
+-SERVER_IPV4=""
+-SERVER_IPV6=""
++# 全局 IP 变量（SERVER_IP / SERVER_IPV4 / SERVER_IPV6）统一由
++# lib/00_security_state.sh 的 reset_node_state() 初始化。此处曾只声明 IPv4/IPv6
++# 两个而漏掉旧字段 SERVER_IP，导致 IPv6 Only 主机在 save_env 处触发 unbound variable。
+@@ -6526 +6546 @@
+-    local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
++    local save_ipv4="${SERVER_IPV4:-${SERVER_IP:-}}"
+@@ -6529,3 +6549,6 @@
+-    # Optional: encrypt sensitive values if encryption is enabled
+-    local save_uuid="$UUID"
+-    local save_private_key="$PRIVATE_KEY"
++    # 所有字段一律使用 ${VAR:-} 展开。节点变量按协议部分赋值（AnyTLS 无 UUID、
++    # Shadowsocks 无 REALITY 密钥……），在 `set -u` 下任何一个漏赋值的字段都会
++    # 让安装在此处中断，且此时节点文件尚未落盘、服务也未配置。reset_node_state()
++    # 已保证这些变量始终有定义，这里再兜一层，避免将来新增协议时重蹈覆辙。
++    local save_uuid="${UUID:-}"
++    local save_private_key="${PRIVATE_KEY:-}"
+@@ -6537,2 +6560,3 @@
+-        save_uuid=$(encrypt_value "$UUID")
+-        save_private_key=$(encrypt_value "$PRIVATE_KEY")
++        # encrypt_value 对空串直接返回空串，因此无需额外判空。
++        save_uuid=$(encrypt_value "$save_uuid")
++        save_private_key=$(encrypt_value "$save_private_key")
+@@ -6551,2 +6575,2 @@
+-SNI=$SNI
+-PUBLIC_KEY=$PUBLIC_KEY
++SNI=${SNI:-}
++PUBLIC_KEY=${PUBLIC_KEY:-}
+@@ -6554 +6578 @@
+-SHORT_ID=$SHORT_ID
++SHORT_ID=${SHORT_ID:-}
+@@ -7065,0 +7090,4 @@
++    # 清空上一次操作残留的节点变量。这些是进程级全局量：同一次菜单会话里连续安装
++    # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
++    reset_node_state
++
+@@ -7193,0 +7222,5 @@
++        # AnyTLS 两种变体都以密码认证，不使用 UUID；REALITY 变体额外需要密钥对。
++        # UUID 必须在分支之外显式置空：gen_reality_keys 只产出 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，
++        # 若把 UUID="" 留在 else 分支里，anytls_reality 路径就会带着未赋值的 UUID 走到
++        # save_env，在 `set -u` 下直接以 "UUID: unbound variable" 终止安装。
++        UUID=""
+@@ -7195 +7228 @@
+-            gen_reality_keys
++            gen_reality_keys || return 1
+@@ -7197 +7229,0 @@
+-            UUID=""
+@@ -7201,0 +7234,2 @@
++        SS_METHOD=""
++        SS_PASSWORD=""
+@@ -8018 +8052,2 @@
+-    # 更新全局变量
++    # 更新全局变量。IPv6 Only 主机上 current_ipv4 为空，此时保留原值；
++    # SERVER_IP 没有独立的探测来源，必须按 `set -u` 安全的方式展开。
+@@ -8021 +8056 @@
+-    SERVER_IP="${current_ipv4:-$SERVER_IP}"
++    SERVER_IP="${current_ipv4:-${SERVER_IP:-}}"

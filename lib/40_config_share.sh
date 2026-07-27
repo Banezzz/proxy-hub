@@ -429,19 +429,23 @@ save_env() {
     node_file=$(get_node_file "$node_name")
 
     # 使用检测到的 IP（优先使用 SERVER_IPV4，向后兼容 SERVER_IP）
-    local save_ipv4="${SERVER_IPV4:-$SERVER_IP}"
+    local save_ipv4="${SERVER_IPV4:-${SERVER_IP:-}}"
     local save_ipv6="${SERVER_IPV6:-}"
 
-    # Optional: encrypt sensitive values if encryption is enabled
-    local save_uuid="$UUID"
-    local save_private_key="$PRIVATE_KEY"
+    # 所有字段一律使用 ${VAR:-} 展开。节点变量按协议部分赋值（AnyTLS 无 UUID、
+    # Shadowsocks 无 REALITY 密钥……），在 `set -u` 下任何一个漏赋值的字段都会
+    # 让安装在此处中断，且此时节点文件尚未落盘、服务也未配置。reset_node_state()
+    # 已保证这些变量始终有定义，这里再兜一层，避免将来新增协议时重蹈覆辙。
+    local save_uuid="${UUID:-}"
+    local save_private_key="${PRIVATE_KEY:-}"
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
     local save_hy2_password="${HY2_PASSWORD:-}"
 
     if is_encryption_enabled; then
-        save_uuid=$(encrypt_value "$UUID")
-        save_private_key=$(encrypt_value "$PRIVATE_KEY")
+        # encrypt_value 对空串直接返回空串，因此无需额外判空。
+        save_uuid=$(encrypt_value "$save_uuid")
+        save_private_key=$(encrypt_value "$save_private_key")
         [[ -n "$save_ss_password" ]] && save_ss_password=$(encrypt_value "$SS_PASSWORD")
         [[ -n "$save_anytls_password" ]] && save_anytls_password=$(encrypt_value "$ANYTLS_PASSWORD")
         [[ -n "$save_hy2_password" ]] && save_hy2_password=$(encrypt_value "$HY2_PASSWORD")
@@ -454,10 +458,10 @@ SERVER_IPV4=${save_ipv4:-}
 SERVER_IPV6=${save_ipv6:-}
 PORT=${PORT:-}
 UUID=$save_uuid
-SNI=$SNI
-PUBLIC_KEY=$PUBLIC_KEY
+SNI=${SNI:-}
+PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
-SHORT_ID=$SHORT_ID
+SHORT_ID=${SHORT_ID:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
