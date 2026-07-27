@@ -488,9 +488,9 @@ is_valid_ipv6() {
     [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
 }
 
-# 全局 IP 变量
-SERVER_IPV4=""
-SERVER_IPV6=""
+# 全局 IP 变量（SERVER_IP / SERVER_IPV4 / SERVER_IPV6）统一由
+# lib/00_security_state.sh 的 reset_node_state() 初始化。此处曾只声明 IPv4/IPv6
+# 两个而漏掉旧字段 SERVER_IP，导致 IPv6 Only 主机在 save_env 处触发 unbound variable。
 
 # 获取 IPv4 地址
 get_ipv4() {

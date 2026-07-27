@@ -99,6 +99,10 @@ cmd_install() {
 
     log_info "$(msg installing)"
 
+    # 清空上一次操作残留的节点变量。这些是进程级全局量：同一次菜单会话里连续安装
+    # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
+    reset_node_state
+
     # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
     # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
     # GeoIP/GeoSite 数据库不再默认下载，仅在启用 WARP 分流时才按需获取。
@@ -227,14 +231,20 @@ cmd_install() {
         ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
         log_info "已生成随机化 AnyTLS padding scheme"
 
+        # AnyTLS 两种变体都以密码认证，不使用 UUID；REALITY 变体额外需要密钥对。
+        # UUID 必须在分支之外显式置空：gen_reality_keys 只产出 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，
+        # 若把 UUID="" 留在 else 分支里，anytls_reality 路径就会带着未赋值的 UUID 走到
+        # save_env，在 `set -u` 下直接以 "UUID: unbound variable" 终止安装。
+        UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
-            gen_reality_keys
+            gen_reality_keys || return 1
         else
-            UUID=""
             PUBLIC_KEY=""
             PRIVATE_KEY=""
             SHORT_ID=""
         fi
+        SS_METHOD=""
+        SS_PASSWORD=""
         HY2_PASSWORD=""
     else
         # VLESS 安装流程
@@ -1051,10 +1061,11 @@ cmd_update_ip() {
     echo ""
     log_info "$(msg update_ip_done) ($updated_count)"
 
-    # 更新全局变量
+    # 更新全局变量。IPv6 Only 主机上 current_ipv4 为空，此时保留原值；
+    # SERVER_IP 没有独立的探测来源，必须按 `set -u` 安全的方式展开。
     [[ -n "$current_ipv4" ]] && SERVER_IPV4="$current_ipv4"
     [[ -n "$current_ipv6" ]] && SERVER_IPV6="$current_ipv6"
-    SERVER_IP="${current_ipv4:-$SERVER_IP}"
+    SERVER_IP="${current_ipv4:-${SERVER_IP:-}}"
 
     # 重新同步所有实际使用的代理内核。
     log_info "$(msg update_ip_regen)"

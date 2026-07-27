@@ -1135,20 +1135,12 @@ cmd_xray_restart() {
 # ============== 协议类型选择 ==============
 
 # 协议类型: vision, xhttp, both, shadowsocks, anytls, anytls_reality, hysteria2
-PROTOCOL_TYPE="vision"
-XHTTP_PORT=""
-XHTTP_PATH=""
-
-# Shadowsocks 相关变量
-SS_METHOD=""
-SS_PASSWORD=""
-
-# AnyTLS 相关变量（协议类型: anytls, anytls_reality）
-ANYTLS_PASSWORD=""
-ANYTLS_PADDING_B64=""
-
-# Hysteria2 相关变量（由 sing-box 承载）
-HY2_PASSWORD=""
+#
+# 节点作用域变量（PROTOCOL_TYPE / UUID / SNI / REALITY 密钥 / 各协议密码等）的默认值
+# 统一在 lib/00_security_state.sh 的 reset_node_state() 中定义，并在该模块加载时执行一次。
+# 此处曾经维护一份平行的默认值清单，但它只覆盖了部分字段（缺少 UUID / SNI / REALITY 密钥），
+# 导致 anytls_reality 这类不赋值 UUID 的协议分支在 `set -u` 下于 save_env 处崩溃。
+# 因此不要在这里重新引入清单——新增字段请只改 reset_node_state()。
 
 # Shadowsocks 支持的加密方式
 SS_METHODS_2022=(

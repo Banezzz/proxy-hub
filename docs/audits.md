@@ -67,3 +67,20 @@
   后续写操作会被拒绝。
 - 临时缓解：从正常交互 shell、独立 service/process group 启动；确认所有相关任务均
   已退出后，按上文 stale-lock 流程人工清理。
+
+## 无控制终端运行时交互提示会以 unbound variable 中断
+
+- 严重性：low
+- 影响范围：全部交互式提示（协议选择、SS 加密方式选择、端口输入、SNI 选择、
+  编辑菜单），即 `lib/30_provision_network.sh` 与 `lib/50_node_commands.sh` 中
+  形如 `local choice` + `read -r choice </dev/tty` 的读取点。
+- 触发条件：进程没有控制终端因而 `/dev/tty` 无法打开，例如以
+  `curl ... | bash` 管道方式、在 cron/systemd/CI 等非交互上下文中运行。
+- 影响：`read` 因重定向失败而从未赋值，脚本在 `set -u` 下以
+  `choice: unbound variable` 之类的信息终止。属于失败关闭：终止发生在写入节点
+  文件和改动服务之前，不会留下半成品状态，但报错信息不能说明真实原因。
+- 临时缓解：从交互式 shell 运行（`bash proxy-hub.sh`，或先下载再执行，而非管道）；
+  需要无人值守时用文档记载的环境变量（`proto=`、`name=`、`reym=`、`port=`、
+  `ssmethod=` 等）跳过对应提示。
+- 说明：此处刻意不给这些变量补默认值——无终端时提示本身也无法显示，静默选取默认
+  协议或默认端口会让用户得到一个自己从未选择的节点，比失败关闭更糟。
