@@ -19,7 +19,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | 类型 | 命令 |
 | --- | --- |
 | 节点 | `install`, `list`, `info`, `qr`, `status`, `health`, `remove`, `edit` |
-| 运维 | `restart`, `regenerate`/`regen`, `update-ip`, `uninstall`, `test-sni`, `xray-update` |
+| 运维 | `restart`, `regenerate`/`regen`, `update-ip`, `netstack`/`ipstack`, `uninstall`, `test-sni`, `xray-update` |
 | 只读状态 | `xray-version` |
 | 工具 | `tools`, `warp`, `bbr`, `swap`, `fail2ban`, `timesync`, `ports`, `logs` |
 | 调度 | `xray-restart`/`restart-schedule` |
@@ -46,6 +46,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | `atpwd` | AnyTLS 密码 |
 | `hy2pwd` | Hysteria2 密码；8-128 位 URI 安全字符，不传时随机生成 |
 | `hy2sni` | Hysteria2 TLS SNI；不传时使用 `www.bing.com` |
+| `ipstack` | `dual`（默认）、`v4`、`v6`；同时接受 `both`/`ipv4`/`ipv6`/`4`/`6`/`v4-only` 等写法 |
 | `restart` | `daily`, `12h`, `6h`, `weekly`, `no` 及既有布尔别名 |
 
 变量名为既有的小写 shell 环境变量，拆分不能改名或转换为只接受命令行 flag。
@@ -147,6 +148,36 @@ lock pathname 直接调用 `flock`，而由固定 root-owned helper 校验 owner
 append-open FD 并核对 inode 后获取同一 lifecycle lock，且只重启原本 active 的内核。
 OpenRC 的 Xray MainPID 在没有可信 literal pidfile 时从同一 `/proc` 枚举器取得唯一 PID，
 Xray release 路径不要求 `pgrep`。
+
+## 网络栈契约
+
+网络栈是**实例级**设置，持久化在 `/root/.proxy_hub_netstack`，取值只有 `dual`、
+`v4`、`v6` 三种，默认 `dual`。文件缺失、为空、是符号链接或内容不在这三个值之内时
+一律回退 `dual`；原始内容永远不会进入配置文件或被当作 shell 代码执行。
+
+| 档位 | Xray inbound | sing-box inbound | Xray freedom 出站 | SNI 测速 | IP 探测与分享链接 |
+| --- | --- | --- | --- | --- | --- |
+| `dual` | `listen: "0.0.0.0"` | `listen: "::"` | 不写 `domainStrategy`（Xray 默认 `AsIs`） | 不限定协议族 | IPv4 与 IPv6 都探测、都输出 |
+| `v4` | `listen: "0.0.0.0"` | `listen: "0.0.0.0"` | `settings.domainStrategy = "UseIPv4"` | `openssl s_client -4` | 只探测并输出 IPv4 |
+| `v6` | `listen: "::"` + `streamSettings.sockopt.v6only = true` | `listen: "::"` | `settings.domainStrategy = "UseIPv6"` | `openssl s_client -6` | 只探测并输出 IPv6 |
+
+约束与边界：
+
+- `dual` 档产出的配置必须与引入本设置之前逐字段一致。Xray 与 sing-box 在该档
+  各自保留历史写法：两者在通配地址上等价（Go 监听通配地址且 network 为 `tcp`
+  时创建未设 `IPV6_V6ONLY` 的 `AF_INET6` socket，Xray 文档亦说明 `"0.0.0.0"`
+  与 `"::"` 等价），改写只会给现有安装引入无收益的行为变更。
+- 只有 `v6` 档写 `sockopt.v6only`，由 Xray 转成 `IPV6_V6ONLY`。sing-box 没有等价
+  字段，因此 AnyTLS / Hysteria2 在 `v6` 档仍是双栈绑定，只是不再产出 IPv4 链接。
+- `v4` 档不做 socket 级强制：真正的 v4-only 监听要求 bind 具体网卡地址，而 NAT 型
+  云主机的公网地址并不在网卡上，bind 它会让服务无法启动。该边界记录在
+  `docs/audits.md`。
+- 出站只使用 `UseIPv4` / `UseIPv6`。`UseIPv4v6` 一类较新的枚举值会让旧 Xray binary
+  在 `xray -test` 阶段拒绝配置，而普通 `install` 不会升级健康的既有 binary。
+- 切换必须走"保存 → 重建两个内核配置 → 重启"的顺序，任一步失败都恢复原设置并
+  再次重建，不允许留下"文件写着新档、运行中却是旧配置"的状态。尚无节点时只保存。
+- `netstack` 是写操作，沿用单实例写锁。`ipstack=` 环境变量在 `netstack` 与
+  `install` 两条路径上都被接受；`install` 路径必须在 SNI 测速与 IP 探测之前落盘。
 
 ## 协议运行时契约
 

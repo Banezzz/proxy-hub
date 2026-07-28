@@ -188,8 +188,18 @@ write_config() {
         fi
     done
 
-    # 构建 outbounds
-    local outbounds_json='[{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]'
+    # 构建 outbounds。freedom 的 domainStrategy 决定出站按哪个协议族解析域名：
+    # 双栈档返回空串，不写该字段，保持 Xray 默认 AsIs 与既有安装完全一致。
+    local outbounds_json freedom_strategy
+    freedom_strategy=$(netstack_freedom_strategy)
+    if ! outbounds_json=$(jq -n \
+        --arg strategy "$freedom_strategy" \
+        '[({"protocol": "freedom", "tag": "direct"}
+            | if $strategy == "" then . else . + {"settings": {"domainStrategy": $strategy}} end),
+          {"protocol": "blackhole", "tag": "block"}]' 2>&1); then
+        log_error "Failed to build outbounds: $outbounds_json"
+        return 1
+    fi
 
     # 检查是否有 WARP 代理
     if check_warp_running; then
@@ -476,6 +486,16 @@ ENV
     CURRENT_NODE_NAME="$node_name"
 }
 
+# 单链接与二维码使用的服务器地址：优先所选网络栈对应的协议族，其次回退到另一
+# 族，最后回退到旧字段 SERVER_IP，保证升级前创建的节点文件仍能产出链接。
+netstack_preferred_ip() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '%s' "${SERVER_IPV6:-${SERVER_IPV4:-${SERVER_IP:-}}}"
+    else
+        printf '%s' "${SERVER_IPV4:-${SERVER_IPV6:-${SERVER_IP:-}}}"
+    fi
+}
+
 # 生成 Vision 分享链接
 get_vision_link() {
     local ip="$1"
@@ -570,7 +590,8 @@ get_share_link() {
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
-    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
+    local ip
+    ip=$(netstack_preferred_ip)
     local proto_type="${PROTOCOL_TYPE:-vision}"
 
     # 根据协议类型返回对应的链接
@@ -606,7 +627,8 @@ show_node_qrcodes() {
     safe_load_node_config "$node_file" || return 1
 
     local node_label="${NODE_NAME:-RV-Reality}"
-    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
+    local ip
+    ip=$(netstack_preferred_ip)
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local shown=0 link
 
@@ -714,7 +736,7 @@ show_info() {
         echo ""
 
         # Shadowsocks IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -723,7 +745,7 @@ show_info() {
         fi
 
         # Shadowsocks IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -740,14 +762,14 @@ show_info() {
         echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
         echo ""
 
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
             echo -e "  ${YELLOW}Hysteria2:${NC}"
             echo -e "  $(get_hy2_link "$SERVER_IPV4" "${hostname}_Hysteria2_v4")"
         fi
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -789,7 +811,7 @@ show_info() {
         echo ""
 
         # AnyTLS IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -798,7 +820,7 @@ show_info() {
         fi
 
         # AnyTLS IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -824,7 +846,7 @@ show_info() {
         echo ""
 
         # IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -842,7 +864,7 @@ show_info() {
         fi
 
         # IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -861,8 +883,12 @@ show_info() {
         fi
     fi
 
-    # 向后兼容：如果没有 IPv4/IPv6，使用旧的 SERVER_IP
-    if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]] && [[ -n "${SERVER_IP:-}" ]]; then
+    # 向后兼容：上面没有输出任何协议族链接时回退到单链接。除了"旧节点只有
+    # SERVER_IP"，这里还覆盖"节点记录的地址族与当前网络栈设置不一致"（例如把
+    # 网络栈切到 v6 后查看一个只记录了 IPv4 的旧节点），否则该节点会一条链接都没有。
+    if ! { [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; } \
+        && ! { [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; } \
+        && [[ -n "${SERVER_IP:-}" ]]; then
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg share_link):${NC}"
         echo -e "${YELLOW}$(get_share_link)${NC}"

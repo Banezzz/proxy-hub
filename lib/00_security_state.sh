@@ -382,6 +382,125 @@ get_validated_port() {
     echo "$port"
 }
 
+# ============== 网络栈（IPv4 / IPv6）选择 ==============
+#
+# Linux 上 Xray 与 sing-box 的通配监听地址默认就是双栈：Go 监听通配地址且 network
+# 为 "tcp" 时会创建未设置 IPV6_V6ONLY 的 AF_INET6 socket，因此 "0.0.0.0" 与 "::"
+# 等价（Xray 文档同样如此说明）。本设置要解决的不是"能否收到 IPv6 连接"，而是
+# 现有实现无法表达的三件事：
+#   1. 严格只收 IPv6（需要 streamSettings.sockopt.v6only，Xray 转成 IPV6_V6ONLY）；
+#   2. 出站按指定协议族解析域名（freedom 的 domainStrategy）；
+#   3. SNI 测速、服务器 IP 探测与分享链接只使用被选中的协议族。
+#
+# 双栈档刻意保留 "0.0.0.0" 而不改写成 "::"：内核以 ipv6.disable=1 启动时 bind "::"
+# 会直接失败，"0.0.0.0" 不会，默认档必须对现有安装零回归。
+# 同理，v4 档也只能停在通配地址：真正的 v4-only 监听要求 bind 具体网卡地址，而
+# NAT 型云主机上公网地址并不在网卡上，bind 它会让服务起不来。该边界记录在
+# docs/audits.md。
+NETSTACK_FILE="/root/.proxy_hub_netstack"
+
+netstack_is_valid() {
+    case "${1:-}" in
+        dual|v4|v6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 把用户输入（ipstack= 环境变量）规范成 dual/v4/v6；无法识别时返回非零，
+# 绝不把原值直接落盘或拼进配置。
+netstack_normalize() {
+    local raw="${1:-}"
+    raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]_-')
+    case "$raw" in
+        dual|both|v4v6|ipv4ipv6|46) printf 'dual' ;;
+        v4|ipv4|4|v4only|ipv4only) printf 'v4' ;;
+        v6|ipv6|6|v6only|ipv6only) printf 'v6' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 读取持久化设置；文件缺失、为空、是符号链接或内容非法时一律回退到 dual。
+netstack_mode() {
+    local mode=""
+    if [[ -f "$NETSTACK_FILE" && ! -L "$NETSTACK_FILE" ]]; then
+        read -r mode < "$NETSTACK_FILE" 2>/dev/null || mode=""
+        mode="${mode//[^a-z0-9]/}"
+    fi
+    netstack_is_valid "$mode" || mode="dual"
+    printf '%s' "$mode"
+}
+
+netstack_save() {
+    local mode="${1:-}"
+    netstack_is_valid "$mode" || return 1
+    printf '%s\n' "$mode" > "$NETSTACK_FILE" || return 1
+    chmod 600 "$NETSTACK_FILE" 2>/dev/null || true
+}
+
+# 某个协议族是否参与本次配置（IP 探测、分享链接、二维码）。
+netstack_allows() {
+    local family="${1:-}"
+    case "$(netstack_mode)" in
+        v4) [[ "$family" == "v4" ]] ;;
+        v6) [[ "$family" == "v6" ]] ;;
+        *) [[ "$family" == "v4" || "$family" == "v6" ]] ;;
+    esac
+}
+
+# Xray inbound 的监听地址。
+netstack_listen_addr() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+# sing-box inbound 的监听地址。两个内核在 dual 档各自保留自己的历史写法
+# （Xray "0.0.0.0"、sing-box "::"）：它们在通配地址上等价，改写只会给现有
+# AnyTLS / Hysteria2 安装引入一次无收益的行为变更。只有 v4 档需要落到 IPv4
+# 通配地址，好让"只用 IPv4"这个选择在两个内核里表达一致。
+netstack_singbox_listen_addr() {
+    if [[ "$(netstack_mode)" == "v4" ]]; then
+        printf '0.0.0.0'
+    else
+        printf '::'
+    fi
+}
+
+# 只有 v6 档需要 sockopt.v6only；其余档返回 JSON null，jq 侧不写出该字段。
+# 该选项只存在于 Xray；sing-box inbound 没有等价字段，因此 AnyTLS 与 Hysteria2
+# 在 v6 档下仍是绑定 "::" 的双栈 socket，只是不再产出 IPv4 分享链接。
+netstack_sockopt_json() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '{"v6only":true}'
+    else
+        printf 'null'
+    fi
+}
+
+# freedom 出站的 domainStrategy。双栈档返回空串，保持 Xray 默认的 AsIs 与既有
+# 行为一致；v4/v6 档只使用自 V2Ray 时代就存在的 UseIPv4/UseIPv6，避免较旧的
+# Xray binary 在 `xray -test` 阶段拒绝 UseIPv4v6 这类新枚举值。
+netstack_freedom_strategy() {
+    case "$(netstack_mode)" in
+        v4) printf 'UseIPv4' ;;
+        v6) printf 'UseIPv6' ;;
+        *) printf '' ;;
+    esac
+}
+
+# openssl s_client 的协议族参数（SNI 测速与自定义 SNI 连通性检查）。
+# 返回空串表示跟随系统解析顺序。调用方须用 ${arr[@]+"${arr[@]}"} 展开，
+# 因为 bash 4.2 在 `set -u` 下展开空数组会报 unbound variable。
+netstack_openssl_family() {
+    case "$(netstack_mode)" in
+        v4) printf '%s' '-4' ;;
+        v6) printf '%s' '-6' ;;
+        *) printf '' ;;
+    esac
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
 # Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
 build_vision_inbound() {
@@ -402,16 +521,18 @@ build_vision_inbound() {
         --arg sni "$sni" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
                 "decryption": "none"
             },
-            "streamSettings": {
+            "streamSettings": ({
                 "network": "tcp",
                 "security": "reality",
                 "realitySettings": {
@@ -422,7 +543,7 @@ build_vision_inbound() {
                     "shortIds": [$short_id],
                     "fingerprint": "chrome"
                 }
-            },
+            } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
 }
@@ -449,16 +570,18 @@ build_xhttp_inbound() {
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
         --arg path "$xhttp_path" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": ""}],
                 "decryption": "none"
             },
-            "streamSettings": {
+            "streamSettings": ({
                 "network": "xhttp",
                 "security": "reality",
                 "xhttpSettings": {"path": $path},
@@ -470,7 +593,7 @@ build_xhttp_inbound() {
                     "shortIds": [$short_id],
                     "fingerprint": "chrome"
                 }
-            },
+            } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
 }
@@ -491,9 +614,11 @@ build_shadowsocks_inbound() {
         --argjson port "$port" \
         --arg method "$method" \
         --arg password "$password" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "shadowsocks",
             "settings": {
@@ -502,7 +627,7 @@ build_shadowsocks_inbound() {
                 "network": "tcp,udp"
             },
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $sockopt then . + {"streamSettings": {"sockopt": $sockopt}} else . end'
 }
 
 # Build AnyTLS inbound JSON (sing-box) using jq (prevents injection)
@@ -564,10 +689,11 @@ build_anytls_inbound() {
         --arg password "$password" \
         --arg padding "$padding" \
         --argjson tls "$tls_json" \
+        --arg listen "$(netstack_singbox_listen_addr)" \
         '{
             "type": "anytls",
             "tag": $tag,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
             "padding_scheme": ($padding | split("\n") | map(select(length > 0))),
@@ -619,10 +745,11 @@ build_hysteria2_inbound() {
         --arg sni "$sni" \
         --arg cert "$cert" \
         --arg key "$key" \
+        --arg listen "$(netstack_singbox_listen_addr)" \
         '{
             "type": "hysteria2",
             "tag": $tag,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
             "tls": {

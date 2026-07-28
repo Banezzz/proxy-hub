@@ -525,11 +525,22 @@ get_ipv6() {
 }
 
 # 检测网络栈类型
+#
+# 探测范围受网络栈设置约束：v4/v6 档不再探测另一族，也不把它写进节点文件，
+# 从而让分享链接、二维码和 update-ip 都只面对被选中的协议族。
+# 本函数在 cmd_install 里是裸调用，`set -e` 下返回非零会直接终止整个安装流程，
+# 因此地址缺失只告警不失败；真正的"选了 v6 却没有 v6 地址"拦截放在 cmd_netstack
+# 的选择时刻，那里可以安全地要求用户确认。
 detect_network_stack() {
     log_info "$(msg detecting_ip)"
 
-    SERVER_IPV4=$(get_ipv4)
-    SERVER_IPV6=$(get_ipv6)
+    local mode
+    mode=$(netstack_mode)
+
+    SERVER_IPV4=""
+    SERVER_IPV6=""
+    [[ "$mode" != "v6" ]] && SERVER_IPV4=$(get_ipv4)
+    [[ "$mode" != "v4" ]] && SERVER_IPV6=$(get_ipv6)
 
     if [[ -n "$SERVER_IPV4" ]] && [[ -n "$SERVER_IPV6" ]]; then
         log_info "Dual-Stack detected: IPv4=$SERVER_IPV4, IPv6=$SERVER_IPV6"
@@ -537,6 +548,8 @@ detect_network_stack() {
         log_info "IPv4 Only: $SERVER_IPV4"
     elif [[ -n "$SERVER_IPV6" ]]; then
         log_info "IPv6 Only: $SERVER_IPV6"
+    elif [[ "$mode" == "v6" ]]; then
+        log_warn "$(msg netstack_no_address) (IPv6)"
     else
         log_warn "Could not detect server IP automatically"
         SERVER_IPV4="YOUR_SERVER_IP"
@@ -655,11 +668,18 @@ load_latency_cache() {
 }
 
 # 测试单个域名延迟
+#
+# 必须按所选网络栈限定协议族：REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
+# 只能连到有 AAAA 记录的域名。若在这里仍按系统默认顺序测速，v6 Only 主机会把
+# 只有 A 记录的域名也判为"可用"，装出一个握手必然失败的节点。
 test_domain_latency() {
     local domain="$1"
-    local t1 t2
+    local t1 t2 family_flag
+    local -a family=()
+    family_flag=$(netstack_openssl_family)
+    [[ -n "$family_flag" ]] && family=("$family_flag")
     t1=$(date +%s%3N)
-    if timeout 2 openssl s_client -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
+    if timeout 2 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
         t2=$(date +%s%3N)
         echo "$((t2 - t1))"
     else
@@ -1095,9 +1115,13 @@ prompt_custom_sni() {
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
 
-            # 可选：测试自定义域名连通性
+            # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
+            local custom_family_flag
+            local -a custom_family=()
+            custom_family_flag=$(netstack_openssl_family)
+            [[ -n "$custom_family_flag" ]] && custom_family=("$custom_family_flag")
             echo -e "  ${CYAN}$(msg sni_testing_custom)...${NC}" >/dev/tty
-            if timeout 3 openssl s_client -connect "${SNI}:443" -servername "$SNI" </dev/null &>/dev/null; then
+            if timeout 3 openssl s_client ${custom_family[@]+"${custom_family[@]}"} -connect "${SNI}:443" -servername "$SNI" </dev/null &>/dev/null; then
                 log_info "$(msg sni_custom_ok)"
             else
                 log_warn "$(msg sni_custom_unreachable)"

@@ -103,6 +103,21 @@ cmd_install() {
     # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
     reset_node_state
 
+    # 网络栈（可选 ipstack=dual|v4|v6）。必须在 SNI 测速与 IP 探测之前落盘：
+    # 两者都按当前设置限定协议族，之后的 write_config 也要用它决定监听地址与出站。
+    if [[ -n "${ipstack:-}" ]]; then
+        local requested_stack
+        if ! requested_stack=$(netstack_normalize "$ipstack"); then
+            log_error "Invalid ipstack value: $ipstack (expected dual, v4, or v6)"
+            return 1
+        fi
+        if ! netstack_save "$requested_stack"; then
+            log_error "Failed to persist network stack setting"
+            return 1
+        fi
+    fi
+    log_info "Network stack: $(netstack_label "$(netstack_mode)")"
+
     # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
     # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
     # GeoIP/GeoSite 数据库不再默认下载，仅在启用 WARP 分流时才按需获取。
@@ -780,7 +795,7 @@ cmd_uninstall() {
     remove_xray_restart_schedule
     service_stop xray
     service_disable xray
-    rm -f "$XRAY_CONF" "$LANG_FILE"
+    rm -f "$XRAY_CONF" "$LANG_FILE" "$NETSTACK_FILE"
     rm -rf "$NODES_DIR"
 
     # Alpine 使用手动安装，需要手动清理
@@ -981,11 +996,13 @@ cmd_update_ip() {
         return 1
     fi
 
-    # 检测当前公网 IP
+    # 检测当前公网 IP。探测范围与网络栈设置一致：未被选中的协议族不再探测，
+    # 因此也不会把它写回节点文件（节点里已有的旧值原样保留，不做删除）。
     log_info "$(msg update_ip_detecting)"
-    local current_ipv4 current_ipv6
-    current_ipv4=$(get_ipv4)
-    current_ipv6=$(get_ipv6)
+    local current_ipv4="" current_ipv6="" netstack
+    netstack=$(netstack_mode)
+    [[ "$netstack" != "v6" ]] && current_ipv4=$(get_ipv4)
+    [[ "$netstack" != "v4" ]] && current_ipv6=$(get_ipv6)
 
     if [[ -z "$current_ipv4" ]] && [[ -z "$current_ipv6" ]]; then
         log_error "$(msg update_ip_detect_fail)"
@@ -1079,4 +1096,128 @@ cmd_update_ip() {
 
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# ============== 网络栈（IPv4 / IPv6）设置 ==============
+#
+# 这是实例级设置，一次决定四件事：Xray/sing-box inbound 的监听地址与
+# sockopt.v6only、Xray freedom 出站的 domainStrategy、SNI 测速使用的协议族，
+# 以及分享链接/二维码输出哪一族地址。因此切换后必须重建两个内核的配置并重启。
+
+# 三档的展示名。纯标签使用中英同排的固定文案，不再为它们各占一对 msg() 映射；
+# 带语义的提示语仍然走 msg()。
+netstack_label() {
+    case "${1:-}" in
+        v4) printf '%s' "IPv4 only / 仅 IPv4" ;;
+        v6) printf '%s' "IPv6 only / 仅 IPv6" ;;
+        *)  printf '%s' "IPv4 & IPv6 / 双栈" ;;
+    esac
+}
+
+# 所选协议族当前是否真的有公网地址；dual 只要求至少有一个。
+netstack_address_available() {
+    case "${1:-}" in
+        v4) [[ -n "$(get_ipv4)" ]] ;;
+        v6) [[ -n "$(get_ipv6)" ]] ;;
+        *) [[ -n "$(get_ipv4)" || -n "$(get_ipv6)" ]] ;;
+    esac
+}
+
+# 保存并让新设置生效。任何一步失败都恢复原设置并再次重建配置，避免留下
+# "文件里写着新档、运行中的内核却是旧配置"的不一致状态。
+netstack_apply() {
+    local mode="$1"
+    local previous
+    previous=$(netstack_mode)
+
+    if [[ "$mode" == "$previous" ]]; then
+        log_info "$(msg netstack_current): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    if ! netstack_save "$mode"; then
+        log_error "$(msg netstack_apply_failed)"
+        return 1
+    fi
+
+    # 还没有任何节点时没有配置可重建，保存即可。
+    if [[ "$(count_nodes)" -eq 0 ]]; then
+        log_info "$(msg netstack_applied): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    if cmd_regenerate; then
+        log_info "$(msg netstack_applied): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    log_error "$(msg netstack_apply_failed)"
+    netstack_save "$previous" || log_error "Failed to restore previous network stack setting"
+    cmd_regenerate >/dev/null 2>&1 || \
+        log_error "Manual recovery may be required: run the regenerate command"
+    return 1
+}
+
+cmd_netstack() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+
+    # 非交互入口：ipstack=dual|v4|v6（同时接受 both / ipv4 / ipv6 / 4 / 6）。
+    # 这条路径不提问，地址缺失只告警，避免脚本化调用被卡住。
+    if [[ -n "${ipstack:-}" ]]; then
+        local env_mode
+        if ! env_mode=$(netstack_normalize "$ipstack"); then
+            log_error "Invalid ipstack value: $ipstack (expected dual, v4, or v6)"
+            return 1
+        fi
+        netstack_address_available "$env_mode" || log_warn "$(msg netstack_no_address)"
+        netstack_apply "$env_mode"
+        return
+    fi
+
+    local choice current mode answer
+    while true; do
+        current=$(netstack_mode)
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg netstack_title)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg netstack_current): ${YELLOW}$(netstack_label "$current")${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} $(netstack_label dual)  ${GRAY}(default)${NC}"
+        echo -e "  ${GREEN}2.${NC} $(netstack_label v4)"
+        echo -e "  ${GREEN}3.${NC} $(netstack_label v6)"
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} $(msg xray_release_back)"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-3]: "
+        read -r choice
+
+        case "$choice" in
+            1) mode="dual" ;;
+            2) mode="v4" ;;
+            3) mode="v6" ;;
+            0|"") return 0 ;;
+            *) continue ;;
+        esac
+
+        # 选了某一族却探测不到对应地址时先拦一道。这道确认放在选择时刻，而不是放在
+        # detect_network_stack：安装流程里那是裸调用，返回非零会被 `set -e` 变成
+        # 整个进程退出。
+        if ! netstack_address_available "$mode"; then
+            log_warn "$(msg netstack_no_address)"
+            echo -n "  $(msg netstack_confirm) [y/N]: "
+            read -r answer
+            if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+                continue
+            fi
+        fi
+
+        netstack_apply "$mode"
+        return
+    done
 }
