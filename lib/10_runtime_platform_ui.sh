@@ -883,6 +883,12 @@ msg() {
             "vision_port") echo "Vision Port" ;;
             "ipv4_links") echo "IPv4 Links" ;;
             "ipv6_links") echo "IPv6 Links" ;;
+            "netstack_title") echo "Network Stack (IPv4 / IPv6)" ;;
+            "netstack_current") echo "Current network stack" ;;
+            "netstack_applied") echo "Network stack applied" ;;
+            "netstack_apply_failed") echo "Failed to apply the network stack, previous setting kept" ;;
+            "netstack_no_address") echo "No public address detected for the selected stack" ;;
+            "netstack_confirm") echo "Continue anyway?" ;;
             "warp_status") echo "WARP Status" ;;
             "warp_running") echo "Running" ;;
             "warp_stopped") echo "Stopped" ;;
@@ -1085,6 +1091,12 @@ msg() {
             "vision_port") echo "Vision 端口" ;;
             "ipv4_links") echo "IPv4 链接" ;;
             "ipv6_links") echo "IPv6 链接" ;;
+            "netstack_title") echo "网络栈 (IPv4 / IPv6)" ;;
+            "netstack_current") echo "当前网络栈" ;;
+            "netstack_applied") echo "网络栈设置已生效" ;;
+            "netstack_apply_failed") echo "网络栈应用失败，已保留原设置" ;;
+            "netstack_no_address") echo "未探测到所选协议族的公网地址" ;;
+            "netstack_confirm") echo "仍然继续?" ;;
             "warp_status") echo "WARP 状态" ;;
             "warp_running") echo "运行中" ;;
             "warp_stopped") echo "已停止" ;;

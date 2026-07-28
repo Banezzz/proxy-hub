@@ -23,6 +23,21 @@
 - 临时缓解：在云控制台按节点协议显式开放端口；Vision/XHTTP/AnyTLS 使用 TCP，
   Hysteria2 使用 UDP，Shadowsocks 同时开放 TCP 与 UDP。
 
+## "仅 IPv4" 档不是 socket 级强制
+
+- 严重性：low
+- 影响范围：网络栈设置为 `v4` 时的全部 inbound（Xray 与 sing-box）。
+- 触发条件：主机同时具备 IPv4 与 IPv6 地址。
+- 影响：`v4` 档只把出站域名解析、SNI 测速与分享链接收敛到 IPv4，监听仍停在通配
+  地址，而通配地址在 Linux 上是双栈 socket，因此该端口依旧可以被 IPv6 客户端连上。
+  真正只监听 IPv4 需要 bind 具体网卡地址，但 NAT 型云主机（Oracle/AWS/GCP 等）的
+  公网地址并不在网卡上，脚本据此 bind 会让服务直接无法启动，代价高于收益。
+  与之相对，`v6` 档通过 `sockopt.v6only` 做了真正的 socket 级强制。
+- 临时缓解：需要严格拒绝 IPv6 入站时，在主机防火墙用 `ip6tables`/`nft` 丢弃对应
+  端口，或在网卡/云安全组层面关闭 IPv6；也可以直接在内核以 `ipv6.disable=1` 启动。
+- 说明：sing-box inbound 没有 `v6only` 等价字段，因此 AnyTLS / Hysteria2 在 `v6`
+  档同样是双栈绑定，只是不再产出 IPv4 分享链接。
+
 ## 构建事务不确定时需人工恢复发布锁
 
 - 严重性：low

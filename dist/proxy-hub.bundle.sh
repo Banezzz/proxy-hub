@@ -398,6 +398,125 @@ get_validated_port() {
     echo "$port"
 }
 
+# ============== 网络栈（IPv4 / IPv6）选择 ==============
+#
+# Linux 上 Xray 与 sing-box 的通配监听地址默认就是双栈：Go 监听通配地址且 network
+# 为 "tcp" 时会创建未设置 IPV6_V6ONLY 的 AF_INET6 socket，因此 "0.0.0.0" 与 "::"
+# 等价（Xray 文档同样如此说明）。本设置要解决的不是"能否收到 IPv6 连接"，而是
+# 现有实现无法表达的三件事：
+#   1. 严格只收 IPv6（需要 streamSettings.sockopt.v6only，Xray 转成 IPV6_V6ONLY）；
+#   2. 出站按指定协议族解析域名（freedom 的 domainStrategy）；
+#   3. SNI 测速、服务器 IP 探测与分享链接只使用被选中的协议族。
+#
+# 双栈档刻意保留 "0.0.0.0" 而不改写成 "::"：内核以 ipv6.disable=1 启动时 bind "::"
+# 会直接失败，"0.0.0.0" 不会，默认档必须对现有安装零回归。
+# 同理，v4 档也只能停在通配地址：真正的 v4-only 监听要求 bind 具体网卡地址，而
+# NAT 型云主机上公网地址并不在网卡上，bind 它会让服务起不来。该边界记录在
+# docs/audits.md。
+NETSTACK_FILE="/root/.proxy_hub_netstack"
+
+netstack_is_valid() {
+    case "${1:-}" in
+        dual|v4|v6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 把用户输入（ipstack= 环境变量）规范成 dual/v4/v6；无法识别时返回非零，
+# 绝不把原值直接落盘或拼进配置。
+netstack_normalize() {
+    local raw="${1:-}"
+    raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]_-')
+    case "$raw" in
+        dual|both|v4v6|ipv4ipv6|46) printf 'dual' ;;
+        v4|ipv4|4|v4only|ipv4only) printf 'v4' ;;
+        v6|ipv6|6|v6only|ipv6only) printf 'v6' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 读取持久化设置；文件缺失、为空、是符号链接或内容非法时一律回退到 dual。
+netstack_mode() {
+    local mode=""
+    if [[ -f "$NETSTACK_FILE" && ! -L "$NETSTACK_FILE" ]]; then
+        read -r mode < "$NETSTACK_FILE" 2>/dev/null || mode=""
+        mode="${mode//[^a-z0-9]/}"
+    fi
+    netstack_is_valid "$mode" || mode="dual"
+    printf '%s' "$mode"
+}
+
+netstack_save() {
+    local mode="${1:-}"
+    netstack_is_valid "$mode" || return 1
+    printf '%s\n' "$mode" > "$NETSTACK_FILE" || return 1
+    chmod 600 "$NETSTACK_FILE" 2>/dev/null || true
+}
+
+# 某个协议族是否参与本次配置（IP 探测、分享链接、二维码）。
+netstack_allows() {
+    local family="${1:-}"
+    case "$(netstack_mode)" in
+        v4) [[ "$family" == "v4" ]] ;;
+        v6) [[ "$family" == "v6" ]] ;;
+        *) [[ "$family" == "v4" || "$family" == "v6" ]] ;;
+    esac
+}
+
+# Xray inbound 的监听地址。
+netstack_listen_addr() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+# sing-box inbound 的监听地址。两个内核在 dual 档各自保留自己的历史写法
+# （Xray "0.0.0.0"、sing-box "::"）：它们在通配地址上等价，改写只会给现有
+# AnyTLS / Hysteria2 安装引入一次无收益的行为变更。只有 v4 档需要落到 IPv4
+# 通配地址，好让"只用 IPv4"这个选择在两个内核里表达一致。
+netstack_singbox_listen_addr() {
+    if [[ "$(netstack_mode)" == "v4" ]]; then
+        printf '0.0.0.0'
+    else
+        printf '::'
+    fi
+}
+
+# 只有 v6 档需要 sockopt.v6only；其余档返回 JSON null，jq 侧不写出该字段。
+# 该选项只存在于 Xray；sing-box inbound 没有等价字段，因此 AnyTLS 与 Hysteria2
+# 在 v6 档下仍是绑定 "::" 的双栈 socket，只是不再产出 IPv4 分享链接。
+netstack_sockopt_json() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '{"v6only":true}'
+    else
+        printf 'null'
+    fi
+}
+
+# freedom 出站的 domainStrategy。双栈档返回空串，保持 Xray 默认的 AsIs 与既有
+# 行为一致；v4/v6 档只使用自 V2Ray 时代就存在的 UseIPv4/UseIPv6，避免较旧的
+# Xray binary 在 `xray -test` 阶段拒绝 UseIPv4v6 这类新枚举值。
+netstack_freedom_strategy() {
+    case "$(netstack_mode)" in
+        v4) printf 'UseIPv4' ;;
+        v6) printf 'UseIPv6' ;;
+        *) printf '' ;;
+    esac
+}
+
+# openssl s_client 的协议族参数（SNI 测速与自定义 SNI 连通性检查）。
+# 返回空串表示跟随系统解析顺序。调用方须用 ${arr[@]+"${arr[@]}"} 展开，
+# 因为 bash 4.2 在 `set -u` 下展开空数组会报 unbound variable。
+netstack_openssl_family() {
+    case "$(netstack_mode)" in
+        v4) printf '%s' '-4' ;;
+        v6) printf '%s' '-6' ;;
+        *) printf '' ;;
+    esac
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
 # Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
 build_vision_inbound() {
@@ -418,16 +537,18 @@ build_vision_inbound() {
         --arg sni "$sni" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
                 "decryption": "none"
             },
-            "streamSettings": {
+            "streamSettings": ({
                 "network": "tcp",
                 "security": "reality",
                 "realitySettings": {
@@ -438,7 +559,7 @@ build_vision_inbound() {
                     "shortIds": [$short_id],
                     "fingerprint": "chrome"
                 }
-            },
+            } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
 }
@@ -465,16 +586,18 @@ build_xhttp_inbound() {
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
         --arg path "$xhttp_path" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": ""}],
                 "decryption": "none"
             },
-            "streamSettings": {
+            "streamSettings": ({
                 "network": "xhttp",
                 "security": "reality",
                 "xhttpSettings": {"path": $path},
@@ -486,7 +609,7 @@ build_xhttp_inbound() {
                     "shortIds": [$short_id],
                     "fingerprint": "chrome"
                 }
-            },
+            } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
 }
@@ -507,9 +630,11 @@ build_shadowsocks_inbound() {
         --argjson port "$port" \
         --arg method "$method" \
         --arg password "$password" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": $listen,
             "port": $port,
             "protocol": "shadowsocks",
             "settings": {
@@ -518,7 +643,7 @@ build_shadowsocks_inbound() {
                 "network": "tcp,udp"
             },
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $sockopt then . + {"streamSettings": {"sockopt": $sockopt}} else . end'
 }
 
 # Build AnyTLS inbound JSON (sing-box) using jq (prevents injection)
@@ -580,10 +705,11 @@ build_anytls_inbound() {
         --arg password "$password" \
         --arg padding "$padding" \
         --argjson tls "$tls_json" \
+        --arg listen "$(netstack_singbox_listen_addr)" \
         '{
             "type": "anytls",
             "tag": $tag,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
             "padding_scheme": ($padding | split("\n") | map(select(length > 0))),
@@ -635,10 +761,11 @@ build_hysteria2_inbound() {
         --arg sni "$sni" \
         --arg cert "$cert" \
         --arg key "$key" \
+        --arg listen "$(netstack_singbox_listen_addr)" \
         '{
             "type": "hysteria2",
             "tag": $tag,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
             "tls": {
@@ -1762,6 +1889,12 @@ msg() {
             "vision_port") echo "Vision Port" ;;
             "ipv4_links") echo "IPv4 Links" ;;
             "ipv6_links") echo "IPv6 Links" ;;
+            "netstack_title") echo "Network Stack (IPv4 / IPv6)" ;;
+            "netstack_current") echo "Current network stack" ;;
+            "netstack_applied") echo "Network stack applied" ;;
+            "netstack_apply_failed") echo "Failed to apply the network stack, previous setting kept" ;;
+            "netstack_no_address") echo "No public address detected for the selected stack" ;;
+            "netstack_confirm") echo "Continue anyway?" ;;
             "warp_status") echo "WARP Status" ;;
             "warp_running") echo "Running" ;;
             "warp_stopped") echo "Stopped" ;;
@@ -1964,6 +2097,12 @@ msg() {
             "vision_port") echo "Vision 端口" ;;
             "ipv4_links") echo "IPv4 链接" ;;
             "ipv6_links") echo "IPv6 链接" ;;
+            "netstack_title") echo "网络栈 (IPv4 / IPv6)" ;;
+            "netstack_current") echo "当前网络栈" ;;
+            "netstack_applied") echo "网络栈设置已生效" ;;
+            "netstack_apply_failed") echo "网络栈应用失败，已保留原设置" ;;
+            "netstack_no_address") echo "未探测到所选协议族的公网地址" ;;
+            "netstack_confirm") echo "仍然继续?" ;;
             "warp_status") echo "WARP 状态" ;;
             "warp_running") echo "运行中" ;;
             "warp_stopped") echo "已停止" ;;
@@ -5528,11 +5667,22 @@ get_ipv6() {
 }
 
 # 检测网络栈类型
+#
+# 探测范围受网络栈设置约束：v4/v6 档不再探测另一族，也不把它写进节点文件，
+# 从而让分享链接、二维码和 update-ip 都只面对被选中的协议族。
+# 本函数在 cmd_install 里是裸调用，`set -e` 下返回非零会直接终止整个安装流程，
+# 因此地址缺失只告警不失败；真正的"选了 v6 却没有 v6 地址"拦截放在 cmd_netstack
+# 的选择时刻，那里可以安全地要求用户确认。
 detect_network_stack() {
     log_info "$(msg detecting_ip)"
 
-    SERVER_IPV4=$(get_ipv4)
-    SERVER_IPV6=$(get_ipv6)
+    local mode
+    mode=$(netstack_mode)
+
+    SERVER_IPV4=""
+    SERVER_IPV6=""
+    [[ "$mode" != "v6" ]] && SERVER_IPV4=$(get_ipv4)
+    [[ "$mode" != "v4" ]] && SERVER_IPV6=$(get_ipv6)
 
     if [[ -n "$SERVER_IPV4" ]] && [[ -n "$SERVER_IPV6" ]]; then
         log_info "Dual-Stack detected: IPv4=$SERVER_IPV4, IPv6=$SERVER_IPV6"
@@ -5540,6 +5690,8 @@ detect_network_stack() {
         log_info "IPv4 Only: $SERVER_IPV4"
     elif [[ -n "$SERVER_IPV6" ]]; then
         log_info "IPv6 Only: $SERVER_IPV6"
+    elif [[ "$mode" == "v6" ]]; then
+        log_warn "$(msg netstack_no_address) (IPv6)"
     else
         log_warn "Could not detect server IP automatically"
         SERVER_IPV4="YOUR_SERVER_IP"
@@ -5658,11 +5810,18 @@ load_latency_cache() {
 }
 
 # 测试单个域名延迟
+#
+# 必须按所选网络栈限定协议族：REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
+# 只能连到有 AAAA 记录的域名。若在这里仍按系统默认顺序测速，v6 Only 主机会把
+# 只有 A 记录的域名也判为"可用"，装出一个握手必然失败的节点。
 test_domain_latency() {
     local domain="$1"
-    local t1 t2
+    local t1 t2 family_flag
+    local -a family=()
+    family_flag=$(netstack_openssl_family)
+    [[ -n "$family_flag" ]] && family=("$family_flag")
     t1=$(date +%s%3N)
-    if timeout 2 openssl s_client -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
+    if timeout 2 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
         t2=$(date +%s%3N)
         echo "$((t2 - t1))"
     else
@@ -6098,9 +6257,13 @@ prompt_custom_sni() {
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
 
-            # 可选：测试自定义域名连通性
+            # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
+            local custom_family_flag
+            local -a custom_family=()
+            custom_family_flag=$(netstack_openssl_family)
+            [[ -n "$custom_family_flag" ]] && custom_family=("$custom_family_flag")
             echo -e "  ${CYAN}$(msg sni_testing_custom)...${NC}" >/dev/tty
-            if timeout 3 openssl s_client -connect "${SNI}:443" -servername "$SNI" </dev/null &>/dev/null; then
+            if timeout 3 openssl s_client ${custom_family[@]+"${custom_family[@]}"} -connect "${SNI}:443" -servername "$SNI" </dev/null &>/dev/null; then
                 log_info "$(msg sni_custom_ok)"
             else
                 log_warn "$(msg sni_custom_unreachable)"
@@ -6302,8 +6465,18 @@ write_config() {
         fi
     done
 
-    # 构建 outbounds
-    local outbounds_json='[{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]'
+    # 构建 outbounds。freedom 的 domainStrategy 决定出站按哪个协议族解析域名：
+    # 双栈档返回空串，不写该字段，保持 Xray 默认 AsIs 与既有安装完全一致。
+    local outbounds_json freedom_strategy
+    freedom_strategy=$(netstack_freedom_strategy)
+    if ! outbounds_json=$(jq -n \
+        --arg strategy "$freedom_strategy" \
+        '[({"protocol": "freedom", "tag": "direct"}
+            | if $strategy == "" then . else . + {"settings": {"domainStrategy": $strategy}} end),
+          {"protocol": "blackhole", "tag": "block"}]' 2>&1); then
+        log_error "Failed to build outbounds: $outbounds_json"
+        return 1
+    fi
 
     # 检查是否有 WARP 代理
     if check_warp_running; then
@@ -6590,6 +6763,16 @@ ENV
     CURRENT_NODE_NAME="$node_name"
 }
 
+# 单链接与二维码使用的服务器地址：优先所选网络栈对应的协议族，其次回退到另一
+# 族，最后回退到旧字段 SERVER_IP，保证升级前创建的节点文件仍能产出链接。
+netstack_preferred_ip() {
+    if [[ "$(netstack_mode)" == "v6" ]]; then
+        printf '%s' "${SERVER_IPV6:-${SERVER_IPV4:-${SERVER_IP:-}}}"
+    else
+        printf '%s' "${SERVER_IPV4:-${SERVER_IPV6:-${SERVER_IP:-}}}"
+    fi
+}
+
 # 生成 Vision 分享链接
 get_vision_link() {
     local ip="$1"
@@ -6684,7 +6867,8 @@ get_share_link() {
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
     local node_label="${NODE_NAME:-RV-Reality}"
-    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
+    local ip
+    ip=$(netstack_preferred_ip)
     local proto_type="${PROTOCOL_TYPE:-vision}"
 
     # 根据协议类型返回对应的链接
@@ -6720,7 +6904,8 @@ show_node_qrcodes() {
     safe_load_node_config "$node_file" || return 1
 
     local node_label="${NODE_NAME:-RV-Reality}"
-    local ip="${SERVER_IPV4:-${SERVER_IPV6:-$SERVER_IP}}"
+    local ip
+    ip=$(netstack_preferred_ip)
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local shown=0 link
 
@@ -6828,7 +7013,7 @@ show_info() {
         echo ""
 
         # Shadowsocks IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -6837,7 +7022,7 @@ show_info() {
         fi
 
         # Shadowsocks IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -6854,14 +7039,14 @@ show_info() {
         echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
         echo ""
 
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
             echo -e "  ${YELLOW}Hysteria2:${NC}"
             echo -e "  $(get_hy2_link "$SERVER_IPV4" "${hostname}_Hysteria2_v4")"
         fi
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -6903,7 +7088,7 @@ show_info() {
         echo ""
 
         # AnyTLS IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -6912,7 +7097,7 @@ show_info() {
         fi
 
         # AnyTLS IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -6938,7 +7123,7 @@ show_info() {
         echo ""
 
         # IPv4 链接
-        if [[ -n "${SERVER_IPV4:-}" ]]; then
+        if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv4_links):${NC}"
             echo ""
@@ -6956,7 +7141,7 @@ show_info() {
         fi
 
         # IPv6 链接
-        if [[ -n "${SERVER_IPV6:-}" ]]; then
+        if [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; then
             echo ""
             echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
             echo -e "${GREEN}$(msg ipv6_links):${NC}"
@@ -6975,8 +7160,12 @@ show_info() {
         fi
     fi
 
-    # 向后兼容：如果没有 IPv4/IPv6，使用旧的 SERVER_IP
-    if [[ -z "${SERVER_IPV4:-}" ]] && [[ -z "${SERVER_IPV6:-}" ]] && [[ -n "${SERVER_IP:-}" ]]; then
+    # 向后兼容：上面没有输出任何协议族链接时回退到单链接。除了"旧节点只有
+    # SERVER_IP"，这里还覆盖"节点记录的地址族与当前网络栈设置不一致"（例如把
+    # 网络栈切到 v6 后查看一个只记录了 IPv4 的旧节点），否则该节点会一条链接都没有。
+    if ! { [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; } \
+        && ! { [[ -n "${SERVER_IPV6:-}" ]] && netstack_allows v6; } \
+        && [[ -n "${SERVER_IP:-}" ]]; then
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "${GREEN}$(msg share_link):${NC}"
         echo -e "${YELLOW}$(get_share_link)${NC}"
@@ -7090,6 +7279,21 @@ cmd_install() {
     # 清空上一次操作残留的节点变量。这些是进程级全局量：同一次菜单会话里连续安装
     # 或先查看再安装时，未重置的字段会把上一个节点的 UUID/密钥/端口带进新节点的 .env。
     reset_node_state
+
+    # 网络栈（可选 ipstack=dual|v4|v6）。必须在 SNI 测速与 IP 探测之前落盘：
+    # 两者都按当前设置限定协议族，之后的 write_config 也要用它决定监听地址与出站。
+    if [[ -n "${ipstack:-}" ]]; then
+        local requested_stack
+        if ! requested_stack=$(netstack_normalize "$ipstack"); then
+            log_error "Invalid ipstack value: $ipstack (expected dual, v4, or v6)"
+            return 1
+        fi
+        if ! netstack_save "$requested_stack"; then
+            log_error "Failed to persist network stack setting"
+            return 1
+        fi
+    fi
+    log_info "Network stack: $(netstack_label "$(netstack_mode)")"
 
     # 仅安装通用依赖（curl/tar/jq/qrencode/openssl 等）。
     # 代理内核（Xray 或 sing-box）在选择协议类型之后按需安装；
@@ -7768,7 +7972,7 @@ cmd_uninstall() {
     remove_xray_restart_schedule
     service_stop xray
     service_disable xray
-    rm -f "$XRAY_CONF" "$LANG_FILE"
+    rm -f "$XRAY_CONF" "$LANG_FILE" "$NETSTACK_FILE"
     rm -rf "$NODES_DIR"
 
     # Alpine 使用手动安装，需要手动清理
@@ -7969,11 +8173,13 @@ cmd_update_ip() {
         return 1
     fi
 
-    # 检测当前公网 IP
+    # 检测当前公网 IP。探测范围与网络栈设置一致：未被选中的协议族不再探测，
+    # 因此也不会把它写回节点文件（节点里已有的旧值原样保留，不做删除）。
     log_info "$(msg update_ip_detecting)"
-    local current_ipv4 current_ipv6
-    current_ipv4=$(get_ipv4)
-    current_ipv6=$(get_ipv6)
+    local current_ipv4="" current_ipv6="" netstack
+    netstack=$(netstack_mode)
+    [[ "$netstack" != "v6" ]] && current_ipv4=$(get_ipv4)
+    [[ "$netstack" != "v4" ]] && current_ipv6=$(get_ipv6)
 
     if [[ -z "$current_ipv4" ]] && [[ -z "$current_ipv6" ]]; then
         log_error "$(msg update_ip_detect_fail)"
@@ -8067,6 +8273,130 @@ cmd_update_ip() {
 
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# ============== 网络栈（IPv4 / IPv6）设置 ==============
+#
+# 这是实例级设置，一次决定四件事：Xray/sing-box inbound 的监听地址与
+# sockopt.v6only、Xray freedom 出站的 domainStrategy、SNI 测速使用的协议族，
+# 以及分享链接/二维码输出哪一族地址。因此切换后必须重建两个内核的配置并重启。
+
+# 三档的展示名。纯标签使用中英同排的固定文案，不再为它们各占一对 msg() 映射；
+# 带语义的提示语仍然走 msg()。
+netstack_label() {
+    case "${1:-}" in
+        v4) printf '%s' "IPv4 only / 仅 IPv4" ;;
+        v6) printf '%s' "IPv6 only / 仅 IPv6" ;;
+        *)  printf '%s' "IPv4 & IPv6 / 双栈" ;;
+    esac
+}
+
+# 所选协议族当前是否真的有公网地址；dual 只要求至少有一个。
+netstack_address_available() {
+    case "${1:-}" in
+        v4) [[ -n "$(get_ipv4)" ]] ;;
+        v6) [[ -n "$(get_ipv6)" ]] ;;
+        *) [[ -n "$(get_ipv4)" || -n "$(get_ipv6)" ]] ;;
+    esac
+}
+
+# 保存并让新设置生效。任何一步失败都恢复原设置并再次重建配置，避免留下
+# "文件里写着新档、运行中的内核却是旧配置"的不一致状态。
+netstack_apply() {
+    local mode="$1"
+    local previous
+    previous=$(netstack_mode)
+
+    if [[ "$mode" == "$previous" ]]; then
+        log_info "$(msg netstack_current): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    if ! netstack_save "$mode"; then
+        log_error "$(msg netstack_apply_failed)"
+        return 1
+    fi
+
+    # 还没有任何节点时没有配置可重建，保存即可。
+    if [[ "$(count_nodes)" -eq 0 ]]; then
+        log_info "$(msg netstack_applied): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    if cmd_regenerate; then
+        log_info "$(msg netstack_applied): $(netstack_label "$mode")"
+        return 0
+    fi
+
+    log_error "$(msg netstack_apply_failed)"
+    netstack_save "$previous" || log_error "Failed to restore previous network stack setting"
+    cmd_regenerate >/dev/null 2>&1 || \
+        log_error "Manual recovery may be required: run the regenerate command"
+    return 1
+}
+
+cmd_netstack() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+
+    # 非交互入口：ipstack=dual|v4|v6（同时接受 both / ipv4 / ipv6 / 4 / 6）。
+    # 这条路径不提问，地址缺失只告警，避免脚本化调用被卡住。
+    if [[ -n "${ipstack:-}" ]]; then
+        local env_mode
+        if ! env_mode=$(netstack_normalize "$ipstack"); then
+            log_error "Invalid ipstack value: $ipstack (expected dual, v4, or v6)"
+            return 1
+        fi
+        netstack_address_available "$env_mode" || log_warn "$(msg netstack_no_address)"
+        netstack_apply "$env_mode"
+        return
+    fi
+
+    local choice current mode answer
+    while true; do
+        current=$(netstack_mode)
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}                     $(msg netstack_title)${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  $(msg netstack_current): ${YELLOW}$(netstack_label "$current")${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} $(netstack_label dual)  ${GRAY}(default)${NC}"
+        echo -e "  ${GREEN}2.${NC} $(netstack_label v4)"
+        echo -e "  ${GREEN}3.${NC} $(netstack_label v6)"
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${RED}0.${NC} $(msg xray_release_back)"
+        echo ""
+        echo -n "  $(msg menu_choice) [0-3]: "
+        read -r choice
+
+        case "$choice" in
+            1) mode="dual" ;;
+            2) mode="v4" ;;
+            3) mode="v6" ;;
+            0|"") return 0 ;;
+            *) continue ;;
+        esac
+
+        # 选了某一族却探测不到对应地址时先拦一道。这道确认放在选择时刻，而不是放在
+        # detect_network_stack：安装流程里那是裸调用，返回非零会被 `set -e` 变成
+        # 整个进程退出。
+        if ! netstack_address_available "$mode"; then
+            log_warn "$(msg netstack_no_address)"
+            echo -n "  $(msg netstack_confirm) [y/N]: "
+            read -r answer
+            if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+                continue
+            fi
+        fi
+
+        netstack_apply "$mode"
+        return
+    done
 }
 
 # ============== WARP 管理 ==============
@@ -10372,6 +10702,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}N.${NC} $(msg netstack_title)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
@@ -10386,7 +10717,7 @@ show_menu() {
 main_menu() {
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,E,I,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,L,U]: "
         read -r choice
         echo ""
 
@@ -10446,6 +10777,11 @@ main_menu() {
                 echo ""
                 read -rp "$(msg menu_press_enter)"
                 ;;
+            [Nn])
+                cmd_netstack
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Tt])
                 cmd_tools
                 ;;
@@ -10488,6 +10824,7 @@ show_help() {
     echo "  restart     Restart service"
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
+    echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -10516,6 +10853,17 @@ show_help() {
     echo "  vlpt=xxx      Specify Vision port (for vision/both)"
     echo "  xhpt=xxx      Specify XHTTP port (for xhttp/both)"
     echo "  uuid=xxx      Specify UUID (VLESS only)"
+    echo "  ipstack=xxx   Network stack: dual (default), v4, or v6"
+    echo ""
+    echo "Network stack (applies to every node, both cores):"
+    echo "  dual  Listen on the wildcard address (IPv4 + IPv6), no outbound domainStrategy,"
+    echo "        probe and publish both families"
+    echo "  v4    Wildcard listen, freedom domainStrategy=UseIPv4, IPv4-only SNI probe and links"
+    echo "  v6    Listen on :: with sockopt.v6only, freedom domainStrategy=UseIPv6,"
+    echo "        IPv6-only SNI probe and links"
+    echo ""
+    echo "  bash $0 netstack              # Interactive selection"
+    echo "  ipstack=v6 bash $0 netstack   # Non-interactive"
     echo ""
     echo "Shadowsocks parameters:"
     echo "  ssmethod=xxx  Encryption: 2022-blake3-aes-256-gcm (default),"
@@ -10649,6 +10997,11 @@ case "${1:-}" in
         init_language_if_needed
         cmd_update_ip
         ;;
+    netstack|ipstack)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_netstack
+        ;;
     uninstall)
         check_lock_for_write_ops
         init_language_if_needed
@@ -10723,7 +11076,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=412593 body-sha256=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
-# build-id=bf11dca958a7b6b1a3bc0dcec00106bb24a3d58abc1d3fad5396f1d99d63ee46
+# body-bytes=428653 body-sha256=01eb93b8339c42c76be25fc0b84c78e362508f83f334229ab5b15b2cb90454b5
+# build-id=01eb93b8339c42c76be25fc0b84c78e362508f83f334229ab5b15b2cb90454b5
 # module-count=11
 # proxy-hub-bundle-end-v1

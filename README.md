@@ -115,6 +115,8 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
 ║   8. 测试 SNI 延迟                                             ║
 ║   9. 健康检查                                                  ║
 ╠═══════════════════════════════════════════════════════════════╣
+║   I. 更新节点 IP                                               ║
+║   N. 网络栈 (IPv4 / IPv6)                                      ║
 ║   T. 系统工具 (Xray/WARP/BBR/Swap/Fail2ban/Ports/Logs)         ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║   L. 切换语言                                                  ║
@@ -165,6 +167,8 @@ bundle。开发与发布架构见 [`docs/dev.md`](docs/dev.md)，稳定的命令
 ./proxy-hub.sh remove      # 删除节点
 ./proxy-hub.sh restart     # 重启服务
 ./proxy-hub.sh test-sni    # 测试 SNI 延迟
+./proxy-hub.sh update-ip   # 检测 IP 变化并更新所有节点
+./proxy-hub.sh netstack    # 选择网络栈：IPv4 & IPv6 / 仅 IPv4 / 仅 IPv6
 ./proxy-hub.sh uninstall   # 卸载所有节点和 Xray
 
 # Xray 版本管理
@@ -255,6 +259,43 @@ name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 | `hy2sni` | Hysteria2 TLS SNI（默认 `www.bing.com`） | `hy2sni=edge.example.com` |
 | `reym` | SNI 域名 (VLESS / AnyTLS+REALITY) | `reym=www.microsoft.com` |
 | `uuid` | 自定义 UUID | `uuid=xxx-xxx-xxx` |
+| `ipstack` | 网络栈：`dual`（默认）/ `v4` / `v6` | `ipstack=v6` |
+
+## 网络栈 (IPv4 / IPv6)
+
+主菜单 `N` 或 `./proxy-hub.sh netstack` 可以在三档之间切换，设置对所有节点、
+两个内核同时生效：
+
+```
+1. IPv4 & IPv6 / 双栈   (默认)
+2. IPv4 only / 仅 IPv4
+3. IPv6 only / 仅 IPv6
+```
+
+| 档位 | 监听 | 出站 | SNI 测速 | 分享链接 |
+|------|------|------|----------|----------|
+| 双栈 | 通配地址，同时接受 IPv4 与 IPv6 | 跟随系统解析（Xray 默认 `AsIs`） | 不限定协议族 | IPv4 与 IPv6 都输出 |
+| 仅 IPv4 | 通配地址 | `domainStrategy=UseIPv4` | 只测 IPv4 可达的域名 | 只输出 IPv4 |
+| 仅 IPv6 | `::` 且置 `sockopt.v6only`，不再接受 IPv4 | `domainStrategy=UseIPv6` | 只测 IPv6 可达的域名 | 只输出 IPv6 |
+
+几点说明：
+
+- 默认档与升级前完全一致。Xray 的通配监听本来就同时收 IPv4 和 IPv6（官方文档
+  说明 `"0.0.0.0"` 与 `"::"` 等价），因此双栈档不需要、也刻意不改写监听地址——
+  以 `ipv6.disable=1` 启动的内核上绑定 `"::"` 会让服务起不来。
+- 仅 IPv6 是唯一做 socket 级强制的档（`IPV6_V6ONLY`）。仅 IPv4 只收敛出站解析、
+  SNI 测速与链接输出：真正的 v4-only 监听需要绑定具体网卡地址，而 NAT 型云主机的
+  公网地址并不在网卡上。
+- 选择仅 IPv6 时 SNI 测速会自动只保留有 AAAA 记录的域名。REALITY 的 dest 握手由
+  服务器自己发起，v6 Only 主机上选到只有 A 记录的域名会导致握手失败。
+- 切换会重建两个内核的配置并重启；任何一步失败都自动回到原设置。
+- 非交互：`ipstack=v6 ./proxy-hub.sh netstack`，或在安装时 `ipstack=v6 ... install`。
+
+```bash
+./proxy-hub.sh netstack              # 交互选择
+ipstack=v6 ./proxy-hub.sh netstack   # 非交互切换
+ipstack=v4 name=hk1 ./proxy-hub.sh install
+```
 
 ## 系统工具
 

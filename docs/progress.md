@@ -1,5 +1,43 @@
 # 变更记录
 
+## 2026-07-28 — 网络栈（IPv4 / IPv6）选择
+
+- 新增实例级网络栈设置（`/root/.proxy_hub_netstack`，取值 `dual`/`v4`/`v6`，默认
+  `dual`），主菜单 `N`、`netstack`/`ipstack` 命令和 `ipstack=` 环境变量三条入口共用
+  同一套规范化、校验与应用逻辑；`netstack` 属于写操作，沿用单实例写锁。
+- 三档语义：`dual` 保持通配监听与 Xray 默认 `AsIs` 出站；`v4` 收敛为
+  `domainStrategy=UseIPv4`、只测 IPv4 可达 SNI、只探测并输出 IPv4；`v6` 额外写
+  `streamSettings.sockopt.v6only`（Xray 转成 `IPV6_V6ONLY`）、`UseIPv6`、只测 IPv6
+  可达 SNI、只输出 IPv6。
+- `dual` 档产物与本次改动前逐字段一致：通配监听在 Linux 上本就是双栈 socket，
+  Xray 文档亦说明 `"0.0.0.0"` 与 `"::"` 等价，因此默认档刻意不改写监听地址——以
+  `ipv6.disable=1` 启动的内核上绑定 `"::"` 会让服务无法启动。两个内核在该档也各自
+  保留历史写法（Xray `"0.0.0.0"`、sing-box `"::"`）。
+- 出站只使用 `UseIPv4`/`UseIPv6` 这类长期存在的枚举值，避免较新的 `UseIPv4v6` 让
+  未升级的既有 Xray binary 在 `xray -test` 阶段拒绝配置，把装节点变成安装失败。
+- SNI 测速与自定义 SNI 连通性检查按档位附加 `openssl s_client -4/-6`：REALITY 的
+  dest 握手由服务器自己发起，v6 Only 主机上只有 A 记录的域名会被测成"可用"，
+  从而装出握手必然失败的节点。
+- 设置文件按不可信输入处理（缺失/空/符号链接/非法内容一律回退 `dual`，原始内容不
+  进入配置也不被求值）；切换按"保存 → 重建两个内核配置 → 重启"执行，任一步失败
+  都恢复原设置并再次重建，尚无节点时只保存。
+
+影响范围：Xray/sing-box inbound 监听、Xray freedom 出站、SNI 测速、服务器 IP 探测、
+`update-ip`、分享链接与二维码的协议族范围，以及主菜单、`help` 和卸载清理。节点
+`.env` schema、UUID、REALITY 密钥、端口与密码均不变。
+
+兼容性：默认 `dual` 与升级前行为一致，既有节点无需重装。切到 `v6` 后查看只记录了
+IPv4 的旧节点仍会回退输出单条链接，不会出现"一条链接都没有"。`v4` 档不做 socket
+级强制（边界见 `docs/audits.md`）；sing-box 无 `v6only` 等价字段，`v6` 档下
+AnyTLS / Hysteria2 仍为双栈绑定。
+
+验证方式：`bash tests/test_netstack.sh` 覆盖三档的监听地址、sockopt 有无与
+streamSettings 合并完整性、出站 `domainStrategy`、sing-box 监听、SNI 测速参数、
+IP 探测与链接协议族、地址族不匹配旧节点的回退、非法设置回退与切换失败回滚；
+另以真实 Xray binary 对三档产物执行 `xray -test -config`；随后运行
+`bash scripts/build-bundle.sh`、`bash -n` 全量语法检查、仓库完整测试与
+`git diff --check`。
+
 ## 2026-07-21 — Xray Release Management
 
 - 新增 `xray-version` 与 `xray-update` CLI，并在中英文系统工具菜单和 `help` 中加入

@@ -82,6 +82,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}N.${NC} $(msg netstack_title)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
@@ -96,7 +97,7 @@ show_menu() {
 main_menu() {
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,E,I,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,L,U]: "
         read -r choice
         echo ""
 
@@ -156,6 +157,11 @@ main_menu() {
                 echo ""
                 read -rp "$(msg menu_press_enter)"
                 ;;
+            [Nn])
+                cmd_netstack
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Tt])
                 cmd_tools
                 ;;
@@ -198,6 +204,7 @@ show_help() {
     echo "  restart     Restart service"
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
+    echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -226,6 +233,17 @@ show_help() {
     echo "  vlpt=xxx      Specify Vision port (for vision/both)"
     echo "  xhpt=xxx      Specify XHTTP port (for xhttp/both)"
     echo "  uuid=xxx      Specify UUID (VLESS only)"
+    echo "  ipstack=xxx   Network stack: dual (default), v4, or v6"
+    echo ""
+    echo "Network stack (applies to every node, both cores):"
+    echo "  dual  Listen on the wildcard address (IPv4 + IPv6), no outbound domainStrategy,"
+    echo "        probe and publish both families"
+    echo "  v4    Wildcard listen, freedom domainStrategy=UseIPv4, IPv4-only SNI probe and links"
+    echo "  v6    Listen on :: with sockopt.v6only, freedom domainStrategy=UseIPv6,"
+    echo "        IPv6-only SNI probe and links"
+    echo ""
+    echo "  bash $0 netstack              # Interactive selection"
+    echo "  ipstack=v6 bash $0 netstack   # Non-interactive"
     echo ""
     echo "Shadowsocks parameters:"
     echo "  ssmethod=xxx  Encryption: 2022-blake3-aes-256-gcm (default),"
@@ -358,6 +376,11 @@ case "${1:-}" in
         check_lock_for_write_ops
         init_language_if_needed
         cmd_update_ip
+        ;;
+    netstack|ipstack)
+        check_lock_for_write_ops
+        init_language_if_needed
+        cmd_netstack
         ;;
     uninstall)
         check_lock_for_write_ops

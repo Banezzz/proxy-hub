@@ -124,6 +124,40 @@ Hysteria2 两者都没有。这两个事实叠加，会产生两类缺陷：
 的 `node-state-contract`，它刻意使用真实 `save_env`——把 `save_env` 打桩正是当初
 让该缺陷逃过测试的原因。
 
+## 网络栈（IPv4 / IPv6）选择
+
+一个实例级设置（`/root/.proxy_hub_netstack`，取值 `dual`/`v4`/`v6`，默认 `dual`）
+同时决定四件事：Xray/sing-box inbound 的监听地址与 `sockopt.v6only`、Xray freedom
+出站的 `domainStrategy`、SNI 测速使用的协议族，以及 IP 探测与分享链接输出哪一族。
+逐档的字段级契约见 `docs/api.md` 的"网络栈契约"。
+
+设计上有四个不可省略的判断：
+
+1. **通配监听本来就是双栈**。Go 在监听通配地址且 network 为 `tcp` 时创建未设置
+   `IPV6_V6ONLY` 的 `AF_INET6` socket，Xray 文档因此明确 `"0.0.0.0"` 与 `"::"`
+   等价。所以本设置解决的不是"能不能收到 IPv6 连接"，而是三件旧实现无法表达的
+   事：严格只收 IPv6、按协议族选择出站解析、把 SNI 测速与链接输出限定到一族。
+   基于同一理由，`dual` 档刻意不把 `"0.0.0.0"` 改写成 `"::"`——以
+   `ipv6.disable=1` 启动的内核上绑定 `"::"` 会让服务起不来，默认档必须零回归。
+   两个内核在 `dual` 档也各自保留历史写法（Xray `"0.0.0.0"`、sing-box `"::"`）。
+2. **`v4` 档不做 socket 级强制**。真正的 v4-only 监听要求 bind 具体网卡地址，而
+   NAT 型云主机的公网地址并不在网卡上，bind 它会让服务无法启动。该边界写在
+   `docs/audits.md`，不能用"看起来更彻底"的实现换掉。
+3. **出站只用 `UseIPv4` / `UseIPv6`**。`UseIPv4v6` 这类枚举值较新，而普通
+   `install` 对健康的既有 binary 只报告版本、不升级，旧 binary 会在
+   `xray -test` 阶段直接拒绝配置，把一次装节点变成一次安装失败。`dual` 档不写
+   该字段，保持 Xray 默认的 `AsIs`。
+4. **SNI 测速必须限定协议族**。REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
+   只能连到有 AAAA 记录的域名。若测速仍按系统默认顺序，只有 A 记录的域名会被测成
+   "可用"，装出一个握手必然失败的节点。`openssl s_client` 的 `-4`/`-6` 参数以
+   `${arr[@]+"${arr[@]}"}` 展开，因为 bash 4.2 在 `set -u` 下展开空数组会报错。
+
+设置文件按不可信输入处理：缺失、为空、是符号链接或内容非法都回退 `dual`，原始
+内容不进入配置也不被求值。切换按"保存 → 重建两个内核配置 → 重启"执行，任一步
+失败都恢复原设置并再次重建；尚无节点时只保存不重建。`detect_network_stack` 在
+安装流程里是裸调用，`set -e` 下返回非零会终止整个安装，因此"选了某族却没有该族
+地址"只告警，真正的确认拦在 `cmd_netstack` 的选择时刻。
+
 ## Xray Release Management
 
 Xray target 由一个 resolver 统一决定，优先级固定为
@@ -389,6 +423,7 @@ bash tests/test_cleanup_lock.sh
 bash tests/test_ssh_rollback.sh
 bash tests/test_remote_branch_features.sh
 bash tests/test_firewall_protocols.sh
+bash tests/test_netstack.sh
 bash tests/test_xray_release.sh
 bash tests/test_xray_transaction.sh
 git diff --check
@@ -432,6 +467,10 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
   检查失败后的旧 binary 恢复；
 - Xray 更新在停服后的 TERM 回滚，以及 activated 持久 journal 在下一次写操作中的
   旧 binary、active 状态与事务残留恢复；
+- 三档网络栈的 inbound 监听地址、`sockopt.v6only` 的有无与合并后 streamSettings
+  的完整性、freedom 出站 `domainStrategy`、sing-box 监听地址、SNI 测速的
+  `-4`/`-6` 参数、IP 探测与分享链接的协议族范围、地址族不匹配旧节点的单链接回退，
+  以及设置文件为非法/空/符号链接时回退 `dual`、切换失败后的设置回滚；
 - 七种协议各自跑通真实 `cmd_install` + 真实 `save_env`，确保没有协议分支在
   `set -u` 下留下未赋值的节点变量；AnyTLS/AnyTLS+REALITY 的 UUID 与 REALITY
   字段划分；同一会话内连续安装不串用上一个节点的凭据；IPv6 Only 主机上
@@ -444,6 +483,8 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
 ## 关键决策
 
 - 保留一个稳定根入口，避免用户迁移命令。
+- 网络栈是实例级设置而非节点字段：监听地址、出站与 SNI 测速对整个内核生效，
+  逐节点保存会产生互相矛盾的组合。
 - 本地使用拆分模块，远程使用单一 bundle，避免逐模块网络请求和跨版本混装。
 - 所有远程内容在 source 前完成下载与验证，失败时不产生业务副作用。
 - 普通节点安装不改变健康的现有 Xray；只有全新安装或显式 `xray-update` 解析 release。
