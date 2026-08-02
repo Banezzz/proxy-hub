@@ -902,7 +902,11 @@ msg() {
             "fail2ban_status") echo "Fail2ban Status" ;;
             "script_running") echo "Script is already running!" ;;
             "lock_owner_alive") echo "Another instance appears to be running" ;;
+            "lock_owner_unknown") echo "Could not determine whether the recorded owner is still running" ;;
+            "lock_owner_inspect") echo "Identify that process first:" ;;
+            "lock_owner_stop") echo "If it is a leftover proxy-hub process, stop it to release the lock (do not kill an unrelated process):" ;;
             "lock_stale_hint") echo "The recorded owner process is gone; the lock looks stale (left over from an unclean exit)" ;;
+            "lock_stale_recycled") echo "The recorded PID now belongs to an unrelated process; the owner exited and the lock is stale" ;;
             "lock_stale_action") echo "If no proxy-hub write operation is running, remove the stale lock with:" ;;
             "enable_xhttp") echo "Enable XHTTP protocol? (y/n)" ;;
             "xhttp_enabled") echo "XHTTP protocol enabled" ;;
@@ -1110,7 +1114,11 @@ msg() {
             "fail2ban_status") echo "Fail2ban 状态" ;;
             "script_running") echo "脚本已在运行中！" ;;
             "lock_owner_alive") echo "检测到另一个实例正在运行" ;;
+            "lock_owner_unknown") echo "无法确认锁记录的进程是否仍在运行" ;;
+            "lock_owner_inspect") echo "请先确认该进程的身份：" ;;
+            "lock_owner_stop") echo "若确认是残留的 proxy-hub 进程，结束它即可释放锁（不要结束无关进程）：" ;;
             "lock_stale_hint") echo "锁记录的进程已不存在，可能是上次异常退出残留的锁" ;;
+            "lock_stale_recycled") echo "锁记录的 PID 已被无关进程复用，原实例已退出，这是残留的锁" ;;
             "lock_stale_action") echo "确认没有 proxy-hub 写操作在运行后，可用以下命令清理残留锁：" ;;
             "enable_xhttp") echo "是否启用 XHTTP 协议？(y/n)" ;;
             "xhttp_enabled") echo "XHTTP 协议已启用" ;;

@@ -586,7 +586,25 @@ OPENRC_SERVICE
     chmod 755 /etc/init.d/sing-box
 }
 
-# 安装 sing-box（下载官方预编译二进制，适用于所有发行版包括 Alpine）
+# musl 系统（Alpine）没有 glibc 动态链接器，无法执行链接 glibc 的二进制文件。
+# 上游从 sing-box v1.13.0 起把默认 linux 归档改成动态链接 glibc，并另外发布
+# 静态链接的 "-musl" 归档；归档选择因此必须按 libc 而不是按 init 系统判断。
+system_is_musl() {
+    local candidate ldd_version=""
+
+    if [[ "${PKG_MANAGER:-}" == "apk" || -f /etc/alpine-release ]]; then
+        return 0
+    fi
+    for candidate in /lib/ld-musl-*.so.1; do
+        if [[ -e "$candidate" ]]; then
+            return 0
+        fi
+    done
+    ldd_version=$(ldd --version 2>&1) || true
+    [[ "$ldd_version" == *musl* ]]
+}
+
+# 安装 sing-box（下载官方预编译二进制，按 libc 选择归档，兼容 glibc 与 musl）
 # AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
 install_singbox() {
     if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
@@ -618,14 +636,33 @@ install_singbox() {
     fi
     version="${tag#v}"
 
+    # 归档选择按 libc 而不是按发行版：sing-box >= 1.13.0 的默认 linux 归档动态
+    # 链接 glibc，在 Alpine 上会以 "cannot execute: required file not found"
+    # 失败；静态链接的 "-musl" 归档只从 1.13.0 起提供，更早的版本只有一个已经
+    # 是静态链接的默认归档，所以旧版本仍回落到默认名。
+    local -a archive_names=()
+    if system_is_musl; then
+        log_info "musl libc detected, using the statically linked sing-box build"
+        archive_names+=("sing-box-${version}-linux-${sb_arch}-musl.tar.gz")
+    fi
+    archive_names+=("sing-box-${version}-linux-${sb_arch}.tar.gz")
+
     log_info "Installing sing-box ${tag} (${sb_arch})..."
 
-    local download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${version}-linux-${sb_arch}.tar.gz"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    if ! secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
-        log_error "Failed to download sing-box from $download_url"
+    local archive_name download_url downloaded=0
+    for archive_name in "${archive_names[@]}"; do
+        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${archive_name}"
+        if secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
+            downloaded=1
+            break
+        fi
+        log_warn "sing-box archive not available: $archive_name"
+    done
+    if ((downloaded == 0)); then
+        log_error "Failed to download sing-box ${tag} for ${sb_arch}"
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -647,6 +684,17 @@ install_singbox() {
     mkdir -p "$SINGBOX_DIR" /usr/local/bin
     install -m 755 "$extracted_bin" "$SINGBOX_BIN"
     rm -rf "$tmp_dir"
+
+    # 安装后立刻验证可执行性：否则不兼容的二进制要到后面 config check 才暴露，
+    # 并被报成 "Generated sing-box config is invalid"，掩盖真正的原因。
+    if ! "$SINGBOX_BIN" version &>/dev/null; then
+        log_error "Installed sing-box binary cannot be executed on this system"
+        if system_is_musl; then
+            log_error "This system uses musl libc; no compatible sing-box build was found for ${tag}"
+        fi
+        rm -f "$SINGBOX_BIN"
+        return 1
+    fi
 
     # 创建服务（systemd 或 OpenRC）
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then

@@ -12,6 +12,8 @@ readonly APPROVED_PATCH_REL="tests/fixtures/approved-safety.patch"
 readonly XRAY_RELEASE_PATCH_REL="tests/fixtures/xray-release-management.patch"
 readonly NODE_STATE_PATCH_REL="tests/fixtures/node-state-reset.patch"
 readonly NETSTACK_PATCH_REL="tests/fixtures/netstack.patch"
+readonly LOCK_OWNER_PATCH_REL="tests/fixtures/lock-owner-identity.patch"
+readonly SINGBOX_MUSL_PATCH_REL="tests/fixtures/singbox-musl.patch"
 readonly API_VERSION="1"
 readonly -a MODULES=(
     00_security_state.sh
@@ -45,6 +47,8 @@ assert_file "$REPO_ROOT/$APPROVED_PATCH_REL"
 assert_file "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL"
 assert_file "$REPO_ROOT/$NODE_STATE_PATCH_REL"
 assert_file "$REPO_ROOT/$NETSTACK_PATCH_REL"
+assert_file "$REPO_ROOT/$LOCK_OWNER_PATCH_REL"
+assert_file "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL"
 
 bash -n "$REPO_ROOT/proxy-hub.sh"
 bash -n "$REPO_ROOT/$BUILD_SCRIPT_REL"
@@ -109,6 +113,8 @@ copy_build_inputs() {
     cp -- "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL" "$destination/$XRAY_RELEASE_PATCH_REL"
     cp -- "$REPO_ROOT/$NODE_STATE_PATCH_REL" "$destination/$NODE_STATE_PATCH_REL"
     cp -- "$REPO_ROOT/$NETSTACK_PATCH_REL" "$destination/$NETSTACK_PATCH_REL"
+    cp -- "$REPO_ROOT/$LOCK_OWNER_PATCH_REL" "$destination/$LOCK_OWNER_PATCH_REL"
+    cp -- "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL" "$destination/$SINGBOX_MUSL_PATCH_REL"
     local module
     for module in "${MODULES[@]}"; do
         cp -- "$REPO_ROOT/lib/$module" "$destination/lib/$module"
@@ -516,12 +522,14 @@ git -C "$REPO_ROOT" show "$LEGACY_BASELINE_COMMIT:proxy-hub.sh" >"$baseline_dir/
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$XRAY_RELEASE_PATCH_REL"
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$NODE_STATE_PATCH_REL"
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$NETSTACK_PATCH_REL"
+    git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$LOCK_OWNER_PATCH_REL"
+    git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL"
 )
 
 full_bundle="$structure_tmp/full-bundle"
 head -n -6 -- "$bundle" >"$full_bundle"
 if ! cmp -s -- "$baseline_dir/proxy-hub.sh" "$full_bundle"; then
     diff -u -- "$baseline_dir/proxy-hub.sh" "$full_bundle" | sed -n '1,200p' >&2 || true
-    fail "bundle content differs from the pinned baseline plus approved safety, Xray release, node-state, and network-stack patches"
+    fail "bundle content differs from the pinned baseline plus the approved patch set"
 fi
-pass "complete bundle equals the pinned baseline plus approved safety, Xray release, node-state, and network-stack patches"
+pass "complete bundle equals the pinned baseline plus the approved patch set"

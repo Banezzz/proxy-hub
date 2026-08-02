@@ -310,17 +310,29 @@ check_lock_for_write_ops() {
         return 0
     fi
     local lock_path="${LOCK_FILE:-${LOCK_DIR:-unknown}}"
-    local owner_pid="" liveness=0
+    local owner_pid="" owner_start="" owner_boot="" liveness=0
     owner_pid=$(lock_recorded_pid) || owner_pid=""
+    owner_start=$(lock_recorded_start) || owner_start=""
+    owner_boot=$(lock_recorded_boot_id) || owner_boot=""
     log_error "$(msg script_running)"
     log_error "Lock path: $lock_path"
     if [[ -n "$owner_pid" ]]; then
-        lock_pid_liveness "$owner_pid" || liveness=$?
+        lock_pid_liveness "$owner_pid" "$owner_start" "$owner_boot" || liveness=$?
         if ((liveness == 1)); then
-            log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            if lock_pid_present "$owner_pid"; then
+                log_warn "$(msg lock_stale_recycled) (PID $owner_pid)"
+            else
+                log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            fi
             log_warn "$(msg lock_stale_action) rm -rf -- $lock_path"
-        elif ((liveness == 0)); then
-            log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+        else
+            if ((liveness == 0)); then
+                log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+            else
+                log_error "$(msg lock_owner_unknown) (PID $owner_pid)"
+            fi
+            log_warn "$(msg lock_owner_inspect) ps -p $owner_pid -o pid,ppid,lstart,cmd"
+            log_warn "$(msg lock_owner_stop) kill $owner_pid"
         fi
     fi
     exit 1

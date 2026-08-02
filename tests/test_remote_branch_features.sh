@@ -706,4 +706,131 @@ assert_eq "bare" "$(node_field "$NODES_DIR/bare.env" NODE_NAME)" \
     "save_env must write a node file from freshly reset state"
 SCENARIO
 
+# sing-box >= 1.13.0 publishes a glibc-linked default archive plus a statically
+# linked "-musl" archive. Picking the default one on Alpine installs a binary
+# the kernel refuses to exec, which used to surface as "Generated sing-box
+# config is invalid" much later. Archive choice must follow libc, the fallback
+# must still work for releases that predate the musl archive, and an
+# unrunnable binary must fail the install instead of being left behind.
+run_scenario singbox-libc-archive-contract <<'SCENARIO'
+source /mnt/lib/00_security_state.sh
+source /mnt/lib/10_runtime_platform_ui.sh
+source /mnt/lib/20_installers_restart.sh
+
+SINGBOX_DIR=/srv/singbox
+SINGBOX_BIN=/srv/singbox/sing-box
+INIT_SYSTEM=systemd
+
+log_info() { :; }
+log_warn() { :; }
+log_error() { printf '%s\n' "$*" >>/srv/singbox.errors; }
+create_singbox_systemd_service() { printf 'systemd\n' >>/srv/singbox.services; }
+create_singbox_openrc_service() { printf 'openrc\n' >>/srv/singbox.services; }
+fetch_github_release_tag() { printf 'v1.13.15\n'; }
+real_system_is_musl=$(declare -f system_is_musl)
+
+# Real archives with a runnable and an unrunnable payload; only the extraction
+# and exec paths are real, the download is stubbed below.
+build_archive() {
+    local dir_name="$1" interpreter="$2" out="$3"
+    rm -rf -- "/srv/pkg/$dir_name"
+    mkdir -p -- "/srv/pkg/$dir_name"
+    printf '#!%s\nprintf "sing-box version 1.13.15\\n"\n' "$interpreter" \
+        >"/srv/pkg/$dir_name/sing-box"
+    chmod 755 "/srv/pkg/$dir_name/sing-box"
+    tar -czf "$out" -C /srv/pkg "$dir_name"
+}
+mkdir -p /srv/pkg
+build_archive sing-box-1.13.15-linux-amd64-musl /bin/sh /srv/musl.tar.gz
+build_archive sing-box-1.13.15-linux-amd64 /bin/sh /srv/default.tar.gz
+build_archive sing-box-1.13.15-linux-amd64-broken /nonexistent/loader /srv/broken.tar.gz
+
+# AVAILABLE lists the archive suffixes this fake release publishes.
+secure_curl() {
+    local arg url="" dest="" want_dest=0
+    for arg in "$@"; do
+        if ((want_dest)); then
+            dest="$arg"
+            want_dest=0
+            continue
+        fi
+        case "$arg" in
+            -o) want_dest=1 ;;
+            https://*) url="$arg" ;;
+        esac
+    done
+    printf '%s\n' "${url##*/}" >>/srv/singbox.urls
+    case "$url" in
+        *"$AVAILABLE") cp -- "$SERVE_ARCHIVE" "$dest" ;;
+        *) return 22 ;;
+    esac
+}
+
+uname() { printf 'x86_64\n'; }
+
+reset_case() {
+    rm -rf -- /srv/singbox
+    rm -f -- /srv/singbox.urls /srv/singbox.services /srv/singbox.errors
+    : >/srv/singbox.urls
+}
+
+# musl host: the musl archive is requested first and nothing else is fetched.
+reset_case
+AVAILABLE="-musl.tar.gz"
+SERVE_ARCHIVE=/srv/musl.tar.gz
+system_is_musl() { return 0; }
+install_singbox || fail_case "install_singbox failed on a musl host"
+assert_eq "sing-box-1.13.15-linux-amd64-musl.tar.gz" "$(cat /srv/singbox.urls)" \
+    "a musl host must fetch exactly the statically linked archive"
+[[ -x /srv/singbox/sing-box ]] || fail_case "sing-box binary was not installed"
+assert_contains "$(/srv/singbox/sing-box version)" "1.13.15" \
+    "the installed binary must be runnable"
+assert_eq "systemd" "$(cat /srv/singbox.services)" "the service must be created"
+
+# glibc host: the default archive is used and the musl name is never requested.
+reset_case
+AVAILABLE="linux-amd64.tar.gz"
+SERVE_ARCHIVE=/srv/default.tar.gz
+system_is_musl() { return 1; }
+install_singbox || fail_case "install_singbox failed on a glibc host"
+assert_eq "sing-box-1.13.15-linux-amd64.tar.gz" "$(cat /srv/singbox.urls)" \
+    "a glibc host must keep fetching the default archive"
+
+# musl host on a release without a musl archive: fall back to the default one,
+# which is statically linked before sing-box 1.13.0.
+reset_case
+AVAILABLE="linux-amd64.tar.gz"
+SERVE_ARCHIVE=/srv/default.tar.gz
+system_is_musl() { return 0; }
+install_singbox || fail_case "install_singbox did not fall back to the default archive"
+assert_eq "sing-box-1.13.15-linux-amd64-musl.tar.gz
+sing-box-1.13.15-linux-amd64.tar.gz" "$(cat /srv/singbox.urls)" \
+    "the musl archive must be tried first and the default one used as fallback"
+[[ -x /srv/singbox/sing-box ]] || fail_case "fallback archive was not installed"
+
+# An installed binary this kernel cannot exec fails the install and is removed,
+# so the next attempt does not skip installation via the already-installed path.
+reset_case
+AVAILABLE="linux-amd64.tar.gz"
+SERVE_ARCHIVE=/srv/broken.tar.gz
+system_is_musl() { return 1; }
+rc=0
+install_singbox || rc=$?
+assert_eq "1" "$rc" "an unrunnable sing-box binary must fail the install"
+[[ ! -e /srv/singbox/sing-box ]] || fail_case "unrunnable binary was left installed"
+assert_contains "$(cat /srv/singbox.errors)" "cannot be executed" \
+    "the failure must name the real cause"
+[[ ! -e /srv/singbox.services ]] || fail_case "no service may be created for a broken binary"
+
+# libc detection itself: Alpine's package manager alone is enough to classify a
+# host as musl, so archive choice never depends on the init system.
+eval "$real_system_is_musl"
+PKG_MANAGER=apk
+system_is_musl || fail_case "apk hosts must be detected as musl"
+PKG_MANAGER=apt
+if system_is_musl; then
+    fail_case "a glibc host must not be detected as musl"
+fi
+SCENARIO
+
 printf '%s\n' "All remote-branch feature contract tests passed."

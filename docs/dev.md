@@ -68,6 +68,21 @@ Hysteria2 使用 `PORT` 记录 UDP 监听端口、`HY2_PASSWORD` 记录认证密
 不得 source 节点 env。分享链接支持 IPv4/IPv6，并明确 `insecure=1` 的自签名证书
 语义。端口选择和健康检查查询 UDP socket，不得用 TCP 探测代替。
 
+### sing-box 归档按 libc 选择
+
+sing-box 从 v1.13.0 起把默认 `sing-box-<ver>-linux-<arch>.tar.gz` 改成动态链接
+glibc，并另外发布静态链接的 `-musl` 归档；v1.12.x 及更早的默认归档本身就是静态
+链接。因此 `install_singbox` 先用 `system_is_musl` 判断 libc（`apk`、
+`/etc/alpine-release`、`/lib/ld-musl-*.so.1` 或 `ldd --version`），musl 主机优先取
+`-musl` 归档，取不到再回落到默认名——回落只对没有 musl 归档的旧版本有意义。判断依据
+必须是 libc 而不是 init 系统：Alpine 也可以跑 systemd。
+
+安装后立即执行 `sing-box version` 验证可执行性，失败就删除刚装的二进制并让安装
+失败。否则不兼容的二进制会一直留在 `/usr/local/bin/sing-box`，等到 config check
+时才以 `Generated sing-box config is invalid` 暴露，掩盖真正的
+`cannot execute: required file not found`。回归覆盖见
+`tests/test_remote_branch_features.sh` 的 `singbox-libc-archive-contract`。
+
 ### `both` 节点的双二维码
 
 `get_share_link` 保持返回单链接的兼容 ABI。新的二维码编排助手安全加载当前节点，
