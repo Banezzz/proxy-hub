@@ -618,6 +618,14 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 
 确保客户端使用完整的 base64 密码，包括末尾的 `==` 填充字符。
 
+### Q: Alpine 上安装 AnyTLS / Hysteria2 报 `cannot execute: required file not found`？
+
+这是 sing-box 归档选错的表现，已修复。sing-box 从 v1.13.0 起把默认 linux 归档改成
+动态链接 glibc，Alpine（musl）没有 glibc 动态链接器，内核会直接拒绝执行，随后被报
+成 `Generated sing-box config is invalid`。脚本现在会检测 musl 并下载静态链接的
+`-musl` 归档，安装后立即验证二进制可执行。升级脚本后重新安装节点即可；已经装坏的
+二进制会被自动替换。
+
 ### Q: Alpine Linux 支持如何？
 
 完全支持 Alpine Linux，使用 OpenRC 作为 init 系统，apk 作为包管理器。
