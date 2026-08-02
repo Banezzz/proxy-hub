@@ -635,6 +635,17 @@ name=hk1 reym=new.sni.com ./proxy-hub.sh install
 事务的外部 binary，脚本不会覆盖或删除它，并保留 journal、staging 与 backup 供人工确认。
 若自动回滚也失败，命令会高亮输出使用已保留备份进行人工恢复的准确命令。
 
+### Q: 提示"脚本已在运行中"，但我确定没有在运行？
+
+脚本用 `/tmp/proxy-hub-<uid>/write.lock.d` 保证同一时刻只有一个写操作。报错时
+会给出锁记录的 PID 并区分两种情况：
+
+- **另一个实例正在运行**：按提示先确认该进程（`ps -p <PID> -o pid,ppid,lstart,cmd`）。
+  确认是 proxy-hub 后结束它即可释放锁（`kill <PID>`，脚本会在 TERM 时清理），不要
+  对无关进程动手。注意 `pkill <PID>` 不做这件事，`pkill` 匹配的是进程名不是 PID。
+- **残留锁**：owner 已退出、PID 已被无关进程复用或锁跨越了重启时，脚本会直接打印
+  可复制的清理命令（`rm -rf -- /tmp/proxy-hub-<uid>/write.lock.d`）。
+
 ### Q: 多节点共用一个 Xray 进程吗？
 
 VLESS 与 Shadowsocks 节点在同一个 Xray 配置中作为多个 inbounds；AnyTLS 与

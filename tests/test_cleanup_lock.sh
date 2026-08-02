@@ -265,6 +265,28 @@ run_lock_scenario stale-owner-diagnosed-not-reclaimed '
     [[ "$(lock_recorded_pid)" == "$$" ]]
     lock_pid_liveness "$$"
 
+    # Owner identity is recorded next to the PID so a recycled PID cannot pass
+    # as a live owner.
+    [[ "$(lock_recorded_start)" == "$(lock_process_start_time "$$")" ]]
+    [[ "$(lock_recorded_boot_id)" == "$(lock_boot_id)" ]]
+
+    # A live PID whose recorded start time does not match was recycled by an
+    # unrelated process: the lock is stale (1), not owned (0).
+    liveness=0
+    lock_pid_liveness 1 999999999 "$(lock_boot_id)" || liveness=$?
+    [[ "$liveness" -eq 1 ]]
+
+    # A lock carried across a reboot is stale even when the PID exists again.
+    liveness=0
+    lock_pid_liveness 1 "" "00000000-0000-0000-0000-000000000000" || liveness=$?
+    [[ "$liveness" -eq 1 ]]
+
+    # Locks written before this metadata existed keep PID-only classification.
+    liveness=0
+    lock_pid_liveness 1 "" "" || liveness=$?
+    [[ "$liveness" -eq 0 ]]
+    lock_pid_present 1
+
     # A provably-dead PID is classified stale (return 1) but the lock is left
     # intact: diagnostics never auto-reclaim (docs/audits.md).
     dead=4000000

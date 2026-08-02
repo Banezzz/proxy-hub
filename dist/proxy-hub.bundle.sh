@@ -25,6 +25,7 @@ LOCK_HELD_METHOD=""
 LOCK_TOKEN=""
 LOCK_DIR_ID=""
 LOCK_SIGNAL_PENDING=""
+LOCK_BOOT_ID_PATH="/proc/sys/kernel/random/boot_id"
 
 lock_prepare_parent() {
     local base_dir="/tmp" base_mode base_owner mode owner
@@ -62,6 +63,36 @@ lock_dir_identity() {
     stat -c '%d:%i' "$1" 2>/dev/null
 }
 
+# Start time (field 22 of /proc/<pid>/stat) of a process.  A PID alone is not an
+# identity because the kernel recycles it; PID plus start time is, so recording
+# it lets a later run tell "the owner is still running" apart from "an unrelated
+# process now happens to own that PID".  The build script's release lock uses
+# the same field for the same reason.  Process state is deliberately not
+# filtered here: this answers "which process is this", not "is it healthy".
+lock_process_start_time() {
+    local pid="$1" stat_line rest
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" ]] || return 1
+    IFS= read -r stat_line < "/proc/$pid/stat" 2>/dev/null || return 1
+    rest="${stat_line##*) }"
+    [[ "$rest" != "$stat_line" ]] || return 1
+    # shellcheck disable=SC2086 # deliberate word splitting of /proc stat fields
+    set -- $rest
+    (($# >= 20)) || return 1
+    [[ "${20}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${20}"
+}
+
+# Boot id of the running kernel.  Start times are counted from boot, so they are
+# only comparable within one boot; recording the boot id makes a lock that
+# survived a reboot provably stale even when /tmp was not cleared.
+lock_boot_id() {
+    local boot_id=""
+    [[ -r "$LOCK_BOOT_ID_PATH" ]] || return 1
+    IFS= read -r boot_id < "$LOCK_BOOT_ID_PATH" 2>/dev/null || return 1
+    [[ "$boot_id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || return 1
+    printf '%s\n' "$boot_id"
+}
+
 lock_acquire() {
     local candidate_token dir_id="" pending_signal rc=1 saved_int saved_term
 
@@ -79,6 +110,7 @@ lock_acquire() {
         local owner_tmp="$LOCK_DIR/.owner-${candidate_token}"
         local pid_tmp="$LOCK_DIR/.pid-${candidate_token}"
         local candidate_id=""
+        local owner_start="" owner_boot=""
 
         trap '' INT TERM
         umask 077
@@ -111,7 +143,12 @@ lock_acquire() {
             cleanup_candidate
             exit 1
         }
-        printf '%s\n' "$$" > "$pid_tmp" || {
+        # Owner identity: PID, its start time and the boot id.  The extra lines
+        # are optional metadata—readers fall back to PID-only classification
+        # when they are absent or unparseable.
+        owner_start=$(lock_process_start_time "$$" 2>/dev/null) || owner_start=""
+        owner_boot=$(lock_boot_id 2>/dev/null) || owner_boot=""
+        printf '%s\n%s\n%s\n' "$$" "$owner_start" "$owner_boot" > "$pid_tmp" || {
             cleanup_candidate
             exit 1
         }
@@ -175,17 +212,64 @@ lock_recorded_pid() {
     printf '%s\n' "$pid"
 }
 
-# Classify a recorded owner PID without touching the lock:
+# Print the owner start time recorded next to the PID, or return non-zero when
+# the lock predates this metadata or records it in an unusable form.
+lock_recorded_start() {
+    local pid="" start=""
+    [[ -n "${PID_FILE:-}" && -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
+    { IFS= read -r pid && IFS= read -r start; } < "$PID_FILE" 2>/dev/null || return 1
+    [[ "$start" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$start"
+}
+
+# Print the boot id recorded next to the PID, with the same fallback contract.
+lock_recorded_boot_id() {
+    local pid="" start="" boot=""
+    [[ -n "${PID_FILE:-}" && -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
+    { IFS= read -r pid && IFS= read -r start && IFS= read -r boot; } \
+        < "$PID_FILE" 2>/dev/null || return 1
+    [[ "$boot" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || return 1
+    printf '%s\n' "$boot"
+}
+
+# Whether a PID currently exists at all (used only to word the stale-lock hint).
+lock_pid_present() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ -d /proc/self ]]; then
+        [[ -e "/proc/$pid" ]]
+        return
+    fi
+    kill -0 "$pid" 2>/dev/null
+}
+
+# Classify a recorded owner without touching the lock:
 #   0 -> still alive (a real instance may be running)
 #   1 -> provably gone (the lock is stale)
 #   2 -> liveness cannot be determined; treat conservatively as maybe-alive
+# The optional start time and boot id are the ones recorded when the lock was
+# taken.  With them a recycled PID—the same number reused by an unrelated
+# process, which used to read as "another instance is running" forever—is
+# classified as stale instead.
 lock_pid_liveness() {
-    local pid="${1:-}"
+    local pid="${1:-}" recorded_start="${2:-}" recorded_boot="${3:-}"
+    local actual_start="" boot_id=""
+
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+
+    # A lock written before the current boot cannot have a live owner.
+    if [[ "$recorded_boot" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; then
+        boot_id=$(lock_boot_id 2>/dev/null) || boot_id=""
+        [[ -z "$boot_id" || "$boot_id" == "$recorded_boot" ]] || return 1
+    fi
+
     [[ "$pid" == "$$" ]] && return 0
     if [[ -d /proc/self ]]; then
-        [[ -e "/proc/$pid" ]] && return 0
-        return 1
+        [[ -e "/proc/$pid" ]] || return 1
+        [[ "$recorded_start" =~ ^[0-9]+$ ]] || return 0
+        actual_start=$(lock_process_start_time "$pid" 2>/dev/null) || return 2
+        [[ "$actual_start" == "$recorded_start" ]] || return 1
+        return 0
     fi
     kill -0 "$pid" 2>/dev/null && return 0
     return 2
@@ -1908,7 +1992,11 @@ msg() {
             "fail2ban_status") echo "Fail2ban Status" ;;
             "script_running") echo "Script is already running!" ;;
             "lock_owner_alive") echo "Another instance appears to be running" ;;
+            "lock_owner_unknown") echo "Could not determine whether the recorded owner is still running" ;;
+            "lock_owner_inspect") echo "Identify that process first:" ;;
+            "lock_owner_stop") echo "If it is a leftover proxy-hub process, stop it to release the lock (do not kill an unrelated process):" ;;
             "lock_stale_hint") echo "The recorded owner process is gone; the lock looks stale (left over from an unclean exit)" ;;
+            "lock_stale_recycled") echo "The recorded PID now belongs to an unrelated process; the owner exited and the lock is stale" ;;
             "lock_stale_action") echo "If no proxy-hub write operation is running, remove the stale lock with:" ;;
             "enable_xhttp") echo "Enable XHTTP protocol? (y/n)" ;;
             "xhttp_enabled") echo "XHTTP protocol enabled" ;;
@@ -2116,7 +2204,11 @@ msg() {
             "fail2ban_status") echo "Fail2ban 状态" ;;
             "script_running") echo "脚本已在运行中！" ;;
             "lock_owner_alive") echo "检测到另一个实例正在运行" ;;
+            "lock_owner_unknown") echo "无法确认锁记录的进程是否仍在运行" ;;
+            "lock_owner_inspect") echo "请先确认该进程的身份：" ;;
+            "lock_owner_stop") echo "若确认是残留的 proxy-hub 进程，结束它即可释放锁（不要结束无关进程）：" ;;
             "lock_stale_hint") echo "锁记录的进程已不存在，可能是上次异常退出残留的锁" ;;
+            "lock_stale_recycled") echo "锁记录的 PID 已被无关进程复用，原实例已退出，这是残留的锁" ;;
             "lock_stale_action") echo "确认没有 proxy-hub 写操作在运行后，可用以下命令清理残留锁：" ;;
             "enable_xhttp") echo "是否启用 XHTTP 协议？(y/n)" ;;
             "xhttp_enabled") echo "XHTTP 协议已启用" ;;
@@ -10930,17 +11022,29 @@ check_lock_for_write_ops() {
         return 0
     fi
     local lock_path="${LOCK_FILE:-${LOCK_DIR:-unknown}}"
-    local owner_pid="" liveness=0
+    local owner_pid="" owner_start="" owner_boot="" liveness=0
     owner_pid=$(lock_recorded_pid) || owner_pid=""
+    owner_start=$(lock_recorded_start) || owner_start=""
+    owner_boot=$(lock_recorded_boot_id) || owner_boot=""
     log_error "$(msg script_running)"
     log_error "Lock path: $lock_path"
     if [[ -n "$owner_pid" ]]; then
-        lock_pid_liveness "$owner_pid" || liveness=$?
+        lock_pid_liveness "$owner_pid" "$owner_start" "$owner_boot" || liveness=$?
         if ((liveness == 1)); then
-            log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            if lock_pid_present "$owner_pid"; then
+                log_warn "$(msg lock_stale_recycled) (PID $owner_pid)"
+            else
+                log_warn "$(msg lock_stale_hint) (PID $owner_pid)"
+            fi
             log_warn "$(msg lock_stale_action) rm -rf -- $lock_path"
-        elif ((liveness == 0)); then
-            log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+        else
+            if ((liveness == 0)); then
+                log_error "$(msg lock_owner_alive) (PID $owner_pid)"
+            else
+                log_error "$(msg lock_owner_unknown) (PID $owner_pid)"
+            fi
+            log_warn "$(msg lock_owner_inspect) ps -p $owner_pid -o pid,ppid,lstart,cmd"
+            log_warn "$(msg lock_owner_stop) kill $owner_pid"
         fi
     fi
     exit 1
@@ -11076,7 +11180,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=428653 body-sha256=01eb93b8339c42c76be25fc0b84c78e362508f83f334229ab5b15b2cb90454b5
-# build-id=01eb93b8339c42c76be25fc0b84c78e362508f83f334229ab5b15b2cb90454b5
+# body-bytes=434081 body-sha256=46ce94329b508b70af0c3bfbb46d7e1e5ee7b8db3953d41552e859ee8fede49f
+# build-id=46ce94329b508b70af0c3bfbb46d7e1e5ee7b8db3953d41552e859ee8fede49f
 # module-count=11
 # proxy-hub-bundle-end-v1
