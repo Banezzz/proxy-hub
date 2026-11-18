@@ -404,7 +404,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL="" HY2_CORE=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -458,6 +458,7 @@ safe_load_node_config() {
     HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
     HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
     HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
+    HY2_CORE=$(safe_read_config_value "$file" "HY2_CORE")
 
     return 0
 }
@@ -671,12 +672,14 @@ xray_probe_capabilities() {
         out=$(timeout 10 "$XRAY_BIN" help 2>/dev/null </dev/null) || out=""
         [[ "$out" =~ (^|[[:space:]])mldsa65([[:space:]]|$) ]] && caps+=" mldsa65 target"
         [[ "$out" =~ (^|[[:space:]])vlessenc([[:space:]]|$) ]] && caps+=" vlessenc"
+        # Hysteria2 入站没有对应的子命令可探测，只能按版本：v26.3.27 起提供。
+        out=$(xray_installed_version_plain) && version_ge "$out" 26.3.27 && caps+=" hysteria2"
     fi
     XRAY_CAPS="$caps"
     XRAY_CAPS_KEY="$key"
 }
 
-# Usage: xray_supports mldsa65|vlessenc|target
+# Usage: xray_supports mldsa65|vlessenc|target|hysteria2
 xray_supports() {
     xray_probe_capabilities
     [[ " $XRAY_CAPS " == *" $1 "* ]]
@@ -931,6 +934,78 @@ build_anytls_inbound() {
         }'
 }
 
+# 一个节点由哪个内核承载。AnyTLS 只有 sing-box 能跑；Hysteria2 默认也在 sing-box 上，
+# HY2_CORE=xray 时改由 Xray 的原生 Hysteria2 入站承载；其余协议都属于 Xray。
+# 所有"这个节点归谁"的判断都必须经过这里，不要再按协议名各自枚举。
+# Usage: node_core_of PROTOCOL_TYPE [HY2_CORE]   -> xray | singbox
+node_core_of() {
+    case "${1:-}" in
+        anytls|anytls_reality) printf '%s' singbox ;;
+        hysteria2)
+            if [[ "${2:-}" == "xray" ]]; then printf '%s' xray; else printf '%s' singbox; fi
+            ;;
+        *) printf '%s' xray ;;
+    esac
+}
+
+# Usage: node_file_core NODE_FILE   -> xray | singbox
+node_file_core() {
+    node_core_of "$(safe_read_config_value "$1" "PROTOCOL_TYPE")" "$(safe_read_config_value "$1" "HY2_CORE")"
+}
+
+# Xray 原生的 Hysteria2 入站。与 sing-box 版本对外等价：同一个 UDP 端口、同一个密码、
+# 同一张证书、同样的 masquerade / Salamander，所以切换内核不改变分享链接。
+# 形状经真实 Xray 26.11.9 与 sing-box 1.14.4 客户端互通验证：transport 必须写
+# `network: hysteria`（文档示例里的 `method` 不生效），Salamander 走 finalmask.udp。
+# Usage: build_xray_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+build_xray_hysteria2_inbound() {
+    local name="$1" port="$2" password="$3" sni="$4" cert="$5" key="$6" obfs_password="${7:-}"
+
+    port=$(get_validated_port "$port" true) || return 1
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
+    validate_tls_server_name "$sni" || return 1
+    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
+
+    jq -n \
+        --arg tag "${name}_hysteria2" \
+        --argjson port "$port" \
+        --arg name "$name" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg cert "$cert" \
+        --arg key "$key" \
+        --arg obfs_password "$obfs_password" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
+        '{
+            "tag": $tag,
+            "listen": $listen,
+            "port": $port,
+            "protocol": "hysteria",
+            "settings": {"version": 2, "users": [{"auth": $password, "email": $name}]},
+            "streamSettings": ({
+                "network": "hysteria",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": $sni,
+                    "alpn": ["h3"],
+                    "certificates": [{"certificateFile": $cert, "keyFile": $key}]
+                },
+                "hysteriaSettings": ({"version": 2}
+                    | if $obfs_password == "" then
+                        . + {"masquerade": {"type": "proxy", "url": "https://www.bing.com", "rewriteHost": true}}
+                      else . end)
+            }
+            | if $obfs_password != "" then
+                . + {"finalmask": {"udp": [{"type": "salamander", "settings": {"password": $obfs_password}}]}}
+              else . end
+            | if $sockopt then . + {"sockopt": $sockopt} else . end),
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+        }'
+}
+
 # Validate a TLS server name before it is written to JSON or a share URI.
 # IPv4 literals are accepted; empty labels, URI delimiters, and overlong labels
 # are rejected. Hysteria2 uses this value as TLS SNI, so IPv6 literals are not
@@ -1113,9 +1188,17 @@ encrypt_value() {
     local key
     key=$(cat "$ENCRYPTION_KEY_FILE")
 
-    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
+    # -A 让 base64 保持单行。节点文件是逐行的 KEY=VALUE，而 openssl 默认每 64 个字符
+    # 换行：明文达到 32 字节（UUID、REALITY 私钥等）时密文会变成两行，第二行在读取时
+    # 被丢弃，剩下的半截密文无法还原。
+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:$key" 2>/dev/null
 }
 
+# Usage: decrypt_value VALUE [FIELD [NODE]]
+# 明文原样返回。密文解不开（密钥文件缺失或已更换、密文不完整）时不输出任何内容并返回
+# 非零，FIELD/NODE 只用于报错。调用方必须检查返回值：旧实现在失败时回显密文，而
+# openssl 在报错前已经输出了解开的前几个分组，结果是"半截明文 + 密文"被当作凭据写进
+# 配置和分享链接。旧版本写出的被截断密文（见 encrypt_value）无法还原，同样走这条路径。
 decrypt_value() {
     local ciphertext="$1"
     [[ -z "$ciphertext" ]] && return 0
@@ -1123,16 +1206,35 @@ decrypt_value() {
     # Check if value is encrypted (starts with U2FsdGVk after base64 decode)
     if [[ ! "$ciphertext" =~ ^U2FsdGVk ]]; then
         # Not encrypted, return as-is (backward compatibility)
-        echo "$ciphertext"
+        printf '%s\n' "$ciphertext"
         return 0
     fi
 
-    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
+    # 解密同样需要 -A：不加时 openssl 拒绝超过约 1KB 的单行 base64。
+    local key="" plaintext=""
+    if [[ -f "$ENCRYPTION_KEY_FILE" ]] && key=$(cat "$ENCRYPTION_KEY_FILE") && \
+        plaintext=$(printf '%s\n' "$ciphertext" | \
+            openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:$key" 2>/dev/null); then
+        printf '%s\n' "$plaintext"
+        return 0
+    fi
 
-    local key
-    key=$(cat "$ENCRYPTION_KEY_FILE")
+    log_error "$(t2 "无法解密${3:+节点 '$3' 的 }${2:-配置值}：密钥文件 $ENCRYPTION_KEY_FILE 缺失或已更换，或密文不完整" \
+        "Cannot decrypt ${2:-a config value}${3:+ of node '$3'}: key file $ENCRYPTION_KEY_FILE is missing or was replaced, or the ciphertext is incomplete")"
+    log_error "$(t2 "旧版本会截断较长的密文，这类值无法还原。请恢复密钥文件，或删除并重建该节点" \
+        "Older versions truncated long ciphertexts, which cannot be recovered. Restore the key file, or delete and recreate the node")"
+    return 1
+}
 
-    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
+# 就地解密 safe_load_node_config 装入全局变量的全部敏感字段，清单与 save_env 加密的
+# 字段一一对应。任何一个失败即返回非零，此时这些变量不可再用于渲染、展示或 save_env。
+decrypt_node_secrets() {
+    local field value
+    for field in UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID \
+        XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD; do
+        value=$(decrypt_value "${!field:-}" "$field" "${NODE_NAME:-${CURRENT_NODE_NAME:-}}") || return 1
+        printf -v "$field" '%s' "$value"
+    done
 }
 
 # Check if config encryption is enabled

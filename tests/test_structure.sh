@@ -15,6 +15,8 @@ readonly NETSTACK_PATCH_REL="tests/fixtures/netstack.patch"
 readonly LOCK_OWNER_PATCH_REL="tests/fixtures/lock-owner-identity.patch"
 readonly SINGBOX_MUSL_PATCH_REL="tests/fixtures/singbox-musl.patch"
 readonly PROTOCOL_REFRESH_PATCH_REL="tests/fixtures/protocol-refresh.patch"
+readonly CONFIG_ENCRYPTION_PATCH_REL="tests/fixtures/config-encryption.patch"
+readonly REFRESH_FOLLOWUPS_PATCH_REL="tests/fixtures/refresh-followups.patch"
 readonly API_VERSION="1"
 readonly -a MODULES=(
     00_security_state.sh
@@ -51,6 +53,8 @@ assert_file "$REPO_ROOT/$NETSTACK_PATCH_REL"
 assert_file "$REPO_ROOT/$LOCK_OWNER_PATCH_REL"
 assert_file "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL"
 assert_file "$REPO_ROOT/$PROTOCOL_REFRESH_PATCH_REL"
+assert_file "$REPO_ROOT/$CONFIG_ENCRYPTION_PATCH_REL"
+assert_file "$REPO_ROOT/$REFRESH_FOLLOWUPS_PATCH_REL"
 
 bash -n "$REPO_ROOT/proxy-hub.sh"
 bash -n "$REPO_ROOT/$BUILD_SCRIPT_REL"
@@ -118,6 +122,8 @@ copy_build_inputs() {
     cp -- "$REPO_ROOT/$LOCK_OWNER_PATCH_REL" "$destination/$LOCK_OWNER_PATCH_REL"
     cp -- "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL" "$destination/$SINGBOX_MUSL_PATCH_REL"
     cp -- "$REPO_ROOT/$PROTOCOL_REFRESH_PATCH_REL" "$destination/$PROTOCOL_REFRESH_PATCH_REL"
+    cp -- "$REPO_ROOT/$CONFIG_ENCRYPTION_PATCH_REL" "$destination/$CONFIG_ENCRYPTION_PATCH_REL"
+    cp -- "$REPO_ROOT/$REFRESH_FOLLOWUPS_PATCH_REL" "$destination/$REFRESH_FOLLOWUPS_PATCH_REL"
     local module
     for module in "${MODULES[@]}"; do
         cp -- "$REPO_ROOT/lib/$module" "$destination/lib/$module"
@@ -528,6 +534,8 @@ git -C "$REPO_ROOT" show "$LEGACY_BASELINE_COMMIT:proxy-hub.sh" >"$baseline_dir/
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$LOCK_OWNER_PATCH_REL"
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$SINGBOX_MUSL_PATCH_REL"
     git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$PROTOCOL_REFRESH_PATCH_REL"
+    git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$CONFIG_ENCRYPTION_PATCH_REL"
+    git apply --unidiff-zero --whitespace=nowarn "$REPO_ROOT/$REFRESH_FOLLOWUPS_PATCH_REL"
 )
 
 full_bundle="$structure_tmp/full-bundle"

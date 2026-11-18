@@ -529,10 +529,7 @@ singbox_node_count() {
     local count=0 f t
     for f in "$NODES_DIR"/*.env; do
         [[ -f "$f" ]] || continue
-        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
-        case "$t" in
-            anytls|anytls_reality|hysteria2) ((count++)) ;;
-        esac
+        [[ "$(node_file_core "$f")" == "singbox" ]] && ((++count))
     done
     echo "$count"
 }
@@ -542,11 +539,7 @@ xray_node_count() {
     local count=0 f t
     for f in "$NODES_DIR"/*.env; do
         [[ -f "$f" ]] || continue
-        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
-        case "$t" in
-            anytls|anytls_reality|hysteria2) ;;
-            *) ((count++)) ;;
-        esac
+        [[ "$(node_file_core "$f")" == "xray" ]] && ((++count))
     done
     echo "$count"
 }

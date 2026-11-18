@@ -84,16 +84,19 @@ write_config() {
         n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
         n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
-        # 处理可能加密的敏感值
-        n_private_key=$(decrypt_value "$n_private_key")
-        n_uuid=$(decrypt_value "$n_uuid")
-        n_ss_password=$(decrypt_value "$n_ss_password")
+        # 处理可能加密的敏感值。解不开时整次渲染失败并保留现有配置：跳过该节点会让
+        # 它从服务里悄悄消失，继续渲染则会把不可用的凭据写进配置。
+        n_private_key=$(decrypt_value "$n_private_key" PRIVATE_KEY "$n_name") || return 1
+        n_uuid=$(decrypt_value "$n_uuid" UUID "$n_name") || return 1
+        n_ss_password=$(decrypt_value "$n_ss_password" SS_PASSWORD "$n_name") || return 1
 
         # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
         # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
         # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
-        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
-        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
+        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")" \
+            XHTTP_UUID "$n_name") || return 1
+        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")" \
+            XHTTP_PRIVATE_KEY "$n_name") || return 1
         n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
         [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
         if [[ -z "$n_xhttp_private_key" ]]; then
@@ -114,14 +117,42 @@ write_config() {
             fi
         fi
 
-        # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
-        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
+        # 由 sing-box 承载的节点（AnyTLS，以及默认情况下的 Hysteria2）在 Xray 配置中跳过
+        if [[ "$(node_core_of "$n_protocol_type" "$(safe_read_config_value "$node_file" "HY2_CORE")")" != "xray" ]]; then
+            continue
+        fi
+
+        # 选择了 Xray 后端的 Hysteria2 节点
+        if [[ "$n_protocol_type" == "hysteria2" ]]; then
+            local hy_port hy_pw hy_obfs hy_sni hy_inbound
+            local hy_cert="$SINGBOX_CERT_DIR/${n_name}.crt" hy_key="$SINGBOX_CERT_DIR/${n_name}.key"
+            if ! xray_supports hysteria2; then
+                log_error "$(t2 "节点 '$n_name' 选择了 Xray 承载 Hysteria2，但当前 Xray 低于 v26.3.27，请先执行 xray-update" \
+                    "Node '$n_name' runs Hysteria2 on Xray, which needs Xray v26.3.27 or newer; run xray-update first")"
+                return 1
+            fi
+            hy_pw=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_PASSWORD")" \
+                HY2_PASSWORD "$n_name") || return 1
+            [[ -z "$hy_pw" ]] && continue
+            hy_port=$(get_validated_port "$n_port" true) || { log_warn "Invalid Hysteria2 port for node '$n_name', skipping"; continue; }
+            hy_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")" \
+                HY2_OBFS_PASSWORD "$n_name") || return 1
+            hy_sni="${n_sni:-www.bing.com}"
+            if [[ ! -f "$hy_cert" || ! -f "$hy_key" ]]; then
+                gen_selfsigned_cert "$n_name" "$hy_sni" || return 1
+            fi
+            if ! hy_inbound=$(build_xray_hysteria2_inbound "$n_name" "$hy_port" "$hy_pw" "$hy_sni" "$hy_cert" "$hy_key" "$hy_obfs"); then
+                log_error "Failed to build Hysteria2 inbound for node '$n_name'"
+                return 1
+            fi
+            inbounds_json=$(jq --argjson inbound "$hy_inbound" '. += [$inbound]' <<<"$inbounds_json") || return 1
             continue
         fi
 
         # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
         # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
-        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
+        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")" \
+            MLDSA65_SEED "$n_name") || return 1
         if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
             log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
                 "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
@@ -129,7 +160,8 @@ write_config() {
         fi
 
         # 可选的 VLESS Encryption，同样在核心不支持时失败而不是静默退回明文 VLESS。
-        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")")
+        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")" \
+            VLESS_DECRYPTION "$n_name") || return 1
         if [[ -n "$n_decryption" ]] && ! xray_supports vlessenc; then
             log_error "$(t2 "节点 '$n_name' 启用了 VLESS Encryption，但当前 Xray 不支持，请先执行 xray-update" \
                 "Node '$n_name' uses VLESS Encryption, which this Xray does not support; run xray-update first")"
@@ -320,7 +352,7 @@ write_singbox_config() {
 
         local n_proto
         n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
-        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" || "$n_proto" == "hysteria2" ]] || continue
+        [[ "$(node_file_core "$node_file")" == "singbox" ]] || continue
 
         local n_name n_port n_sni n_priv n_sid n_pw n_pad_b64 n_pad
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
@@ -329,16 +361,14 @@ write_singbox_config() {
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
         n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
             "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-        if [[ "$n_proto" == "hysteria2" ]]; then
-            n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
-        else
-            n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
-        fi
+        local n_pw_field="ANYTLS_PASSWORD"
+        [[ "$n_proto" == "hysteria2" ]] && n_pw_field="HY2_PASSWORD"
+        n_pw=$(safe_read_config_value "$node_file" "$n_pw_field")
         n_pad_b64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
 
-        # 解密可能加密的敏感值
-        n_priv=$(decrypt_value "$n_priv")
-        n_pw=$(decrypt_value "$n_pw")
+        # 解密可能加密的敏感值；失败时与 write_config 一样整体失败
+        n_priv=$(decrypt_value "$n_priv" PRIVATE_KEY "$n_name") || return 1
+        n_pw=$(decrypt_value "$n_pw" "$n_pw_field" "$n_name") || return 1
 
         [[ -z "$n_pw" ]] && continue
 
@@ -354,7 +384,8 @@ write_singbox_config() {
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
             local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
-            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")" \
+                HY2_OBFS_PASSWORD "$n_name") || return 1
             n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
             if [[ -n "$n_domain" ]]; then
                 # ACME 真证书：不再使用逐节点自签名证书。
@@ -568,6 +599,7 @@ HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 HY2_DOMAIN=${HY2_DOMAIN:-}
 HY2_EMAIL=${HY2_EMAIL:-}
+HY2_CORE=${HY2_CORE:-}
 ENV
     chmod 600 "$node_file"
 
@@ -775,6 +807,7 @@ get_share_link() {
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
+    decrypt_node_secrets || return 1
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip
     ip=$(netstack_preferred_ip)
@@ -782,15 +815,12 @@ get_share_link() {
 
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
-        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
         get_ss_link "$ip" "${node_label}_SS"
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]] && [[ -n "${ANYTLS_PASSWORD:-}" ]]; then
         # AnyTLS 节点
-        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
         get_anytls_link "$ip" "${node_label}_AnyTLS"
     elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
         # XHTTP-only 节点
@@ -812,6 +842,7 @@ show_node_qrcodes() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     safe_load_node_config "$node_file" || return 1
+    decrypt_node_secrets || return 1
 
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip
@@ -891,6 +922,7 @@ show_info() {
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
+    decrypt_node_secrets || return 1
 
     local hostname
     hostname=$(hostname 2>/dev/null || echo "server")
@@ -953,8 +985,6 @@ show_info() {
             echo -e "  $(get_ss_link "$SERVER_IPV6" "${hostname}_SS_v6")"
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
-        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
         if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
@@ -963,7 +993,7 @@ show_info() {
         if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
             echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
         fi
-        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
+        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 ($([[ "${HY2_CORE:-}" == "xray" ]] && echo Xray || echo sing-box))"
         if [[ -n "${HY2_DOMAIN:-}" ]]; then
             echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
             echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"
@@ -991,7 +1021,6 @@ show_info() {
         fi
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
         # AnyTLS 节点显示
-        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
         echo -e "  ${BLUE}Password:${NC}    ${ANYTLS_PASSWORD:-N/A}"
         echo -e "  ${BLUE}Transport:${NC}   AnyTLS (sing-box)"

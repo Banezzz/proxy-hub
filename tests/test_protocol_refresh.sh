@@ -936,6 +936,7 @@ run_scenario hysteria2-port-hopping <<'SCENARIO'
 load_modules
 HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
 HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
 systemctl() { printf '%s\n' "$*" >>/srv/systemctl.calls; }
 : >/srv/systemctl.calls
 
@@ -1007,6 +1008,8 @@ fi
 assert_not_contains "$calls" "-A INPUT" "the helper must not touch filter rules"
 assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-$HY2_HOP_HELPER apply" \
     "sing-box re-applies the rules on every start"
+assert_eq "$(cat "$HY2_HOP_DROPIN")" "$(cat "$HY2_HOP_DROPIN_XRAY")" \
+    "the Xray service gets the same hook, since either core may host the node"
 assert_contains "$(cat /srv/systemctl.calls)" "daemon-reload" "systemd must reload after the drop-in changes"
 
 # Idempotent: every apply tears the chain down before rebuilding it.
@@ -1039,7 +1042,8 @@ cp /srv/bin/iptables /srv/bin/ip6tables
 hy2_hop_sync
 assert_contains "$(cat /srv/iptables.calls)" "iptables -t nat -X PROXY_HUB_HY2_HOP" "the chain is deleted"
 assert_not_contains "$(cat /srv/iptables.calls)" " -N " "no chain is recreated without rules"
-[[ ! -e "$HY2_HOP_HELPER" && ! -e "$HY2_HOP_DROPIN" ]] || fail_case "helper or drop-in was left behind"
+[[ ! -e "$HY2_HOP_HELPER" && ! -e "$HY2_HOP_DROPIN" && ! -e "$HY2_HOP_DROPIN_XRAY" ]] || \
+    fail_case "helper or drop-in was left behind"
 hy2_hop_sync || fail_case "syncing with nothing to do must succeed"
 
 # OpenRC wires the helper into start_pre instead of a drop-in.
@@ -1872,6 +1876,7 @@ INIT_SYSTEM=systemd
 # The port-hopping helper escapes the sandbox so it can still load NAT modules.
 HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
 HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
 printf '#!/bin/sh\nexit 0\n' >/srv/bin/iptables; chmod 755 /srv/bin/iptables
 PATH="/srv/bin:$PATH"
 write_node hy hysteria2 "HY2_HOP_PORTS=30000-30100"
@@ -1931,7 +1936,7 @@ write_node full both \
     "VLESS_DECRYPTION=mlkem768x25519plus.native.600s.DecKey_1" \
     "VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1" \
     "HY2_OBFS_PASSWORD=Obfs.Pass_1" "HY2_HOP_PORTS=30000-30100" \
-    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com"
+    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com" "HY2_CORE=xray"
 sed -i 's/^ANYTLS_PADDING_B64=$/ANYTLS_PADDING_B64=c3RvcD04/' "$NODES_DIR/full.env"
 sort "$NODES_DIR/full.env" >/srv/before.env
 CURRENT_NODE_NAME=full
@@ -1942,6 +1947,514 @@ diff -u /srv/before.env /srv/after.env >&2 || fail_case "load_node_for_edit + sa
 assert_eq "600" "$(stat -c '%a' "$NODES_DIR/full.env")" "the node file stays private"
 CURRENT_NODE_NAME=missing
 assert_fails "a missing node must fail to load" load_node_for_edit
+SCENARIO
+
+# Optional config encryption (ENABLE_CONFIG_ENCRYPTION=true plus a key file): every
+# secret field must survive save_env -> load_node_for_edit unchanged, the node file
+# must stay one KEY=VALUE per line, and a value that cannot be decrypted must fail
+# instead of flowing into a config, a link or a re-saved node file.
+run_scenario config-encryption-round-trip <<'SCENARIO'
+load_modules
+ENCRYPTION_KEY_FILE=/srv/state/config.key
+head -c 32 /dev/urandom | base64 >"$ENCRYPTION_KEY_FILE"
+chmod 600 "$ENCRYPTION_KEY_FILE"
+secret_fields=(UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID XHTTP_PRIVATE_KEY
+    MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD)
+
+# Realistic lengths: everything from 32 bytes up used to wrap onto a second line.
+DEC=mlkem768x25519plus.native.600s.mMhB2sQo8nWcYFJc0lDq1mUuJ7yrZ1Zz3Cq1kq0aS3E.Zs7f1cQ0b9WmV3xT5nK8pL2rD4gH6jA1sU0yE9iO7wR3tY5uI8oP2aS4dF6gH1jK3lZ5xC7vB9nM0qW2eR4tY6uI8oP0aS
+write_node full both \
+    "EXTRA_SHORT_IDS=aa11:bb22" "XHTTP_UUID=22222222-2222-4222-8222-222222222222" \
+    "XHTTP_PUBLIC_KEY=Zk1uT0pRc2xWb3hZd2FCZERmR2hJakxtTm9QcVJzVHU" \
+    "XHTTP_PRIVATE_KEY=cFhZd2FCZERmR2hJakxtTm9QcVJzVHVWd1h5WmFiY2Q" "XHTTP_SHORT_ID=fedcba9876543210" \
+    "MLDSA65_SEED=TWxEc2FTZWVkMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY" "MLDSA65_VERIFY=Verify_1" \
+    "VLESS_DECRYPTION=$DEC" "VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1" \
+    "HY2_OBFS_PASSWORD=0123456789abcdef0123456789abcdef" "HY2_HOP_PORTS=30000-30100" \
+    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com" "HY2_CORE="
+sed -i 's/^ANYTLS_PADDING_B64=$/ANYTLS_PADDING_B64=c3RvcD04/' "$NODES_DIR/full.env"
+sort "$NODES_DIR/full.env" >/srv/before.env
+CURRENT_NODE_NAME=full
+load_node_for_edit || fail_case "loading the plaintext node failed"
+declare -A expected=()
+for field in "${secret_fields[@]}"; do
+    [[ -n "${!field}" ]] || fail_case "the fixture leaves $field empty"
+    expected[$field]="${!field}"
+done
+
+# Encrypt on save.  Each secret is stored as exactly one ciphertext line.
+ENABLE_CONFIG_ENCRYPTION=true
+is_encryption_enabled || fail_case "encryption was not enabled"
+save_env
+node_lines=$(wc -l <"$NODES_DIR/full.env")
+assert_eq "$(wc -l </srv/before.env)" "$node_lines" "an encrypted node file must keep one line per field"
+assert_eq "$node_lines" "$(grep -c '^[A-Z0-9_]*=' "$NODES_DIR/full.env")" \
+    "every line of an encrypted node file must be KEY=VALUE"
+for field in "${secret_fields[@]}"; do
+    stored=$(safe_read_config_value "$NODES_DIR/full.env" "$field")
+    [[ "$stored" == U2FsdGVk* ]] || fail_case "$field was not stored encrypted: $stored"
+    assert_not_contains "$(cat "$NODES_DIR/full.env")" "=${expected[$field]}" "$field leaked in plaintext"
+done
+
+# Read back, twice: the second save re-encrypts values that came from ciphertext.
+for pass in first second; do
+    reset_node_state
+    load_node_for_edit || fail_case "loading the encrypted node failed ($pass pass)"
+    for field in "${secret_fields[@]}"; do
+        assert_eq "${expected[$field]}" "${!field}" "$field after the $pass encrypted round trip"
+    done
+    save_env
+done
+
+# The renderers and the share links see plaintext, never ciphertext.
+make_fake_xray /srv/bin/xray-new mldsa65 mlkem768 vlessenc
+XRAY_BIN=/srv/bin/xray-new
+XRAY_CAPS=""
+write_config || fail_case "rendering an encrypted node failed"
+assert_not_contains "$(cat "$XRAY_CONF")" "U2FsdGVk" "ciphertext reached the Xray config"
+vision=$(jq -c '.inbounds[] | select(.tag == "full_vision")' "$XRAY_CONF")
+xhttp=$(jq -c '.inbounds[] | select(.tag == "full_xhttp")' "$XRAY_CONF")
+assert_eq "${expected[UUID]}" "$(jq -r '.settings.clients[0].id' <<<"$vision")" "rendered Vision UUID"
+assert_eq "${expected[PRIVATE_KEY]}" "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$vision")" \
+    "rendered Vision private key"
+assert_eq "${expected[MLDSA65_SEED]}" "$(jq -r '.streamSettings.realitySettings.mldsa65Seed' <<<"$vision")" \
+    "rendered ML-DSA-65 seed"
+assert_eq "${expected[VLESS_DECRYPTION]}" "$(jq -r '.settings.decryption' <<<"$vision")" "rendered VLESS decryption"
+assert_eq "${expected[XHTTP_UUID]}" "$(jq -r '.settings.clients[0].id' <<<"$xhttp")" "rendered XHTTP UUID"
+assert_eq "${expected[XHTTP_PRIVATE_KEY]}" "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$xhttp")" \
+    "rendered XHTTP private key"
+link=$(get_share_link)
+assert_contains "$link" "vless://${expected[UUID]}@" "the share link must carry the plaintext UUID"
+info=$(show_info)
+assert_contains "$info" "vless://${expected[XHTTP_UUID]}@" "show_info must print the plaintext XHTTP UUID"
+assert_not_contains "$link$info" "U2FsdGVk" "ciphertext reached a share link"
+
+for protocol in shadowsocks hysteria2 anytls; do
+    sed -i "s/^PROTOCOL_TYPE=.*/PROTOCOL_TYPE=$protocol/" "$NODES_DIR/full.env"
+    link=$(get_share_link)
+    assert_not_contains "$link$(show_info)" "U2FsdGVk" "ciphertext reached the $protocol output"
+    case "$protocol" in
+        shadowsocks)
+            write_config || fail_case "rendering the encrypted Shadowsocks node failed"
+            assert_eq "${expected[SS_PASSWORD]}" "$(jq -r '.inbounds[0].settings.password' "$XRAY_CONF")" \
+                "rendered Shadowsocks password"
+            ;;
+        hysteria2)
+            assert_contains "$link" "hysteria2://${expected[HY2_PASSWORD]}@" "Hysteria2 link password"
+            assert_contains "$link" "obfs-password=${expected[HY2_OBFS_PASSWORD]}" "Hysteria2 link obfs password"
+            sed -i 's/^HY2_DOMAIN=.*/HY2_DOMAIN=/' "$NODES_DIR/full.env"
+            write_singbox_config || fail_case "rendering the encrypted Hysteria2 node failed"
+            assert_eq "${expected[HY2_PASSWORD]}/${expected[HY2_OBFS_PASSWORD]}" \
+                "$(jq -r '.inbounds[0] | "\(.users[0].password)/\(.obfs.password)"' "$SINGBOX_CONF")" \
+                "rendered Hysteria2 passwords"
+            sed -i 's/^HY2_DOMAIN=.*/HY2_DOMAIN=hy.example.com/' "$NODES_DIR/full.env"
+            ;;
+        anytls)
+            assert_contains "$link" "anytls://${expected[ANYTLS_PASSWORD]}@" "AnyTLS link password"
+            write_singbox_config || fail_case "rendering the encrypted AnyTLS node failed"
+            assert_eq "${expected[ANYTLS_PASSWORD]}" "$(jq -r '.inbounds[0].users[0].password' "$SINGBOX_CONF")" \
+                "rendered AnyTLS password"
+            ;;
+    esac
+done
+sed -i 's/^PROTOCOL_TYPE=.*/PROTOCOL_TYPE=both/' "$NODES_DIR/full.env"
+
+# Turning encryption off and saving once more restores the original file exactly,
+# which also covers every field that is never encrypted.
+load_node_for_edit || fail_case "reloading the encrypted node failed"
+ENABLE_CONFIG_ENCRYPTION=false
+save_env
+sort "$NODES_DIR/full.env" >/srv/after.env
+diff -u /srv/before.env /srv/after.env >&2 || fail_case "the encrypted round trip changed the node file"
+assert_eq "600" "$(stat -c '%a' "$NODES_DIR/full.env")" "the node file stays private"
+
+# The primitive itself: single line at any length, including past the size where
+# OpenSSL refuses single-line base64 unless -A is given on decryption as well.
+long_value=$(head -c 1500 /dev/zero | tr '\0' 'k')
+for value in "a" "0123456789abcdef0123456789abcde" "0123456789abcdef0123456789abcdef" "$long_value"; do
+    cipher=$(encrypt_value "$value")
+    assert_eq "1" "$(printf '%s\n' "$cipher" | wc -l)" "ciphertext of a ${#value}-byte value must be one line"
+    assert_eq "$value" "$(decrypt_value "$cipher")" "primitive round trip of a ${#value}-byte value"
+done
+assert_eq "" "$(encrypt_value "")" "an empty value stays empty"
+assert_eq "plain-value" "$(decrypt_value "plain-value")" "plaintext passes through decrypt_value"
+
+# Ciphertext written by the old implementation (`openssl enc -a`, wrapped at 64
+# characters).  Short values fitted on one line and must keep decrypting.
+legacy_encrypt() {
+    printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$(cat "$ENCRYPTION_KEY_FILE")"
+}
+legacy_short=$(legacy_encrypt "SafeAnyTlsPassword")
+assert_eq "1" "$(printf '%s\n' "$legacy_short" | wc -l)" "a short legacy ciphertext is a single line"
+assert_eq "SafeAnyTlsPassword" "$(decrypt_value "$legacy_short")" "short legacy ciphertext must still decrypt"
+
+# Longer values lost their second line on read.  That is unrecoverable, so reading
+# the node must fail without output rather than return a partial or raw value.
+legacy_uuid=$(legacy_encrypt "11111111-1111-4111-8111-111111111111")
+assert_eq "2" "$(printf '%s\n' "$legacy_uuid" | wc -l)" "a legacy UUID ciphertext spans two lines"
+write_node legacy vision
+{
+    grep -v '^UUID=' "$NODES_DIR/legacy.env"
+    printf 'UUID=%s\n' "$legacy_uuid"
+} >/srv/legacy.env
+cp -- /srv/legacy.env "$NODES_DIR/legacy.env"
+truncated=$(safe_read_config_value "$NODES_DIR/legacy.env" UUID)
+assert_eq "${legacy_uuid%%$'\n'*}" "$truncated" "the reader returns only the first ciphertext line"
+rc=0
+out=$(decrypt_value "$truncated" 2>/srv/decrypt.err) || rc=$?
+assert_eq "1/" "$rc/$out" "a truncated ciphertext must fail without output"
+assert_contains "$(cat /srv/decrypt.err)" "Cannot decrypt" "the failure must be reported"
+
+CURRENT_NODE_NAME=legacy
+rc=0
+load_node_for_edit 2>/srv/load.err || rc=$?
+assert_eq "1" "$rc" "a node with a truncated secret must fail to load for editing"
+assert_contains "$(cat /srv/load.err)" "UUID of node 'legacy'" "the error must name the field and the node"
+cmp -s /srv/legacy.env "$NODES_DIR/legacy.env" || fail_case "a failed load must not rewrite the node file"
+rc=0
+link=$(get_share_link 2>/dev/null) || rc=$?
+assert_eq "1/" "$rc/$link" "a share link must not be built from an undecryptable node"
+assert_fails "show_info must fail for an undecryptable node" show_info >/dev/null 2>&1
+cp -- "$XRAY_CONF" /srv/xray.before.json
+rc=0
+write_config 2>/srv/render.err || rc=$?
+assert_eq "1" "$rc" "rendering must fail while a node cannot be decrypted"
+assert_contains "$(cat /srv/render.err)" "UUID of node 'legacy'" "the render error must name the field and the node"
+cmp -s /srv/xray.before.json "$XRAY_CONF" || fail_case "a failed render must leave the existing config untouched"
+rm -f -- "$NODES_DIR/legacy.env"
+write_config || fail_case "removing the undecryptable node must unblock rendering"
+
+# A missing key file is a failure too, not a reason to hand back the ciphertext.
+cipher=$(encrypt_value "SafeHy2Password")
+mv -- "$ENCRYPTION_KEY_FILE" /srv/state/config.key.away
+rc=0
+out=$(decrypt_value "$cipher" 2>/dev/null) || rc=$?
+assert_eq "1/" "$rc/$out" "decryption without the key file must fail without output"
+SCENARIO
+
+# Hysteria2 can be hosted by either core.  The choice changes which config the
+# node is rendered into and nothing a client can see.
+run_scenario hysteria2-core-choice <<'SCENARIO'
+load_modules
+set_fake_xray() {
+    printf '#!/bin/sh\ncase "$1" in\n  version) echo "Xray %s (Xray, Penetrates Everything.) abc" ;;\n  help) printf "\\tmldsa65  x\\n\\tvlessenc  x\\n" ;;\nesac\nexit 0\n' "$1" >/srv/bin/xray-hy
+    chmod 755 /srv/bin/xray-hy
+    XRAY_BIN=/srv/bin/xray-hy
+    XRAY_CAPS=""
+}
+set_fake_xray 26.11.9
+
+# Which core owns a node.
+assert_eq "singbox" "$(node_core_of hysteria2 "")" "Hysteria2 defaults to sing-box"
+assert_eq "xray" "$(node_core_of hysteria2 xray)" "HY2_CORE=xray moves Hysteria2 to Xray"
+assert_eq "singbox" "$(node_core_of hysteria2 bogus)" "an unknown value keeps the default"
+assert_eq "singbox" "$(node_core_of anytls xray)" "AnyTLS can only run on sing-box"
+assert_eq "singbox" "$(node_core_of anytls_reality "")" "AnyTLS + REALITY runs on sing-box"
+for proto in vision xhttp both shadowsocks ""; do
+    assert_eq "xray" "$(node_core_of "$proto" "")" "'$proto' runs on Xray"
+done
+
+# Capability follows the installed version.
+xray_supports hysteria2 || fail_case "Xray 26.11.9 must support the Hysteria2 inbound"
+set_fake_xray 26.3.27
+xray_supports hysteria2 || fail_case "v26.3.27 is the first version with the Hysteria2 inbound"
+set_fake_xray 26.2.6
+assert_fails "v26.2.6 has no Hysteria2 inbound" xray_supports hysteria2
+set_fake_xray 26.11.9
+
+# Option handling.
+resolve_hy2_core
+assert_eq "" "$HY2_CORE" "the default backend is sing-box"
+hy2core=xray resolve_hy2_core
+assert_eq "xray" "$HY2_CORE" "hy2core=xray selects Xray"
+hy2core=sing-box resolve_hy2_core
+assert_eq "" "$HY2_CORE" "hy2core=sing-box selects the default"
+rc=0
+( hy2core=nonsense resolve_hy2_core 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "an unknown backend must be rejected"
+
+HY2_DOMAIN="" HY2_HOP_PORTS=""
+hy2_core_allowed xray || fail_case "a plain node may run on Xray"
+hy2_core_allowed singbox || fail_case "sing-box has no restrictions"
+HY2_DOMAIN=hy.example.com
+assert_contains "$(hy2_core_allowed xray 2>&1 || true)" "ACME certificates are only available" "ACME needs sing-box"
+assert_fails "ACME on Xray must be refused" hy2_core_allowed xray
+hy2_core_allowed singbox || fail_case "ACME on sing-box stays allowed"
+HY2_DOMAIN="" HY2_HOP_PORTS=30000-30100
+hy2_core_allowed xray || fail_case "port hopping on Xray is fine under systemd"
+INIT_SYSTEM=openrc
+assert_fails "port hopping on Xray under OpenRC must be refused" hy2_core_allowed xray
+INIT_SYSTEM=systemd
+HY2_HOP_PORTS=""
+set_fake_xray 26.2.6
+assert_contains "$(hy2_core_allowed xray 2>&1 || true)" "v26.3.27 or newer" "an old Xray must be named as the reason"
+set_fake_xray 26.11.9
+
+# Rendering and counting.
+write_node onxray hysteria2 "HY2_CORE=xray"
+write_node onsb hysteria2
+sed -i 's/^PORT=1443$/PORT=5443/' "$NODES_DIR/onsb.env"
+write_node obfsx hysteria2 "HY2_CORE=xray" "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+sed -i 's/^PORT=1443$/PORT=6443/' "$NODES_DIR/obfsx.env"
+write_node at anytls
+sed -i 's/^PORT=1443$/PORT=7443/' "$NODES_DIR/at.env"
+assert_eq "2" "$(xray_node_count)" "Xray counts the two Hysteria2 nodes it hosts"
+assert_eq "2" "$(singbox_node_count)" "sing-box counts its Hysteria2 node and the AnyTLS node"
+for n in onxray onsb obfsx; do gen_selfsigned_cert "$n" edge.example.com; done
+gen_selfsigned_cert at edge.example.com
+
+write_config
+write_singbox_config
+assert_eq "onxray_hysteria2 obfsx_hysteria2" "$(jq -r '[.inbounds[].tag] | sort | reverse | join(" ")' "$XRAY_CONF")" \
+    "the Xray config holds exactly the nodes that chose Xray"
+assert_eq "at_anytls onsb_hysteria2" "$(jq -r '[.inbounds[].tag] | sort | join(" ")' "$SINGBOX_CONF")" \
+    "the sing-box config holds the rest"
+plain=$(jq -c '.inbounds[] | select(.tag == "onxray_hysteria2")' "$XRAY_CONF")
+assert_eq "hysteria/hysteria/tls" \
+    "$(jq -r '"\(.protocol)/\(.streamSettings.network)/\(.streamSettings.security)"' <<<"$plain")" "protocol and transport"
+assert_eq "null" "$(jq -r '.streamSettings.method' <<<"$plain")" "the transport is selected by network, not method"
+assert_eq '{"version":2,"users":[{"auth":"SafeHy2Password","email":"onxray"}]}' "$(jq -c '.settings' <<<"$plain")" "users"
+assert_eq '["h3"]' "$(jq -c '.streamSettings.tlsSettings.alpn' <<<"$plain")" "ALPN"
+assert_eq "/srv/sing-box/certs/onxray.crt" \
+    "$(jq -r '.streamSettings.tlsSettings.certificates[0].certificateFile' <<<"$plain")" "the per-node certificate is reused"
+assert_eq "proxy" "$(jq -r '.streamSettings.hysteriaSettings.masquerade.type' <<<"$plain")" "masquerade without obfuscation"
+assert_eq "null" "$(jq -r '.streamSettings.finalmask' <<<"$plain")" "no finalmask without obfuscation"
+assert_eq "1443" "$(jq -r '.port' <<<"$plain")" "port"
+obfs=$(jq -c '.inbounds[] | select(.tag == "obfsx_hysteria2")' "$XRAY_CONF")
+assert_eq '{"udp":[{"type":"salamander","settings":{"password":"Chosen.Obfs-Pass_1"}}]}' \
+    "$(jq -c '.streamSettings.finalmask' <<<"$obfs")" "Salamander is a UDP finalmask on Xray"
+assert_eq "null" "$(jq -r '.streamSettings.hysteriaSettings.masquerade' <<<"$obfs")" "no masquerade with obfuscation"
+
+# The share link does not depend on the core.
+CURRENT_NODE_NAME=onxray
+link_xray=$(get_share_link)
+sed -i 's/^HY2_CORE=xray$/HY2_CORE=/' "$NODES_DIR/onxray.env"
+assert_eq "$link_xray" "$(get_share_link)" "switching cores must not change the share link"
+sed -i 's/^HY2_CORE=$/HY2_CORE=xray/' "$NODES_DIR/onxray.env"
+assert_contains "$(show_info)" "Hysteria2 (Xray)" "node info names the hosting core"
+CURRENT_NODE_NAME=onsb
+assert_contains "$(show_info)" "Hysteria2 (sing-box)" "node info names the hosting core"
+
+# IPv6-only stack: the Xray inbound gets the same listen address and sockopt as the others.
+printf '%s\n' v6 >"$NETSTACK_FILE"
+write_config
+assert_eq "::/true" \
+    "$(jq -r '.inbounds[] | select(.tag == "onxray_hysteria2") | "\(.listen)/\(.streamSettings.sockopt.v6only)"' "$XRAY_CONF")" \
+    "the network stack setting applies to the Hysteria2 inbound"
+unlink "$NETSTACK_FILE"
+
+# A node that asks for Xray on a core that cannot host it fails to render.
+set_fake_xray 26.2.6
+rc=0
+write_config 2>/srv/core.err || rc=$?
+assert_eq "1" "$rc" "an Xray too old for Hysteria2 must fail the render"
+assert_contains "$(cat /srv/core.err)" "run xray-update first" "the failure must say how to fix it"
+set_fake_xray 26.11.9
+
+# With config encryption on, the Xray-hosted node is rendered from decrypted
+# secrets, and an undecryptable one fails the render instead of being skipped.
+ENCRYPTION_KEY_FILE=/srv/state/config.key
+head -c 32 /dev/urandom | base64 >"$ENCRYPTION_KEY_FILE"
+ENABLE_CONFIG_ENCRYPTION=true
+CURRENT_NODE_NAME=obfsx
+load_node_for_edit || fail_case "loading the node failed"
+save_env
+[[ "$(grep '^HY2_PASSWORD=' "$NODES_DIR/obfsx.env")" == HY2_PASSWORD=U2FsdGVk* ]] || fail_case "the password must be stored encrypted"
+write_config
+assert_eq "SafeHy2Password/Chosen.Obfs-Pass_1" \
+    "$(jq -r '.inbounds[] | select(.tag == "obfsx_hysteria2") | "\(.settings.users[0].auth)/\(.streamSettings.finalmask.udp[0].settings.password)"' "$XRAY_CONF")" \
+    "encrypted Hysteria2 secrets must be decrypted for the Xray inbound"
+head -c 32 /dev/urandom | base64 >"$ENCRYPTION_KEY_FILE"
+assert_fails "an undecryptable Hysteria2 password must fail the Xray render" write_config
+ENABLE_CONFIG_ENCRYPTION=false
+unlink "$NODES_DIR/obfsx.env"
+
+assert_fails "the Xray builder must reject an unsafe password" \
+    build_xray_hysteria2_inbound n 4443 'bad"pw12345' edge.example.com /c /k
+assert_fails "the Xray builder must reject an unsafe obfs password" \
+    build_xray_hysteria2_inbound n 4443 SafeHy2Password edge.example.com /c /k 'bad"pw12345'
+
+if use_real_xray; then
+    write_config
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+        cat /srv/xray-test.out >&2
+        fail_case "the real core rejected the Hysteria2 inbound"
+    }
+fi
+SCENARIO
+
+# Installing a Hysteria2 node on Xray takes the Xray path end to end: the right
+# core is installed, the node is rendered into the Xray config, and a failed
+# start rolls back through Xray without touching sing-box.
+run_scenario hysteria2-install-on-xray <<'SCENARIO'
+load_modules
+printf '#!/bin/sh\ncase "$1" in\n  version) echo "Xray 26.11.9 (Xray, Penetrates Everything.) abc" ;;\n  help) printf "\\tmldsa65  x\\n" ;;\nesac\nexit 0\n' >/srv/bin/xray-hy
+chmod 755 /srv/bin/xray-hy
+XRAY_BIN=/srv/bin/xray-hy
+XRAY_CAPS=""
+HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
+HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
+record() { printf '%s\n' "$*" >>/srv/install.calls; }
+is_root() { return 0; }
+install_deps() { :; }
+install_xray() { record install-xray; }
+install_singbox() { record install-singbox; }
+detect_network_stack() { SERVER_IPV4=203.0.113.10; SERVER_IPV6=""; }
+choose_ports() { PORT=4443; XHTTP_PORT=""; XHTTP_PATH=""; }
+service_enable() { :; }
+service_stop() { record "stop:$1"; }
+service_disable() { :; }
+START_OK=yes
+service_restart() { record "restart:$1"; [[ "$START_OK" == yes ]]; }
+service_is_active() { [[ "$START_OK" == yes ]]; }
+sleep() { :; }
+open_firewall_port() { record "firewall:$1/$2"; }
+show_info() { :; }
+show_node_qrcodes() { :; }
+prompt_xray_restart_on_install() { :; }
+show_proxy_service_failure_logs() { :; }
+service_hardening_ensure() { record "harden:$1"; }
+systemctl() { :; }
+: >/srv/install.calls
+
+( name=hx proto=hysteria2 hy2core=xray hy2obfs=true cmd_install ) >/srv/install.out 2>&1 || {
+    cat /srv/install.out >&2; fail_case "installing Hysteria2 on Xray failed"; }
+calls=$(cat /srv/install.calls)
+assert_contains "$calls" "install-xray" "Xray must be installed for an Xray-hosted node"
+assert_not_contains "$calls" "install-singbox" "sing-box must not be installed for an Xray-hosted node"
+assert_contains "$calls" "restart:xray" "the Xray service is restarted"
+assert_not_contains "$calls" "restart:sing-box" "the sing-box service is not touched"
+assert_contains "$calls" "firewall:4443/udp" "the UDP port is opened"
+assert_contains "$calls" "harden:xray" "the hosting service is hardened after the health gate"
+assert_eq "xray" "$(safe_read_config_value "$NODES_DIR/hx.env" HY2_CORE)" "the node records its core"
+assert_eq "hx_hysteria2" "$(jq -r '.inbounds[0].tag' "$XRAY_CONF")" "the node is rendered into the Xray config"
+assert_eq "salamander" "$(jq -r '.inbounds[0].streamSettings.finalmask.udp[0].type' "$XRAY_CONF")" \
+    "install options reach the Xray inbound"
+[[ -s "$SINGBOX_CERT_DIR/hx.crt" ]] || fail_case "the self-signed certificate must exist for an Xray-hosted node"
+[[ ! -e "$SINGBOX_CONF" ]] || fail_case "no sing-box config may be written for an Xray-only host"
+
+# The default is still sing-box.
+: >/srv/install.calls
+singbox_sync() { record singbox-sync; }
+( name=hs proto=hysteria2 cmd_install ) >/srv/install.out 2>&1 || { cat /srv/install.out >&2; fail_case "default install failed"; }
+calls=$(cat /srv/install.calls)
+assert_contains "$calls" "install-singbox" "without hy2core the node is installed on sing-box"
+assert_contains "$calls" "singbox-sync" "without hy2core the sing-box path is taken"
+assert_eq "" "$(safe_read_config_value "$NODES_DIR/hs.env" HY2_CORE)" "the default core is stored as empty"
+
+# Combinations Xray cannot host are refused before anything is written.
+for combo in "hy2domain=hy.example.com" "hy2core=bogus"; do
+    : >/srv/install.calls
+    rc=0
+    ( getent() { printf '203.0.113.10 STREAM x\n'; }; get_ipv4() { echo 203.0.113.10; }; get_ipv6() { :; }
+      ss() { :; }
+      export "$combo"; name=bad proto=hysteria2 hy2core="${hy2core:-xray}" cmd_install ) >/srv/install.out 2>&1 || rc=$?
+    assert_eq "1" "$rc" "install with '$combo' on Xray must be refused"
+    [[ ! -e "$NODES_DIR/bad.env" ]] || fail_case "a refused install must not leave a node file ($combo)"
+done
+
+# A failed start rolls the node back through Xray, port-hopping rules included.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/srv/iptables.calls\nexit 0\n' >/srv/bin/iptables
+chmod 755 /srv/bin/iptables
+: >/srv/install.calls; : >/srv/iptables.calls
+START_OK=no
+rc=0
+( name=hf proto=hysteria2 hy2core=xray hy2hop=41000-41050 PATH="/srv/bin:$PATH" cmd_install ) >/srv/install.out 2>&1 || rc=$?
+START_OK=yes
+assert_eq "1" "$rc" "a failed start must fail the install"
+assert_contains "$(cat /srv/install.calls)" "restart:xray" "the install must have reached the service start"
+assert_contains "$(cat /srv/iptables.calls)" "--dport 41000:41050 -j REDIRECT --to-ports 4443" \
+    "the hop rules were applied for the Xray-hosted node before the start"
+[[ ! -e "$HY2_HOP_HELPER" ]] || fail_case "the rollback must clear the hop helper of the removed node"
+[[ ! -e "$NODES_DIR/hf.env" ]] || fail_case "the failed node must be removed"
+[[ ! -e "$SINGBOX_CERT_DIR/hf.crt" ]] || fail_case "the failed node's certificate must be removed"
+assert_not_contains "$(cat /srv/install.calls)" "singbox-sync" "an Xray-hosted rollback must not run the sing-box path"
+assert_eq "hx_hysteria2" "$(jq -r '[.inbounds[].tag] | join(" ")' "$XRAY_CONF")" \
+    "the Xray config is rebuilt without the failed node"
+SCENARIO
+
+# Real interop on loopback: the configs the builders render are started with
+# the real cores and a real sing-box client connects to them.  A case passes
+# when the server logs the proxied request.  Runs only when both real cores
+# are provided; nothing here is stubbed.
+run_scenario hysteria2-interop <<'SCENARIO'
+load_modules
+if ! use_real_xray || ! use_real_singbox; then
+    printf 'skipped: needs PROXY_HUB_TEST_XRAY_BIN and PROXY_HUB_TEST_SINGBOX_BIN\n'
+    exit 0
+fi
+CLIENT_BIN="$SINGBOX_BIN"
+SERVER_PID="" CLIENT_PID=""
+stop_pair() {
+    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
+    [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" 2>/dev/null
+    wait 2>/dev/null || true
+    SERVER_PID="" CLIENT_PID=""
+}
+trap stop_pair EXIT
+
+# Usage: probe CORE CLIENT_EXTRA_JSON CLIENT_PASSWORD -> prints OK or FAIL
+probe() {
+    local core="$1" extra="$2" password="$3" pattern attempt
+    jq -n --arg pw "$password" --argjson extra "{${extra}}" '
+        {log: {level: "error"},
+         inbounds: [{type: "mixed", listen: "127.0.0.1", listen_port: 11080}],
+         outbounds: [({type: "hysteria2", tag: "hy", server: "127.0.0.1", server_port: 1443, password: $pw,
+                       tls: {enabled: true, server_name: "edge.example.com", insecure: true}} + $extra)]}' >/srv/client.json
+    : >/srv/server.log
+    if [[ "$core" == "xray" ]]; then
+        jq '.log.loglevel = "info"' "$XRAY_CONF" >/srv/server.json
+        "$XRAY_BIN" run -config /srv/server.json >/srv/server.log 2>&1 &
+        pattern='accepted tcp:127.0.0.1:9'
+    else
+        jq '.log.level = "info"' "$SINGBOX_CONF" >/srv/server.json
+        "$SINGBOX_BIN" run -c /srv/server.json >/srv/server.log 2>&1 &
+        pattern='inbound connection to 127.0.0.1:9'
+    fi
+    SERVER_PID=$!
+    "$CLIENT_BIN" run -c /srv/client.json >/srv/client.log 2>&1 &
+    CLIENT_PID=$!
+    for attempt in 1 2 3 4 5 6 7 8; do
+        curl -sS -m 2 --noproxy '' -x socks5h://127.0.0.1:11080 http://127.0.0.1:9/ >/dev/null 2>&1 || true
+        if grep -q "$pattern" /srv/server.log; then
+            stop_pair
+            printf 'OK'
+            return 0
+        fi
+        command sleep 0.4
+    done
+    stop_pair
+    printf 'FAIL'
+}
+OBFS='"obfs":{"type":"salamander","password":"Chosen.Obfs-Pass_1"}'
+
+# The harness itself: with no Hysteria2 node there is nothing to connect to.
+write_node tcp vision
+write_config
+assert_eq "FAIL" "$(probe xray "" SafeHy2Password)" "without a Hysteria2 inbound nothing may be accepted"
+unlink "$NODES_DIR/tcp.env"
+
+for core in xray singbox; do
+    core_field="HY2_CORE="
+    [[ "$core" == xray ]] && core_field="HY2_CORE=xray"
+
+    write_node hy hysteria2 "$core_field"
+    gen_selfsigned_cert hy edge.example.com
+    write_config
+    write_singbox_config
+    assert_eq "OK" "$(probe "$core" "" SafeHy2Password)" "[$core] a plain node accepts its client"
+    assert_eq "FAIL" "$(probe "$core" "" WrongPassword)" "[$core] a wrong password is refused"
+    assert_eq "FAIL" "$(probe "$core" "$OBFS" SafeHy2Password)" "[$core] a client with obfs cannot reach a plain node"
+
+    write_node hy hysteria2 "$core_field" "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+    write_config
+    write_singbox_config
+    assert_eq "OK" "$(probe "$core" "$OBFS" SafeHy2Password)" "[$core] Salamander works with the matching password"
+    assert_eq "FAIL" "$(probe "$core" "" SafeHy2Password)" "[$core] a client without obfs cannot reach an obfuscated node"
+    assert_eq "FAIL" "$(probe "$core" '"obfs":{"type":"salamander","password":"Other.Pass_99"}' SafeHy2Password)" \
+        "[$core] a wrong obfs password is refused"
+done
+printf 'interop: 13 probes against real cores\n'
 SCENARIO
 
 printf '%s\n' "All protocol-refresh contract tests passed."

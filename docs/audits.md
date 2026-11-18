@@ -184,13 +184,30 @@
   需要扫描服务器的邻近网段，脚本没有做这件事。
 - 临时缓解：自行找到同 ASN 的目标后，用 `reym=` 或 SNI 菜单的"手动输入"指定。
 
-## 可选的配置加密会写出多行密文
+## 可选的配置加密没有完整性校验，密钥经命令行传入
 
-- 严重性：medium（仅在启用该未公开选项时）
+- 严重性：low（仅在启用该未公开选项时）
 - 影响范围：设置了 `ENABLE_CONFIG_ENCRYPTION=true` 且存在
-  `/root/.reality_vision_key` 的安装。这是一个没有文档的开关，默认关闭。
-- 触发条件：加密任何超过约 30 字节的值，例如 UUID 或 REALITY 私钥。
-- 影响：`encrypt_value` 用 `openssl enc -a`，其 base64 输出每 64 字符换行；UUID 和私钥
-  的密文都是两行，写进逐行 `KEY=VALUE` 的节点文件后第二行丢失，节点无法再被读出。
-  这是先于本轮改动存在的缺陷，本轮新增的敏感字段沿用了同一个函数，同样受影响。
-- 临时缓解：不要启用该选项。修复方向是改用单行 base64（`-A`）并兼容读取既有密文。
+  `/root/.reality_vision_key` 的安装。
+- 触发条件：密钥文件被换成另一把密钥后读取既有节点；或本机其他用户在加解密的瞬间
+  读取进程参数。
+- 影响：`openssl enc -aes-256-cbc` 不带认证，用错误密钥解密时约每 256 次有 1 次通过
+  padding 检查并返回乱码（实测 300 次中 2 次），这时 `decrypt_value` 无法识别失败。
+  密钥以 `-pass pass:<key>` 传给 openssl，在该进程存活期间出现在
+  `/proc/<pid>/cmdline` 中。另外 `is_encryption_enabled` 要求密钥文件已存在，
+  `setup_encryption_key` 因此不会被触发，密钥需手工生成。
+- 临时缓解：不要更换密钥文件；需要更换时先关闭加密并让每个节点经 `save_env` 重存为
+  明文。多用户主机上挂载 `/proc` 时使用 `hidepid=2`。
+
+## Xray 承载的 Hysteria2 在 IPv6 上未经验证
+
+- 严重性：low
+- 影响范围：`HY2_CORE=xray` 的 Hysteria2 节点，在双栈或 IPv6 Only 主机上。
+- 触发条件：客户端经 IPv6 连接，或网络栈设置为 `v6`。
+- 影响：该后端在 IPv4 回环上与真实 sing-box 客户端互通（含 Salamander 与反例）。但
+  验证环境没有 IPv6，下面两点没有实测：`dual` 档下监听 `0.0.0.0` 的 UDP socket 是否
+  同时接受 IPv6 连接（TCP 入站依赖的"通配监听即双栈"是否对 Xray 的 QUIC 监听同样
+  成立）；`v6` 档下 `listen "::"` 加 `sockopt.v6only` 是否生效。在没有 IPv6 的主机上，
+  后者只会让 Xray 记一条"failed to set IPV6_V6ONLY"并继续提供 IPv4 服务。
+- 临时缓解：需要 IPv6 入口的 Hysteria2 节点保持默认的 sing-box 后端（它在 `dual` 档
+  监听 `::`），或在一台双栈主机上实测后再切换。
