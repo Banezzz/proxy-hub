@@ -7047,17 +7047,72 @@ get_anytls_link() {
     fi
 }
 
+# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
+# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
+# Usage: cert_sha256_hex CERT_PEM
+cert_sha256_hex() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    out="${out##*=}"
+    out="${out//:/}"
+    out="${out,,}"
+    [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$out"
+}
+
+# 证书公钥的 SHA-256（base64），对应 sing-box 出站的 certificate_public_key_sha256。
+# Usage: cert_pubkey_sha256_b64 CERT_PEM
+cert_pubkey_sha256_b64() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform der 2>/dev/null \
+        | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0) || return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+# 当前已加载节点的逐节点自签名证书路径。
+node_selfsigned_cert_path() {
+    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
+}
+
 # 生成 Hysteria2 分享链接。密码被限制在 URI-unreserved 字符集内。
+#
+# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
+# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
+# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
+# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
 get_hy2_link() {
     local ip="$1"
     local node_label="$2"
     local ip_formatted="$ip"
+    local pin="" query
 
     if [[ "$ip" == *:* ]]; then
         ip_formatted="[$ip]"
     fi
 
-    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
+    query="sni=${SNI:-www.bing.com}&insecure=1"
+    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
+    [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+
+    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
+}
+
+# 在节点信息里展示自签名证书指纹，供不支持从链接导入固定值的客户端手工填写。
+show_selfsigned_cert_pins() {
+    local cert pin_hex pin_key
+    cert=$(node_selfsigned_cert_path)
+    pin_hex=$(cert_sha256_hex "$cert") || return 0
+    pin_key=$(cert_pubkey_sha256_b64 "$cert") || pin_key=""
+    echo -e "  ${BLUE}Cert SHA-256:${NC} ${pin_hex}"
+    echo -e "               ${GRAY}(Hysteria2 pinSHA256 / Xray pinnedPeerCertSha256)${NC}"
+    if [[ -n "$pin_key" ]]; then
+        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
+        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
+    fi
 }
 
 # 向后兼容的获取分享链接函数
@@ -7237,6 +7292,7 @@ show_info() {
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
         echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
         echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+        show_selfsigned_cert_pins
         echo ""
 
         if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
@@ -7270,6 +7326,7 @@ show_info() {
             echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
             echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}  ${GRAY}(证书 CN / cert CN)${NC}"
             echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(客户端需允许不安全连接)${NC}"
+            show_selfsigned_cert_pins
         fi
 
         # Padding scheme（base64 解码后展示）：每个节点随机生成，握手时自动下发给客户端
@@ -11288,7 +11345,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=438611 body-sha256=ca471a57ac497dbdf55a428bfebc4130471395805cc61a95e967f83939866d61
-# build-id=ca471a57ac497dbdf55a428bfebc4130471395805cc61a95e967f83939866d61
+# body-bytes=441110 body-sha256=6da3abc7b1c695967ca1d83dde70c64538f229c51013eeace1ca0c92f3251076
+# build-id=6da3abc7b1c695967ca1d83dde70c64538f229c51013eeace1ca0c92f3251076
 # module-count=11
 # proxy-hub-bundle-end-v1

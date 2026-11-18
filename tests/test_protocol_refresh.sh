@@ -263,4 +263,54 @@ if use_real_xray; then
 fi
 SCENARIO
 
+# Self-signed nodes: Hysteria2 links carry the certificate pin next to
+# insecure=1, and the node info prints the fingerprints for manual pinning.
+run_scenario selfsigned-pin-links <<'SCENARIO'
+load_modules
+write_node hy hysteria2
+write_node plain anytls
+gen_selfsigned_cert hy edge.example.com
+gen_selfsigned_cert plain edge.example.com
+
+expected_pin=$(openssl x509 -in "$SINGBOX_CERT_DIR/hy.crt" -outform der | sha256sum | awk '{print $1}')
+assert_eq "$expected_pin" "$(cert_sha256_hex "$SINGBOX_CERT_DIR/hy.crt")" \
+    "the pin must be the SHA-256 of the DER certificate"
+expected_key=$(openssl x509 -in "$SINGBOX_CERT_DIR/hy.crt" -noout -pubkey \
+    | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64 -w0)
+assert_eq "$expected_key" "$(cert_pubkey_sha256_b64 "$SINGBOX_CERT_DIR/hy.crt")" \
+    "the public-key pin must hash the SubjectPublicKeyInfo"
+
+CURRENT_NODE_NAME=hy
+link=$(get_share_link)
+assert_contains "$link" "hysteria2://SafeHy2Password@203.0.113.10:1443/?" "Hysteria2 link shape"
+assert_contains "$link" "&insecure=1" "insecure=1 stays for clients that only know that flag"
+assert_contains "$link" "&pinSHA256=${expected_pin}" "the link must pin the node certificate"
+info=$(show_info)
+assert_contains "$info" "$expected_pin" "node info must print the certificate fingerprint"
+assert_contains "$info" "$expected_key" "node info must print the public-key fingerprint"
+
+# The pin follows the certificate: a regenerated certificate changes the link.
+rm -f -- "$SINGBOX_CERT_DIR/hy.crt" "$SINGBOX_CERT_DIR/hy.key"
+gen_selfsigned_cert hy edge.example.com
+assert_not_contains "$(get_share_link)" "$expected_pin" "a new certificate must produce a new pin"
+
+# A missing certificate degrades to the legacy link instead of an empty pin.
+rm -f -- "$SINGBOX_CERT_DIR/hy.crt"
+link=$(get_share_link)
+assert_contains "$link" "&insecure=1#" "legacy link form without a certificate"
+assert_not_contains "$link" "pinSHA256" "no empty pin may be emitted"
+assert_fails "an unreadable certificate must not yield a pin" cert_sha256_hex /srv/absent.crt
+
+# Plain AnyTLS has no standard pin parameter; the fingerprints are shown instead.
+CURRENT_NODE_NAME=plain
+plain_pin=$(cert_sha256_hex "$SINGBOX_CERT_DIR/plain.crt")
+assert_contains "$(show_info)" "$plain_pin" "plain AnyTLS info must print the fingerprint"
+assert_contains "$(get_share_link)" "insecure=1" "plain AnyTLS keeps insecure=1"
+
+# REALITY variants have no certificate of their own and must not print one.
+write_node real anytls_reality
+CURRENT_NODE_NAME=real
+assert_not_contains "$(show_info)" "Cert SHA-256" "REALITY nodes have no pinned certificate"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
