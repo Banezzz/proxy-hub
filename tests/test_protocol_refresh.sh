@@ -1884,4 +1884,40 @@ assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-$HY2_HOP_HELPER apply"
     "an old systemd keeps the prefix it understands"
 SCENARIO
 
+# The sysctl tuning template: no dead keys, UDP floors for QUIC, and a way to
+# recognise a file written by the previous template.
+run_scenario sysctl-tuning-template <<'SCENARIO'
+load_modules
+SYSCTL_TUNING_FILE=/srv/state/99-bbr.conf
+content=$(sysctl_tuning_content bbr fq)
+assert_contains "$content" "net.ipv4.tcp_congestion_control = bbr" "the congestion control is preserved"
+assert_contains "$content" "net.core.default_qdisc = fq" "the qdisc is preserved"
+assert_contains "$content" "net.core.rmem_max = 33554432" "receive buffers are raised"
+assert_contains "$content" "net.ipv4.udp_rmem_min = 16384" "UDP sockets get a receive floor"
+assert_contains "$content" "net.ipv4.udp_wmem_min = 16384" "UDP sockets get a send floor"
+assert_not_contains "$content" "tcp_low_latency" "tcp_low_latency is a no-op since Linux 4.14"
+# Every line is either a comment or a well-formed key = value pair.
+while IFS= read -r line; do
+    [[ "$line" =~ ^# || "$line" =~ ^[a-z0-9_.]+\ =\ [a-z0-9_\ ]+$ ]] || fail_case "malformed sysctl line: $line"
+done <<<"$content"
+assert_contains "$(sysctl_tuning_content "" "")" "tcp_congestion_control = bbr" "an unreadable current value falls back to bbr"
+
+assert_fails "a missing file is not legacy" sysctl_tuning_is_legacy
+printf '%s\n' 'net.ipv4.tcp_congestion_control = cubic' 'net.ipv4.tcp_low_latency = 1' >"$SYSCTL_TUNING_FILE"
+sysctl_tuning_is_legacy || fail_case "a file with tcp_low_latency is the legacy template"
+
+sysctl() {
+    case "$*" in
+        "-n net.ipv4.tcp_congestion_control") echo cubic ;;
+        "-n net.core.default_qdisc") echo fq_codel ;;
+        *) printf '%s\n' "$*" >>/srv/sysctl.calls ;;
+    esac
+}
+sysctl_tuning_apply || fail_case "applying the template failed"
+assert_contains "$(cat "$SYSCTL_TUNING_FILE")" "tcp_congestion_control = cubic" "the running algorithm is kept, not forced to BBR"
+assert_contains "$(cat "$SYSCTL_TUNING_FILE")" "default_qdisc = fq_codel" "the running qdisc is kept"
+assert_fails "a rewritten file is no longer legacy" sysctl_tuning_is_legacy
+assert_contains "$(cat /srv/sysctl.calls)" "--system" "the new values are loaded immediately"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

@@ -863,9 +863,15 @@ cmd_bbr() {
         echo -e "  Congestion Control: $bbr_status"
         echo -e "  Queue Discipline: ${YELLOW}$qdisc_status${NC}"
         echo ""
-        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ"
+        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ  ${YELLOW}$(t2 "[推荐]" "[recommended]")${NC}"
+        menu_note "$(t2 "换用 BBR 拥塞控制，丢包线路上吞吐更稳；对绝大多数 VPS 都是正收益。" \
+            "Switches to BBR congestion control: steadier throughput on lossy links, a net win on most VPSes.")"
         echo -e "  ${GREEN}2.${NC} Disable BBR (use CUBIC)"
-        echo -e "  ${GREEN}3.${NC} Apply TCP optimization"
+        menu_note "$(t2 "恢复系统默认算法；仅在 BBR 表现异常时使用。" \
+            "Back to the system default; only when BBR misbehaves.")"
+        echo -e "  ${GREEN}3.${NC} Apply TCP/UDP optimization"
+        menu_note "$(t2 "放大收发缓冲区（对高带宽线路和 Hysteria2 有帮助），不改变上面的算法选择。" \
+            "Raises socket buffers (helps high-bandwidth links and Hysteria2) without changing the algorithm above.")"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
@@ -908,25 +914,49 @@ EOF
     read -rp "$(msg menu_press_enter)"
 }
 
+# 网络调优模板。保留当前的拥塞控制与队列规则，只调缓冲区与几个通用开关：
+#   - 缓冲区上限 32MB：高带宽长距离链路上 TCP 窗口与 QUIC（Hysteria2）收发都受它限制；
+#   - udp_rmem_min / udp_wmem_min：给每个 UDP socket 一个不至于在突发时丢包的下限；
+#   - 不再写 tcp_low_latency：它自内核 4.14 起是空操作，写了只会让人误以为有效。
+# Usage: sysctl_tuning_content CONGESTION_CONTROL QDISC
+SYSCTL_TUNING_FILE="/etc/sysctl.d/99-bbr.conf"
+sysctl_tuning_content() {
+    printf '%s\n' \
+        "# proxy-hub-managed: sysctl-tuning-v2" \
+        "net.core.default_qdisc = ${2:-fq}" \
+        "net.ipv4.tcp_congestion_control = ${1:-bbr}" \
+        "net.core.rmem_max = 33554432" \
+        "net.core.wmem_max = 33554432" \
+        "net.ipv4.tcp_rmem = 4096 87380 33554432" \
+        "net.ipv4.tcp_wmem = 4096 65536 33554432" \
+        "net.ipv4.udp_rmem_min = 16384" \
+        "net.ipv4.udp_wmem_min = 16384" \
+        "net.ipv4.tcp_slow_start_after_idle = 0" \
+        "net.ipv4.tcp_mtu_probing = 1"
+}
+
+# 调优文件是否是旧模板写的（含已失效的 tcp_low_latency）。
+sysctl_tuning_is_legacy() {
+    [[ -f "$SYSCTL_TUNING_FILE" ]] && grep -q '^net\.ipv4\.tcp_low_latency' "$SYSCTL_TUNING_FILE" 2>/dev/null
+}
+
+# 按当前的拥塞控制与队列规则重写调优文件并立即生效。
+sysctl_tuning_apply() {
+    local cc qd
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cc=""
+    qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || qd=""
+    sysctl_tuning_content "$cc" "$qd" >"$SYSCTL_TUNING_FILE" || return 1
+    sysctl --system >/dev/null 2>&1 || true
+}
+
 bbr_optimize() {
     echo ""
-    log_info "Applying TCP optimization..."
-    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-
-    cat > /etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc = $qd
-net.ipv4.tcp_congestion_control = $cc
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-EOF
-    sysctl --system >/dev/null 2>&1
-    log_info "TCP optimization applied"
+    log_info "Applying TCP/UDP optimization..."
+    if sysctl_tuning_apply; then
+        log_info "TCP/UDP optimization applied"
+    else
+        log_error "Failed to write $SYSCTL_TUNING_FILE"
+    fi
     echo ""
     read -rp "$(msg menu_press_enter)"
 }
