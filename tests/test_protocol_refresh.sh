@@ -1944,4 +1944,186 @@ CURRENT_NODE_NAME=missing
 assert_fails "a missing node must fail to load" load_node_for_edit
 SCENARIO
 
+# Optional config encryption (ENABLE_CONFIG_ENCRYPTION=true plus a key file): every
+# secret field must survive save_env -> load_node_for_edit unchanged, the node file
+# must stay one KEY=VALUE per line, and a value that cannot be decrypted must fail
+# instead of flowing into a config, a link or a re-saved node file.
+run_scenario config-encryption-round-trip <<'SCENARIO'
+load_modules
+ENCRYPTION_KEY_FILE=/srv/state/config.key
+head -c 32 /dev/urandom | base64 >"$ENCRYPTION_KEY_FILE"
+chmod 600 "$ENCRYPTION_KEY_FILE"
+secret_fields=(UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID XHTTP_PRIVATE_KEY
+    MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD)
+
+# Realistic lengths: everything from 32 bytes up used to wrap onto a second line.
+DEC=mlkem768x25519plus.native.600s.mMhB2sQo8nWcYFJc0lDq1mUuJ7yrZ1Zz3Cq1kq0aS3E.Zs7f1cQ0b9WmV3xT5nK8pL2rD4gH6jA1sU0yE9iO7wR3tY5uI8oP2aS4dF6gH1jK3lZ5xC7vB9nM0qW2eR4tY6uI8oP0aS
+write_node full both \
+    "EXTRA_SHORT_IDS=aa11:bb22" "XHTTP_UUID=22222222-2222-4222-8222-222222222222" \
+    "XHTTP_PUBLIC_KEY=Zk1uT0pRc2xWb3hZd2FCZERmR2hJakxtTm9QcVJzVHU" \
+    "XHTTP_PRIVATE_KEY=cFhZd2FCZERmR2hJakxtTm9QcVJzVHVWd1h5WmFiY2Q" "XHTTP_SHORT_ID=fedcba9876543210" \
+    "MLDSA65_SEED=TWxEc2FTZWVkMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY" "MLDSA65_VERIFY=Verify_1" \
+    "VLESS_DECRYPTION=$DEC" "VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1" \
+    "HY2_OBFS_PASSWORD=0123456789abcdef0123456789abcdef" "HY2_HOP_PORTS=30000-30100" \
+    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com"
+sed -i 's/^ANYTLS_PADDING_B64=$/ANYTLS_PADDING_B64=c3RvcD04/' "$NODES_DIR/full.env"
+sort "$NODES_DIR/full.env" >/srv/before.env
+CURRENT_NODE_NAME=full
+load_node_for_edit || fail_case "loading the plaintext node failed"
+declare -A expected=()
+for field in "${secret_fields[@]}"; do
+    [[ -n "${!field}" ]] || fail_case "the fixture leaves $field empty"
+    expected[$field]="${!field}"
+done
+
+# Encrypt on save.  Each secret is stored as exactly one ciphertext line.
+ENABLE_CONFIG_ENCRYPTION=true
+is_encryption_enabled || fail_case "encryption was not enabled"
+save_env
+node_lines=$(wc -l <"$NODES_DIR/full.env")
+assert_eq "$(wc -l </srv/before.env)" "$node_lines" "an encrypted node file must keep one line per field"
+assert_eq "$node_lines" "$(grep -c '^[A-Z0-9_]*=' "$NODES_DIR/full.env")" \
+    "every line of an encrypted node file must be KEY=VALUE"
+for field in "${secret_fields[@]}"; do
+    stored=$(safe_read_config_value "$NODES_DIR/full.env" "$field")
+    [[ "$stored" == U2FsdGVk* ]] || fail_case "$field was not stored encrypted: $stored"
+    assert_not_contains "$(cat "$NODES_DIR/full.env")" "=${expected[$field]}" "$field leaked in plaintext"
+done
+
+# Read back, twice: the second save re-encrypts values that came from ciphertext.
+for pass in first second; do
+    reset_node_state
+    load_node_for_edit || fail_case "loading the encrypted node failed ($pass pass)"
+    for field in "${secret_fields[@]}"; do
+        assert_eq "${expected[$field]}" "${!field}" "$field after the $pass encrypted round trip"
+    done
+    save_env
+done
+
+# The renderers and the share links see plaintext, never ciphertext.
+make_fake_xray /srv/bin/xray-new mldsa65 mlkem768 vlessenc
+XRAY_BIN=/srv/bin/xray-new
+XRAY_CAPS=""
+write_config || fail_case "rendering an encrypted node failed"
+assert_not_contains "$(cat "$XRAY_CONF")" "U2FsdGVk" "ciphertext reached the Xray config"
+vision=$(jq -c '.inbounds[] | select(.tag == "full_vision")' "$XRAY_CONF")
+xhttp=$(jq -c '.inbounds[] | select(.tag == "full_xhttp")' "$XRAY_CONF")
+assert_eq "${expected[UUID]}" "$(jq -r '.settings.clients[0].id' <<<"$vision")" "rendered Vision UUID"
+assert_eq "${expected[PRIVATE_KEY]}" "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$vision")" \
+    "rendered Vision private key"
+assert_eq "${expected[MLDSA65_SEED]}" "$(jq -r '.streamSettings.realitySettings.mldsa65Seed' <<<"$vision")" \
+    "rendered ML-DSA-65 seed"
+assert_eq "${expected[VLESS_DECRYPTION]}" "$(jq -r '.settings.decryption' <<<"$vision")" "rendered VLESS decryption"
+assert_eq "${expected[XHTTP_UUID]}" "$(jq -r '.settings.clients[0].id' <<<"$xhttp")" "rendered XHTTP UUID"
+assert_eq "${expected[XHTTP_PRIVATE_KEY]}" "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$xhttp")" \
+    "rendered XHTTP private key"
+link=$(get_share_link)
+assert_contains "$link" "vless://${expected[UUID]}@" "the share link must carry the plaintext UUID"
+info=$(show_info)
+assert_contains "$info" "vless://${expected[XHTTP_UUID]}@" "show_info must print the plaintext XHTTP UUID"
+assert_not_contains "$link$info" "U2FsdGVk" "ciphertext reached a share link"
+
+for protocol in shadowsocks hysteria2 anytls; do
+    sed -i "s/^PROTOCOL_TYPE=.*/PROTOCOL_TYPE=$protocol/" "$NODES_DIR/full.env"
+    link=$(get_share_link)
+    assert_not_contains "$link$(show_info)" "U2FsdGVk" "ciphertext reached the $protocol output"
+    case "$protocol" in
+        shadowsocks)
+            write_config || fail_case "rendering the encrypted Shadowsocks node failed"
+            assert_eq "${expected[SS_PASSWORD]}" "$(jq -r '.inbounds[0].settings.password' "$XRAY_CONF")" \
+                "rendered Shadowsocks password"
+            ;;
+        hysteria2)
+            assert_contains "$link" "hysteria2://${expected[HY2_PASSWORD]}@" "Hysteria2 link password"
+            assert_contains "$link" "obfs-password=${expected[HY2_OBFS_PASSWORD]}" "Hysteria2 link obfs password"
+            sed -i 's/^HY2_DOMAIN=.*/HY2_DOMAIN=/' "$NODES_DIR/full.env"
+            write_singbox_config || fail_case "rendering the encrypted Hysteria2 node failed"
+            assert_eq "${expected[HY2_PASSWORD]}/${expected[HY2_OBFS_PASSWORD]}" \
+                "$(jq -r '.inbounds[0] | "\(.users[0].password)/\(.obfs.password)"' "$SINGBOX_CONF")" \
+                "rendered Hysteria2 passwords"
+            sed -i 's/^HY2_DOMAIN=.*/HY2_DOMAIN=hy.example.com/' "$NODES_DIR/full.env"
+            ;;
+        anytls)
+            assert_contains "$link" "anytls://${expected[ANYTLS_PASSWORD]}@" "AnyTLS link password"
+            write_singbox_config || fail_case "rendering the encrypted AnyTLS node failed"
+            assert_eq "${expected[ANYTLS_PASSWORD]}" "$(jq -r '.inbounds[0].users[0].password' "$SINGBOX_CONF")" \
+                "rendered AnyTLS password"
+            ;;
+    esac
+done
+sed -i 's/^PROTOCOL_TYPE=.*/PROTOCOL_TYPE=both/' "$NODES_DIR/full.env"
+
+# Turning encryption off and saving once more restores the original file exactly,
+# which also covers every field that is never encrypted.
+load_node_for_edit || fail_case "reloading the encrypted node failed"
+ENABLE_CONFIG_ENCRYPTION=false
+save_env
+sort "$NODES_DIR/full.env" >/srv/after.env
+diff -u /srv/before.env /srv/after.env >&2 || fail_case "the encrypted round trip changed the node file"
+assert_eq "600" "$(stat -c '%a' "$NODES_DIR/full.env")" "the node file stays private"
+
+# The primitive itself: single line at any length, including past the size where
+# OpenSSL refuses single-line base64 unless -A is given on decryption as well.
+long_value=$(head -c 1500 /dev/zero | tr '\0' 'k')
+for value in "a" "0123456789abcdef0123456789abcde" "0123456789abcdef0123456789abcdef" "$long_value"; do
+    cipher=$(encrypt_value "$value")
+    assert_eq "1" "$(printf '%s\n' "$cipher" | wc -l)" "ciphertext of a ${#value}-byte value must be one line"
+    assert_eq "$value" "$(decrypt_value "$cipher")" "primitive round trip of a ${#value}-byte value"
+done
+assert_eq "" "$(encrypt_value "")" "an empty value stays empty"
+assert_eq "plain-value" "$(decrypt_value "plain-value")" "plaintext passes through decrypt_value"
+
+# Ciphertext written by the old implementation (`openssl enc -a`, wrapped at 64
+# characters).  Short values fitted on one line and must keep decrypting.
+legacy_encrypt() {
+    printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$(cat "$ENCRYPTION_KEY_FILE")"
+}
+legacy_short=$(legacy_encrypt "SafeAnyTlsPassword")
+assert_eq "1" "$(printf '%s\n' "$legacy_short" | wc -l)" "a short legacy ciphertext is a single line"
+assert_eq "SafeAnyTlsPassword" "$(decrypt_value "$legacy_short")" "short legacy ciphertext must still decrypt"
+
+# Longer values lost their second line on read.  That is unrecoverable, so reading
+# the node must fail without output rather than return a partial or raw value.
+legacy_uuid=$(legacy_encrypt "11111111-1111-4111-8111-111111111111")
+assert_eq "2" "$(printf '%s\n' "$legacy_uuid" | wc -l)" "a legacy UUID ciphertext spans two lines"
+write_node legacy vision
+{
+    grep -v '^UUID=' "$NODES_DIR/legacy.env"
+    printf 'UUID=%s\n' "$legacy_uuid"
+} >/srv/legacy.env
+cp -- /srv/legacy.env "$NODES_DIR/legacy.env"
+truncated=$(safe_read_config_value "$NODES_DIR/legacy.env" UUID)
+assert_eq "${legacy_uuid%%$'\n'*}" "$truncated" "the reader returns only the first ciphertext line"
+rc=0
+out=$(decrypt_value "$truncated" 2>/srv/decrypt.err) || rc=$?
+assert_eq "1/" "$rc/$out" "a truncated ciphertext must fail without output"
+assert_contains "$(cat /srv/decrypt.err)" "Cannot decrypt" "the failure must be reported"
+
+CURRENT_NODE_NAME=legacy
+rc=0
+load_node_for_edit 2>/srv/load.err || rc=$?
+assert_eq "1" "$rc" "a node with a truncated secret must fail to load for editing"
+assert_contains "$(cat /srv/load.err)" "UUID of node 'legacy'" "the error must name the field and the node"
+cmp -s /srv/legacy.env "$NODES_DIR/legacy.env" || fail_case "a failed load must not rewrite the node file"
+rc=0
+link=$(get_share_link 2>/dev/null) || rc=$?
+assert_eq "1/" "$rc/$link" "a share link must not be built from an undecryptable node"
+assert_fails "show_info must fail for an undecryptable node" show_info >/dev/null 2>&1
+cp -- "$XRAY_CONF" /srv/xray.before.json
+rc=0
+write_config 2>/srv/render.err || rc=$?
+assert_eq "1" "$rc" "rendering must fail while a node cannot be decrypted"
+assert_contains "$(cat /srv/render.err)" "UUID of node 'legacy'" "the render error must name the field and the node"
+cmp -s /srv/xray.before.json "$XRAY_CONF" || fail_case "a failed render must leave the existing config untouched"
+rm -f -- "$NODES_DIR/legacy.env"
+write_config || fail_case "removing the undecryptable node must unblock rendering"
+
+# A missing key file is a failure too, not a reason to hand back the ciphertext.
+cipher=$(encrypt_value "SafeHy2Password")
+mv -- "$ENCRYPTION_KEY_FILE" /srv/state/config.key.away
+rc=0
+out=$(decrypt_value "$cipher" 2>/dev/null) || rc=$?
+assert_eq "1/" "$rc/$out" "decryption without the key file must fail without output"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
