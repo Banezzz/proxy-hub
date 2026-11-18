@@ -1301,4 +1301,205 @@ install_flow=$(declare -f cmd_install)
 assert_contains "$install_flow" "Shadowsocks has no traffic disguise" "installing Shadowsocks must warn about its positioning"
 SCENARIO
 
+# sing-box releases: nothing unverified is executed, and a failed replacement
+# leaves the previous binary and service state in place.
+run_scenario singbox-verified-release <<'SCENARIO'
+load_modules
+SINGBOX_DIR=/srv/sb
+SINGBOX_BIN=/srv/sb/bin/sing-box
+SINGBOX_CONF=/srv/sb/config.json
+mkdir -p /srv/sb/bin /srv/pkg
+log_info() { printf 'info: %s\n' "$*" >>/srv/sb.log; }
+log_warn() { printf 'warn: %s\n' "$*" >>/srv/sb.log; }
+log_error() { printf 'error: %s\n' "$*" >>/srv/sb.log; }
+uname() { printf 'x86_64\n'; }
+system_is_musl() { return 1; }
+sleep() { :; }
+
+# A fake core: reports its version, and `check` obeys CHECK_RC baked in at build.
+build_release() {
+    local version="$1" check_rc="${2:-0}" dir="sing-box-$1-linux-amd64"
+    rm -rf -- "/srv/pkg/$dir"
+    mkdir -p -- "/srv/pkg/$dir"
+    cat >"/srv/pkg/$dir/sing-box" <<CORE
+#!/bin/sh
+case "\$1" in
+  version) echo "sing-box version $version" ;;
+  check) exit $check_rc ;;
+esac
+CORE
+    chmod 755 "/srv/pkg/$dir/sing-box"
+    tar -czf "/srv/pkg/$version.tar.gz" -C /srv/pkg "$dir"
+}
+LATEST=1.14.4
+DIGEST_MODE=real
+ASSET_HOST=https://github.com
+release_json() {
+    local version="$1" name digest
+    name="sing-box-${version}-linux-amd64.tar.gz"
+    case "$DIGEST_MODE" in
+        real) digest="\"sha256:$(sha256sum "/srv/pkg/$version.tar.gz" | awk '{print $1}')\"" ;;
+        wrong) digest="\"sha256:$(printf 'x' | sha256sum | awk '{print $1}')\"" ;;
+        malformed) digest='"md5:abc"' ;;
+        absent) digest=null ;;
+    esac
+    printf '{"tag_name":"v%s","assets":[{"name":"%s","browser_download_url":"%s/SagerNet/sing-box/releases/download/v%s/%s","digest":%s}]}\n' \
+        "$version" "$name" "$ASSET_HOST" "$version" "$name" "$digest"
+}
+secure_curl() {
+    local arg url="" dest="" want_dest=0 version
+    for arg in "$@"; do
+        if ((want_dest)); then dest="$arg"; want_dest=0; continue; fi
+        case "$arg" in -o) want_dest=1 ;; https://*) url="$arg" ;; esac
+    done
+    printf '%s\n' "$url" >>/srv/sb.urls
+    case "$url" in
+        */releases/latest) release_json "$LATEST" ;;
+        */releases/tags/v*) release_json "${url##*/v}" ;;
+        *) version="${url##*/sing-box-}"; version="${version%-linux-amd64.tar.gz}"
+           cp -- "/srv/pkg/$version.tar.gz" "$dest" ;;
+    esac
+}
+ACTIVE=yes
+START_OK=yes
+service_is_active() { [[ "$ACTIVE" == yes ]]; }
+service_restart() {
+    printf 'restart %s\n' "$("$SINGBOX_BIN" version)" >>/srv/sb.service
+    if [[ "$START_OK" == yes || "$("$SINGBOX_BIN" version)" != *"$LATEST"* ]]; then ACTIVE=yes; else ACTIVE=no; return 1; fi
+}
+reset_case() { rm -f -- /srv/sb.log /srv/sb.urls /srv/sb.service; : >/srv/sb.urls; : >/srv/sb.log; : >/srv/sb.service; }
+build_release 1.13.15
+build_release 1.14.4
+install_old() { tar -xzf /srv/pkg/1.13.15.tar.gz -C /srv/pkg; cp /srv/pkg/sing-box-1.13.15-linux-amd64/sing-box "$SINGBOX_BIN"; rm -f "$SINGBOX_BIN".bak-*; }
+
+# Fresh install of the latest stable release.
+reset_case
+singbox_install_release fresh || { cat /srv/sb.log >&2; fail_case "fresh install failed"; }
+assert_eq "sing-box version 1.14.4" "$("$SINGBOX_BIN" version)" "the verified release is installed"
+assert_eq "" "$(cat /srv/sb.service)" "a fresh install does not touch the service"
+
+# Digest problems: nothing is installed and the cause is named.
+for mode in wrong malformed absent; do
+    reset_case
+    rm -f -- "$SINGBOX_BIN"
+    DIGEST_MODE="$mode"
+    rc=0
+    singbox_install_release fresh || rc=$?
+    assert_eq "1" "$rc" "digest mode '$mode' must fail the install"
+    [[ ! -e "$SINGBOX_BIN" ]] || fail_case "digest mode '$mode' left a binary installed"
+    assert_contains "$(cat /srv/sb.log)" "SHA-256" "digest mode '$mode' must name the cause"
+done
+[[ -z "$(find /srv/sb/bin -name '.sing-box.new.*')" ]] || fail_case "a failed install leaked a staged binary"
+
+# An operator-supplied digest is still enforced.
+reset_case
+DIGEST_MODE=absent
+SINGBOX_SHA256=$(sha256sum /srv/pkg/1.14.4.tar.gz | awk '{print $1}') singbox_install_release fresh || \
+    fail_case "a correct SINGBOX_SHA256 must allow the install"
+rm -f -- "$SINGBOX_BIN"
+rc=0
+SINGBOX_SHA256=$(printf y | sha256sum | awk '{print $1}') singbox_install_release fresh || rc=$?
+assert_eq "1" "$rc" "a wrong SINGBOX_SHA256 must still fail"
+DIGEST_MODE=real
+
+# Download URLs outside the official release path are refused.
+reset_case
+ASSET_HOST=https://evil.example
+rc=0
+singbox_install_release fresh || rc=$?
+assert_eq "1" "$rc" "an asset hosted elsewhere must be refused"
+assert_not_contains "$(cat /srv/sb.urls)" "evil.example" "the foreign URL must never be fetched"
+ASSET_HOST=https://github.com
+
+# Update of a running service.
+install_old
+printf '{}\n' >"$SINGBOX_CONF"
+reset_case
+ACTIVE=yes
+singbox_install_release update || { cat /srv/sb.log >&2; fail_case "update failed"; }
+assert_eq "sing-box version 1.14.4" "$("$SINGBOX_BIN" version)" "the update replaces the binary"
+assert_eq "restart sing-box version 1.14.4" "$(cat /srv/sb.service)" "a running service is restarted on the new binary"
+backup=$(ls "$SINGBOX_BIN".bak-v1.13.15-* 2>/dev/null | head -n 1)
+[[ -n "$backup" ]] || fail_case "the previous binary was not backed up with its version"
+assert_eq "sing-box version 1.13.15" "$("$backup" version)" "the backup holds the previous binary"
+
+# Already current: no download, no restart.
+reset_case
+singbox_install_release update
+assert_not_contains "$(cat /srv/sb.urls)" "/download/" "an up-to-date core must not be downloaded again"
+assert_eq "" "$(cat /srv/sb.service)" "an up-to-date core must not be restarted"
+
+# A stopped service stays stopped.
+install_old
+reset_case
+ACTIVE=no
+singbox_install_release update || fail_case "update of a stopped service failed"
+assert_eq "" "$(cat /srv/sb.service)" "a stopped service must not be started by an update"
+assert_eq "sing-box version 1.14.4" "$("$SINGBOX_BIN" version)" "the stopped service still gets the new binary"
+
+# The new core rejects the current config: the old binary is untouched.
+install_old
+build_release 1.14.4 1
+reset_case
+ACTIVE=yes
+rc=0
+singbox_install_release update || rc=$?
+assert_eq "1" "$rc" "a config the new core rejects must cancel the update"
+assert_eq "sing-box version 1.13.15" "$("$SINGBOX_BIN" version)" "the old binary must stay in place"
+assert_eq "" "$(cat /srv/sb.service)" "a cancelled update must not restart the service"
+build_release 1.14.4
+
+# The new core fails to start: the old binary and the running state are restored.
+install_old
+reset_case
+ACTIVE=yes
+START_OK=no
+rc=0
+singbox_install_release update || rc=$?
+assert_eq "1" "$rc" "a failed start must fail the update"
+assert_eq "sing-box version 1.13.15" "$("$SINGBOX_BIN" version)" "the old binary must be restored"
+assert_eq "yes" "$ACTIVE" "the service must be running again on the old binary"
+assert_contains "$(cat /srv/sb.log)" "restoring the previous version" "the rollback must be reported"
+START_OK=yes
+
+# Stable older than the installed core: no automatic downgrade.
+reset_case
+LATEST=1.13.15
+cp /srv/pkg/sing-box-1.14.4-linux-amd64/sing-box "$SINGBOX_BIN" 2>/dev/null || {
+    tar -xzf /srv/pkg/1.14.4.tar.gz -C /srv/pkg; cp /srv/pkg/sing-box-1.14.4-linux-amd64/sing-box "$SINGBOX_BIN"; }
+singbox_install_release update
+assert_eq "sing-box version 1.14.4" "$("$SINGBOX_BIN" version)" "a newer installed core must not be downgraded"
+assert_contains "$(cat /srv/sb.log)" "refusing an automatic downgrade" "the refusal must be explained"
+
+# An explicit version is honoured, including a downgrade, and is validated.
+SINGBOX_VERSION=v1.13.15 singbox_install_release update || fail_case "an explicit version must install"
+assert_eq "sing-box version 1.13.15" "$("$SINGBOX_BIN" version)" "an explicit version allows a downgrade"
+assert_contains "$(cat /srv/sb.urls)" "/releases/tags/v1.13.15" "an explicit version queries its own release"
+rc=0
+SINGBOX_VERSION='1.14;rm' singbox_install_release update || rc=$?
+assert_eq "1" "$rc" "an unsafe version string must be rejected"
+LATEST=1.14.4
+
+# A release that reports another version than its tag is refused.
+build_release 9.9.9
+cp /srv/pkg/9.9.9.tar.gz /srv/pkg/1.14.4.tar.gz
+install_old
+reset_case
+rc=0
+singbox_install_release update || rc=$?
+assert_eq "1" "$rc" "an archive reporting a different version must be refused"
+assert_eq "sing-box version 1.13.15" "$("$SINGBOX_BIN" version)" "a refused archive must not replace the binary"
+build_release 1.14.4
+
+# Backups are pruned to the configured count.
+for stamp in 20260101-000001 20260101-000002 20260101-000003 20260101-000004 20260101-000005; do
+    : >"$SINGBOX_BIN.bak-v1.0.0-$stamp"
+    touch -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} 00:00:0${stamp: -1}" "$SINGBOX_BIN.bak-v1.0.0-$stamp"
+done
+: >"$SINGBOX_BIN.bak-manual"
+SINGBOX_BACKUP_KEEP=2 singbox_prune_backups
+assert_eq "2" "$(ls "$SINGBOX_BIN".bak-v* | wc -l | tr -d ' ')" "only the newest backups are kept"
+[[ -e "$SINGBOX_BIN.bak-manual" ]] || fail_case "a backup the script did not create must not be pruned"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

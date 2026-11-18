@@ -468,14 +468,106 @@
 +    fi
 +}
 +
-@@ -5283 +5631,2 @@
+@@ -4688,0 +5037,4 @@
++#
++# 已有可运行的 binary 时只报告、不改动，与 Xray 的普通安装语义一致：创建节点不应
++# 悄悄升级内核。下载、SHA-256 校验、候选 binary 验证与原子替换都在
++# singbox_install_release 里，全新安装与显式的 singbox-update 走同一条路径。
+@@ -4696,82 +5048 @@
+-
+-    local arch sb_arch
+-    arch=$(uname -m)
+-    case "$arch" in
+-        x86_64|amd64)   sb_arch="amd64" ;;
+-        aarch64|arm64)  sb_arch="arm64" ;;
+-        armv7l|armv7)   sb_arch="armv7" ;;
+-        i686|i386)      sb_arch="386" ;;
+-        *)
+-            log_error "Unsupported architecture for sing-box: $arch"
+-            return 1
+-            ;;
+-    esac
+-
+-    # 获取最新版本号（安全的 API 解析）
+-    local tag version
+-    tag=$(fetch_github_release_tag "SagerNet/sing-box")
+-    if [[ -z "$tag" ]]; then
+-        log_error "Failed to get sing-box latest version"
+-        return 1
+-    fi
+-    version="${tag#v}"
+-
+-    # 归档选择按 libc 而不是按发行版：sing-box >= 1.13.0 的默认 linux 归档动态
+-    # 链接 glibc，在 Alpine 上会以 "cannot execute: required file not found"
+-    # 失败；静态链接的 "-musl" 归档只从 1.13.0 起提供，更早的版本只有一个已经
+-    # 是静态链接的默认归档，所以旧版本仍回落到默认名。
+-    local -a archive_names=()
+-    if system_is_musl; then
+-        log_info "musl libc detected, using the statically linked sing-box build"
+-        archive_names+=("sing-box-${version}-linux-${sb_arch}-musl.tar.gz")
+-    fi
+-    archive_names+=("sing-box-${version}-linux-${sb_arch}.tar.gz")
+-
+-    log_info "Installing sing-box ${tag} (${sb_arch})..."
+-
+-    local tmp_dir
+-    tmp_dir=$(mktemp -d)
+-
+-    local archive_name download_url downloaded=0
+-    for archive_name in "${archive_names[@]}"; do
+-        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${archive_name}"
+-        if secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
+-            downloaded=1
+-            break
+-        fi
+-        log_warn "sing-box archive not available: $archive_name"
+-    done
+-    if ((downloaded == 0)); then
+-        log_error "Failed to download sing-box ${tag} for ${sb_arch}"
+-        rm -rf "$tmp_dir"
+-        return 1
+-    fi
+-
+-    if ! tar -xzf "${tmp_dir}/sing-box.tar.gz" -C "$tmp_dir" 2>/dev/null; then
+-        log_error "Failed to extract sing-box archive"
+-        rm -rf "$tmp_dir"
+-        return 1
+-    fi
+-
+-    local extracted_bin
+-    extracted_bin=$(find "$tmp_dir" -type f -name sing-box 2>/dev/null | head -1)
+-    if [[ -z "$extracted_bin" ]]; then
+-        log_error "sing-box binary not found in archive"
+-        rm -rf "$tmp_dir"
+-        return 1
+-    fi
+-
+-    mkdir -p "$SINGBOX_DIR" /usr/local/bin
+-    install -m 755 "$extracted_bin" "$SINGBOX_BIN"
+-    rm -rf "$tmp_dir"
+-
+-    # 安装后立刻验证可执行性：否则不兼容的二进制要到后面 config check 才暴露，
+-    # 并被报成 "Generated sing-box config is invalid"，掩盖真正的原因。
+-    if ! "$SINGBOX_BIN" version &>/dev/null; then
+-        log_error "Installed sing-box binary cannot be executed on this system"
+-        if system_is_musl; then
+-            log_error "This system uses musl libc; no compatible sing-box build was found for ${tag}"
+-        fi
+-        rm -f "$SINGBOX_BIN"
+-        return 1
+-    fi
++    singbox_install_release fresh || return 1
+@@ -4785,2 +5055,0 @@
+-
+-    log_info "sing-box ${tag} installed successfully"
+@@ -5283 +5552,2 @@
 -# 选择协议类型
 +# 选择协议类型。每个选项下面用一两行说明它适合谁、需要什么，让不熟悉协议的用户
 +# 也能直接选；回车采用推荐项。
-@@ -5288 +5637 @@
+@@ -5288 +5558 @@
 -    echo -e "${GREEN}                     选择节点协议类型${NC}"
 +    echo -e "${GREEN}        $(t2 "选择节点协议类型（回车采用推荐）" "Choose a protocol (Enter for the recommended one)")${NC}"
-@@ -5291,7 +5640,21 @@
+@@ -5291,7 +5561,21 @@
 -    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
 -    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
 -    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
@@ -504,16 +596,16 @@
 +    echo -e "  ${GREEN}7.${NC} Hysteria2"
 +    menu_note "$(t2 "基于 UDP/QUIC，丢包或高延迟线路上明显更快；需放行 UDP，部分网络会限速 UDP。" \
 +        "UDP/QUIC based, clearly faster on lossy or high-latency links; needs UDP allowed, and some networks throttle UDP.")"
-@@ -5299 +5662 @@
+@@ -5299 +5583 @@
 -    echo -n "  请选择 [1-7] (默认 1): "
 +    echo -n "  $(t2 "请选择" "Select") [1-7] ($(t2 "默认" "default") 1): "
-@@ -5411,0 +5775,5 @@
+@@ -5411,0 +5696,5 @@
 +# ============== Hysteria2 加固选项 ==============
 +#
 +# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
 +# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
 +
-@@ -5429,0 +5798,37 @@
+@@ -5429,0 +5719,37 @@
 +# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
 +# 已经分配给别的节点的端口再发一次。
 +# Usage: node_tcp_port_claimed PORT
@@ -551,25 +643,25 @@
 +    gen_random_free_port "$exclude_port"
 +}
 +
-@@ -5522 +5927,5 @@
+@@ -5522 +5848,5 @@
 -            default_at_port=$(gen_random_free_port)
 +            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 +                default_at_port=$(default_reality_port)
 +            else
 +                default_at_port=$(gen_random_free_port)
 +            fi
-@@ -5559 +5968 @@
+@@ -5559 +5889 @@
 -            default_vision_port=$(gen_random_free_port)
 +            default_vision_port=$(default_reality_port)
-@@ -5575 +5984 @@
+@@ -5575 +5905 @@
 -            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
 +            default_xhttp_port=$(default_reality_port "${PORT:-0}")
-@@ -5634 +6043,3 @@
+@@ -5634 +5964,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +6063,16 @@
+@@ -5651,0 +5984,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -586,11 +678,11 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +6137,3 @@
+@@ -5709,0 +6058,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -5951,0 +6382,104 @@
+@@ -5951,0 +6303,104 @@
 +# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
 +# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
 +# 预热一次，后台子 shell 直接继承。
@@ -695,21 +787,21 @@
 +    done
 +}
 +
-@@ -5959 +6493 @@
+@@ -5959 +6414 @@
 -    local t1 t2 family_flag
 +    local t1 t2 family_flag tls13_flag
-@@ -5962,0 +6497,3 @@
+@@ -5962,0 +6418,3 @@
 +    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
 +    tls13_flag=$(sni_tls13_flag)
 +    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
-@@ -5987,0 +6525 @@
+@@ -5987,0 +6446 @@
 +    sni_tls13_flag >/dev/null
-@@ -6082,0 +6621 @@
+@@ -6082,0 +6542 @@
 +    sni_tls13_flag >/dev/null
-@@ -6201 +6740 @@
+@@ -6201 +6661 @@
 -    # 获取排序后的 Top 5 域名
 +    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
-@@ -6204,6 +6743 @@
+@@ -6204,6 +6664 @@
 -    while IFS=' ' read -r lat dom; do
 -        top_domains+=("$dom")
 -        top_latencies+=("$lat")
@@ -717,13 +809,13 @@
 -        echo "${latency_map[$domain]} $domain"
 -    done | sort -n | head -5)
 +    rank_sni_candidates latency_map top_domains top_latencies
-@@ -6303 +6837,4 @@
+@@ -6303 +6758,4 @@
 -                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
 +                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
 +                printf "\n"
-@@ -6377,0 +6915,9 @@
+@@ -6377,0 +6836,9 @@
 +# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
 +# 自己的理由（例如目标与服务器同 ASN）。
 +# Usage: warn_discouraged_reality_target DOMAIN
@@ -733,21 +825,21 @@
 +        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
 +}
 +
-@@ -6398,0 +6945 @@
+@@ -6398,0 +6866 @@
 +            warn_discouraged_reality_target "$SNI"
-@@ -6478,0 +7026,4 @@
+@@ -6478,0 +6947,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +7035 @@
+@@ -6484 +6956 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +7047,3 @@
+@@ -6495,0 +6968,3 @@
 +        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
 +        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
 +        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
-@@ -6501,0 +7056,14 @@
+@@ -6501,0 +6977,14 @@
 +        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
 +        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
 +        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
@@ -762,7 +854,7 @@
 +            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
 +        fi
 +
-@@ -6517,0 +7086,17 @@
+@@ -6517,0 +7007,17 @@
 +        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
 +        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
 +        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
@@ -780,20 +872,20 @@
 +            return 1
 +        fi
 +
-@@ -6563 +7148 @@
+@@ -6563 +7069 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
-@@ -6591 +7176 @@
+@@ -6591 +7097 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
 +            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
-@@ -6695 +7280 @@
+@@ -6695 +7201 @@
 -    local inbounds_json="[]"
 +    local inbounds_json="[]" providers_json="[]"
-@@ -6709 +7294,2 @@
+@@ -6709 +7215,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6734 +7320,20 @@
+@@ -6734 +7241,20 @@
 -            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
 +            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
 +            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
@@ -815,37 +907,37 @@
 +                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
 +                n_sni="$n_domain"
 +            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-@@ -6738 +7343 @@
+@@ -6738 +7264 @@
 -                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
 +                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
-@@ -6781,0 +7387 @@
+@@ -6781,0 +7308 @@
 +        --argjson providers "$providers_json" \
-@@ -6787 +7393 @@
+@@ -6787 +7314 @@
 -        }' 2>&1); then
 +        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
-@@ -6815,0 +7422 @@
+@@ -6815,0 +7343 @@
 +        hy2_hop_sync
-@@ -6830,0 +7438,5 @@
+@@ -6830,0 +7359,5 @@
 +    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
 +    if ! hy2_hop_sync; then
 +        return 1
 +    fi
 +
-@@ -6870,0 +7483,5 @@
+@@ -6870,0 +7404,5 @@
 +    local save_xhttp_uuid="${XHTTP_UUID:-}"
 +    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
 +    local save_mldsa65_seed="${MLDSA65_SEED:-}"
 +    local save_vless_decryption="${VLESS_DECRYPTION:-}"
 +    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
-@@ -6872,0 +7490,5 @@
+@@ -6872,0 +7411,5 @@
 +        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
 +        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
 +        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
 +        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
 +        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
-@@ -6891,0 +7514 @@
+@@ -6891,0 +7435 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6894,0 +7518,8 @@
+@@ -6894,0 +7439,8 @@
 +XHTTP_UUID=$save_xhttp_uuid
 +XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
 +XHTTP_PRIVATE_KEY=$save_xhttp_private_key
@@ -854,12 +946,12 @@
 +MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
 +VLESS_DECRYPTION=$save_vless_decryption
 +VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
-@@ -6899,0 +7531,4 @@
+@@ -6899,0 +7452,4 @@
 +HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 +HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 +HY2_DOMAIN=${HY2_DOMAIN:-}
 +HY2_EMAIL=${HY2_EMAIL:-}
-@@ -6927 +7562,8 @@
+@@ -6927 +7483,8 @@
 -    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
 +    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
 +}
@@ -869,12 +961,12 @@
 +vless_link_pq_params() {
 +    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
 +    return 0
-@@ -6941 +7583,3 @@
+@@ -6941 +7504,3 @@
 -    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
 +    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
 +    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
 +    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
-@@ -6944 +7588,28 @@
+@@ -6944 +7509,28 @@
 -    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
 +    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
 +    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
@@ -904,7 +996,7 @@
 +    PRIVATE_KEY="$keep_private"
 +    SHORT_ID="$keep_sid"
 +    return "$rc"
-@@ -6989,0 +7661,31 @@
+@@ -6989,0 +7582,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -936,15 +1028,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7693,5 @@
+@@ -6990,0 +7614,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7702 @@
+@@ -6994,0 +7623 @@
 +    local pin="" query
-@@ -7000 +7708,26 @@
+@@ -7000 +7629,26 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
@@ -972,9 +1064,9 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7016,0 +7750 @@
+@@ -7016,0 +7671 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7082 +7816,7 @@
+@@ -7082 +7737,7 @@
 -    qrencode -t ANSIUTF8 "$link"
 +    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
 +    if (( ${#link} > 1200 )); then
@@ -983,23 +1075,23 @@
 +    else
 +        qrencode -t ANSIUTF8 "$link"
 +    fi
-@@ -7092,0 +7833,6 @@
+@@ -7092,0 +7754,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7174,0 +7921 @@
+@@ -7174,0 +7842 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7176,0 +7924,6 @@
+@@ -7176,0 +7845,6 @@
 +        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
 +        fi
 +        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
 +            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
 +        fi
-@@ -7178,2 +7931,8 @@
+@@ -7178,2 +7852,8 @@
 -        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
 -        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +        if [[ -n "${HY2_DOMAIN:-}" ]]; then
@@ -1010,11 +1102,11 @@
 +            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +            show_selfsigned_cert_pins
 +        fi
-@@ -7207,0 +7967 @@
+@@ -7207,0 +7888 @@
 +            show_extra_short_ids
-@@ -7212,0 +7973 @@
+@@ -7212,0 +7894 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +8023,12 @@
+@@ -7261,0 +7944,12 @@
 +        show_extra_short_ids
 +        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
 +            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
@@ -1027,7 +1119,7 @@
 +            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
 +            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
 +        fi
-@@ -7378,0 +8152,9 @@
+@@ -7378,0 +8073,9 @@
 +            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
 +            if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +                local acme_port
@@ -1037,55 +1129,55 @@
 +                        log_warn "Could not automatically open TCP port $acme_port for ACME"
 +                done
 +            fi
-@@ -7497,0 +8280,4 @@
+@@ -7497,0 +8201,4 @@
 +        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
 +        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
 +        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
 +            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
-@@ -7534,0 +8321,3 @@
+@@ -7534,0 +8242,3 @@
 +        configure_hy2_options || return 1
 +        # ACME 节点的 TLS SNI 就是证书域名。
 +        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
-@@ -7552,0 +8342 @@
+@@ -7552,0 +8263 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7572,0 +8363 @@
+@@ -7572,0 +8284 @@
 +            apply_extra_short_ids || return 1
-@@ -7588,0 +8380 @@
+@@ -7588,0 +8301 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7595,0 +8388,6 @@
+@@ -7595,0 +8309,6 @@
 +        apply_extra_short_ids || return 1
 +        # both 节点的两个 inbound 各用一套凭据，互不牵连。
 +        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
 +            gen_xhttp_credentials || return 1
 +        fi
 +        configure_pq_options || return 1
-@@ -7607,2 +8405,2 @@
+@@ -7607,2 +8326,2 @@
 -        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
 -        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
 +        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
 +        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
-@@ -7921,0 +8720,5 @@
+@@ -7921,0 +8641,5 @@
 +    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
 +    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 +    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
 +    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 +    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
-@@ -7970,0 +8774,2 @@
+@@ -7970,0 +8695,2 @@
 +                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
 +                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
-@@ -8018,0 +8824,2 @@
+@@ -8018,0 +8745,2 @@
 +                    # ACME 节点的 SNI 即证书域名，两者一起改。
 +                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
-@@ -8028,0 +8836,2 @@
+@@ -8028,0 +8757,2 @@
 +                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
 +                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
-@@ -8033,0 +8843,5 @@
+@@ -8033,0 +8764,5 @@
 +                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
 +                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
 +                        local keep_xhttp_uuid="$XHTTP_UUID"
 +                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
 +                    fi
-@@ -8062,0 +8877,22 @@
+@@ -8062,0 +8798,22 @@
 +            hysteria2:4)
 +                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +                    HY2_OBFS_PASSWORD=""
@@ -1108,14 +1200,14 @@
 +                elif apply_hy2_hop_range "$new_hop"; then
 +                    changed=true
 +                fi ;;
-@@ -8087 +8923 @@
+@@ -8087 +8844 @@
 -        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
 +        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
-@@ -8133,0 +8970,3 @@
+@@ -8133,0 +8891,3 @@
 +    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
 +    hy2_hop_remove
 +
-@@ -8539,0 +9379,390 @@
+@@ -8539,0 +9300,600 @@
 +}
 +
 +# ============== 协议可选增强 ==============
@@ -1506,3 +1598,213 @@
 +        log_info "$(t2 "已启用 Salamander 混淆（密码已写入分享链接，客户端导入即可）" \
 +            "Salamander obfuscation enabled (the password is in the share link; just import it)")"
 +    fi
++}
++
++# ============== sing-box Release 管理 ==============
++#
++# 目标与 Xray 的 release 管理一致：没有通过官方 SHA-256 的归档不会被执行，替换失败
++# 能回到旧 binary。实现刻意比 Xray 的事务轻：sing-box 只是一个由本脚本独占管理的
++# binary，这里用"同目录暂存 + rename 原子替换 + 带版本号的备份"覆盖下载损坏、候选
++# 不可执行、新版本拒绝现有配置、替换后服务起不来这四类失败。
++#
++# SHA-256 来自 GitHub release API 中每个资产的 digest 字段（"sha256:<hex>"）。
++# 该字段缺失或格式不符时失败关闭；确需安装这样的 release 时，由操作者用
++# SINGBOX_SHA256=<hex> 明确给出期望值，脚本仍然按它校验。
++SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases"
++SINGBOX_MAX_ARCHIVE_BYTES=$((300 * 1024 * 1024))
++# 低于该版本的 sing-box 缺少 AnyTLS 默认不再上传客户端元数据的修正（1.13.16）。
++SINGBOX_BASELINE_VERSION="1.13.16"
++
++# 请求的固定版本（SINGBOX_VERSION / singbox_version，可带 v 前缀）；未指定输出空串。
++singbox_requested_version() {
++    local raw="${SINGBOX_VERSION:-${singbox_version:-}}"
++    [[ -z "$raw" ]] && return 0
++    raw="${raw#v}"
++    [[ "$raw" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]] || return 1
++    printf '%s' "$raw"
++}
++
++map_singbox_arch() {
++    case "${1:-$(uname -m)}" in
++        x86_64|amd64)   printf '%s' amd64 ;;
++        aarch64|arm64)  printf '%s' arm64 ;;
++        armv7l|armv7)   printf '%s' armv7 ;;
++        i686|i386)      printf '%s' 386 ;;
++        *) return 1 ;;
++    esac
++}
++
++# 取 release 元数据（JSON）。Usage: singbox_release_json [VERSION]（缺省为 latest stable）
++singbox_release_json() {
++    local version="${1:-}" url="$SINGBOX_RELEASE_API/latest"
++    [[ -n "$version" ]] && url="$SINGBOX_RELEASE_API/tags/v${version}"
++    secure_curl "$url" 2>/dev/null
++}
++
++# 从 release JSON 里选出本机应使用的归档，输出一行 "NAME URL SHA256"。
++# musl 主机优先 "-musl" 静态归档；没有它的旧 release 回落到默认归档（1.13 之前的
++# 默认归档本身是静态链接的）。
++# Usage: singbox_select_asset RELEASE_JSON VERSION ARCH
++singbox_select_asset() {
++    local json="$1" version="$2" arch="$3" name row digest
++    local -a names=()
++    system_is_musl && names+=("sing-box-${version}-linux-${arch}-musl.tar.gz")
++    names+=("sing-box-${version}-linux-${arch}.tar.gz")
++    for name in "${names[@]}"; do
++        row=$(jq -r --arg name "$name" \
++            '.assets[]? | select(.name == $name) | "\(.browser_download_url) \(.digest // "")"' \
++            <<<"$json" 2>/dev/null | head -n 1)
++        [[ -n "$row" ]] || continue
++        digest="${row#* }"
++        [[ "${row%% *}" == https://github.com/SagerNet/sing-box/releases/download/* ]] || return 1
++        if [[ -n "${SINGBOX_SHA256:-}" ]]; then
++            digest="sha256:${SINGBOX_SHA256,,}"
++        fi
++        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
++            log_error "$(t2 "release 元数据没有 $name 的 SHA-256，拒绝安装未校验的归档（可用 SINGBOX_SHA256=<hex> 明确指定）" \
++                "The release metadata has no SHA-256 for $name; refusing an unverified archive (set SINGBOX_SHA256=<hex> to supply one)")"
++            return 1
++        fi
++        printf '%s %s %s\n' "$name" "${row%% *}" "${digest#sha256:}"
++        return 0
++    done
++    log_error "No sing-box archive for linux-${arch} in release v${version}"
++    return 1
++}
++
++# 下载、校验并解出候选 binary，输出其路径。
++# Usage: singbox_fetch_candidate WORK_DIR NAME URL SHA256 VERSION
++singbox_fetch_candidate() {
++    local work="$1" name="$2" url="$3" expected="$4" version="$5" archive actual size candidate reported
++    archive="$work/$name"
++    if ! secure_curl "$url" -o "$archive"; then
++        log_error "Failed to download $name"
++        return 1
++    fi
++    size=$(stat -c '%s' "$archive" 2>/dev/null) || return 1
++    (( size > 0 && size <= SINGBOX_MAX_ARCHIVE_BYTES )) || { log_error "Unexpected archive size: $size"; return 1; }
++    actual=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
++    if [[ "$actual" != "$expected" ]]; then
++        log_error "$(t2 "sing-box 归档 SHA-256 不匹配，已丢弃" "sing-box archive SHA-256 mismatch; discarded") (expected $expected, got ${actual:-none})"
++        return 1
++    fi
++    mkdir -p -- "$work/unpacked" || return 1
++    if ! tar -xzf "$archive" -C "$work/unpacked" --no-same-owner 2>/dev/null; then
++        log_error "Failed to extract sing-box archive"
++        return 1
++    fi
++    candidate=$(find "$work/unpacked" -type f -name sing-box 2>/dev/null | head -n 1)
++    if [[ -z "$candidate" ]]; then
++        log_error "sing-box binary not found in archive"
++        return 1
++    fi
++    chmod 755 "$candidate" || return 1
++    # 立刻验证可执行性与版本：不兼容的 binary（例如 musl 主机拿到 glibc 构建）要在
++    # 这里失败，而不是等到 config check 才被报成"配置无效"。
++    if ! reported=$(timeout 20 "$candidate" version 2>/dev/null </dev/null); then
++        log_error "Installed sing-box binary cannot be executed on this system"
++        system_is_musl && log_error "This system uses musl libc; no compatible sing-box build was found for v${version}"
++        return 1
++    fi
++    if [[ ! "$reported" =~ sing-box[[:space:]]+version[[:space:]]+${version//./\\.}([[:space:]]|$) ]]; then
++        log_error "Downloaded sing-box does not report version $version"
++        return 1
++    fi
++    printf '%s\n' "$candidate"
++}
++
++# 只保留最近 SINGBOX_BACKUP_KEEP（默认 3）份脚本创建的备份。
++singbox_prune_backups() {
++    local keep="${SINGBOX_BACKUP_KEEP:-3}" backup index=0
++    [[ "$keep" =~ ^[0-9]{1,3}$ ]] || keep=3
++    while IFS= read -r backup; do
++        index=$((index + 1))
++        (( index > keep )) && rm -f -- "$backup"
++    done < <(ls -1t -- "${SINGBOX_BIN}".bak-v*-[0-9]*-[0-9]* 2>/dev/null)
++    return 0
++}
++
++# 安装或更新 sing-box。
++# Usage: singbox_install_release fresh|update
++#   fresh   全新安装（install_singbox 调用）；不重启服务
++#   update  替换已有 binary：新 binary 必须接受现有配置；原先在运行则重启并确认 active，
++#           任一步失败都恢复旧 binary 与原服务状态
++singbox_install_release() {
++    local intent="${1:-update}" version arch json asset name url digest work candidate
++    local old_version="" backup="" stage was_active=0 rc=0
++
++    if ! version=$(singbox_requested_version); then
++        log_error "Invalid SINGBOX_VERSION: ${SINGBOX_VERSION:-${singbox_version:-}}"
++        return 1
++    fi
++    arch=$(map_singbox_arch) || { log_error "Unsupported architecture for sing-box: $(uname -m)"; return 1; }
++    json=$(singbox_release_json "$version") || json=""
++    if [[ -z "$version" ]]; then
++        version=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null)
++        version="${version#v}"
++    fi
++    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]]; then
++        log_error "Failed to get sing-box release metadata"
++        return 1
++    fi
++
++    old_version=$(singbox_installed_version) || old_version=""
++    if [[ "$intent" == "update" && -n "$old_version" && "$old_version" == "$version" \
++        && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]]; then
++        log_info "$(t2 "sing-box 已是最新版本" "sing-box is already up to date"): v$version"
++        return 0
++    fi
++    if [[ "$intent" == "update" && -n "$old_version" && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]] \
++        && ! version_ge "$version" "$old_version"; then
++        log_warn "$(t2 "已安装的 sing-box 比 stable 更新，不自动降级" "Installed sing-box is newer than stable; refusing an automatic downgrade"): v$old_version > v$version"
++        return 0
++    fi
++
++    asset=$(singbox_select_asset "$json" "$version" "$arch") || return 1
++    read -r name url digest <<<"$asset"
++    system_is_musl && [[ "$name" == *-musl.tar.gz ]] && \
++        log_info "musl libc detected, using the statically linked sing-box build"
++    log_info "Installing sing-box v${version} (${arch})..."
++
++    work=$(mktemp -d) || return 1
++    candidate=$(singbox_fetch_candidate "$work" "$name" "$url" "$digest" "$version") || { rm -rf -- "$work"; return 1; }
++
++    # 新 binary 必须接受现有配置，否则替换后服务必然起不来。
++    if [[ -s "$SINGBOX_CONF" ]] && ! "$candidate" check -c "$SINGBOX_CONF" >/dev/null 2>&1; then
++        log_error "$(t2 "新版 sing-box 不接受现有配置，已取消更新（现有 binary 未改动）" \
++            "The new sing-box rejects the current config; update cancelled (existing binary untouched)")"
++        rm -rf -- "$work"
++        return 1
++    fi
++
++    mkdir -p "$SINGBOX_DIR" "$(dirname "$SINGBOX_BIN")" || { rm -rf -- "$work"; return 1; }
++    stage=$(mktemp "$(dirname "$SINGBOX_BIN")/.sing-box.new.XXXXXXXX") || { rm -rf -- "$work"; return 1; }
++    if ! cp -- "$candidate" "$stage" || ! chmod 755 "$stage"; then
++        rm -rf -- "$work" "$stage"
++        return 1
++    fi
++    rm -rf -- "$work"
++
++    if [[ -f "$SINGBOX_BIN" ]]; then
++        backup="${SINGBOX_BIN}.bak-v${old_version:-unknown}-$(date +%Y%m%d-%H%M%S)"
++        cp -p -- "$SINGBOX_BIN" "$backup" || { rm -f -- "$stage"; return 1; }
++        service_is_active "$SINGBOX_SERVICE" && was_active=1
++    fi
++    # rename 在同一目录内是原子的：任何时刻该路径上要么是旧 binary，要么是新 binary。
++    mv -f -- "$stage" "$SINGBOX_BIN" || { rm -f -- "$stage"; return 1; }
++
++    if (( was_active == 1 )); then
++        service_restart "$SINGBOX_SERVICE" || rc=1
++        sleep 1
++        service_is_active "$SINGBOX_SERVICE" || rc=1
++        if (( rc != 0 )); then
++            log_error "$(t2 "新版 sing-box 启动失败，正在恢复旧版本" "The new sing-box failed to start; restoring the previous version")"
++            cp -p -- "$backup" "${SINGBOX_BIN}.restore" && mv -f -- "${SINGBOX_BIN}.restore" "$SINGBOX_BIN"
++            service_restart "$SINGBOX_SERVICE" || true
++            return 1
++        fi
++    fi
++
++    singbox_prune_backups
++    log_info "sing-box v${version} installed successfully"
++    return 0

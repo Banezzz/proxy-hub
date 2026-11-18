@@ -718,9 +718,11 @@ run_scenario singbox-libc-archive-contract <<'SCENARIO'
 source /mnt/lib/00_security_state.sh
 source /mnt/lib/10_runtime_platform_ui.sh
 source /mnt/lib/20_installers_restart.sh
+source /mnt/lib/60_system_tools.sh
 
 SINGBOX_DIR=/srv/singbox
 SINGBOX_BIN=/srv/singbox/sing-box
+SINGBOX_CONF=/srv/singbox/config.json
 INIT_SYSTEM=systemd
 
 log_info() { :; }
@@ -728,11 +730,10 @@ log_warn() { :; }
 log_error() { printf '%s\n' "$*" >>/srv/singbox.errors; }
 create_singbox_systemd_service() { printf 'systemd\n' >>/srv/singbox.services; }
 create_singbox_openrc_service() { printf 'openrc\n' >>/srv/singbox.services; }
-fetch_github_release_tag() { printf 'v1.13.15\n'; }
 real_system_is_musl=$(declare -f system_is_musl)
 
-# Real archives with a runnable and an unrunnable payload; only the extraction
-# and exec paths are real, the download is stubbed below.
+# Real archives with a runnable and an unrunnable payload; extraction, digest
+# verification and exec are real, only the network is stubbed below.
 build_archive() {
     local dir_name="$1" interpreter="$2" out="$3"
     rm -rf -- "/srv/pkg/$dir_name"
@@ -747,9 +748,20 @@ build_archive sing-box-1.13.15-linux-amd64-musl /bin/sh /srv/musl.tar.gz
 build_archive sing-box-1.13.15-linux-amd64 /bin/sh /srv/default.tar.gz
 build_archive sing-box-1.13.15-linux-amd64-broken /nonexistent/loader /srv/broken.tar.gz
 
-# AVAILABLE lists the archive suffixes this fake release publishes.
+# PUBLISHED lists "asset-suffix:archive-file" pairs this fake release offers.
+release_json() {
+    local entry suffix file name assets=""
+    for entry in $PUBLISHED; do
+        suffix="${entry%%:*}"
+        file="${entry#*:}"
+        name="sing-box-1.13.15-linux-amd64${suffix}.tar.gz"
+        assets+="${assets:+,}{\"name\":\"$name\",\"browser_download_url\":\"https://github.com/SagerNet/sing-box/releases/download/v1.13.15/$name\",\"digest\":\"sha256:$(sha256sum "$file" | awk '{print $1}')\"}"
+    done
+    printf '{"tag_name":"v1.13.15","assets":[%s]}\n' "$assets"
+}
+
 secure_curl() {
-    local arg url="" dest="" want_dest=0
+    local arg url="" dest="" want_dest=0 entry suffix
     for arg in "$@"; do
         if ((want_dest)); then
             dest="$arg"
@@ -761,11 +773,19 @@ secure_curl() {
             https://*) url="$arg" ;;
         esac
     done
+    if [[ "$url" == https://api.github.com/* ]]; then
+        release_json
+        return 0
+    fi
     printf '%s\n' "${url##*/}" >>/srv/singbox.urls
-    case "$url" in
-        *"$AVAILABLE") cp -- "$SERVE_ARCHIVE" "$dest" ;;
-        *) return 22 ;;
-    esac
+    for entry in $PUBLISHED; do
+        suffix="${entry%%:*}"
+        if [[ "$url" == *"linux-amd64${suffix}.tar.gz" ]]; then
+            cp -- "${entry#*:}" "$dest"
+            return 0
+        fi
+    done
+    return 22
 }
 
 uname() { printf 'x86_64\n'; }
@@ -776,10 +796,9 @@ reset_case() {
     : >/srv/singbox.urls
 }
 
-# musl host: the musl archive is requested first and nothing else is fetched.
+# musl host: the musl archive is chosen and nothing else is fetched.
 reset_case
-AVAILABLE="-musl.tar.gz"
-SERVE_ARCHIVE=/srv/musl.tar.gz
+PUBLISHED="-musl:/srv/musl.tar.gz :/srv/default.tar.gz"
 system_is_musl() { return 0; }
 install_singbox || fail_case "install_singbox failed on a musl host"
 assert_eq "sing-box-1.13.15-linux-amd64-musl.tar.gz" "$(cat /srv/singbox.urls)" \
@@ -791,30 +810,26 @@ assert_eq "systemd" "$(cat /srv/singbox.services)" "the service must be created"
 
 # glibc host: the default archive is used and the musl name is never requested.
 reset_case
-AVAILABLE="linux-amd64.tar.gz"
-SERVE_ARCHIVE=/srv/default.tar.gz
 system_is_musl() { return 1; }
 install_singbox || fail_case "install_singbox failed on a glibc host"
 assert_eq "sing-box-1.13.15-linux-amd64.tar.gz" "$(cat /srv/singbox.urls)" \
     "a glibc host must keep fetching the default archive"
 
 # musl host on a release without a musl archive: fall back to the default one,
-# which is statically linked before sing-box 1.13.0.
+# which is statically linked before sing-box 1.13.0.  The release metadata says
+# which archives exist, so the missing one is never requested.
 reset_case
-AVAILABLE="linux-amd64.tar.gz"
-SERVE_ARCHIVE=/srv/default.tar.gz
+PUBLISHED=":/srv/default.tar.gz"
 system_is_musl() { return 0; }
 install_singbox || fail_case "install_singbox did not fall back to the default archive"
-assert_eq "sing-box-1.13.15-linux-amd64-musl.tar.gz
-sing-box-1.13.15-linux-amd64.tar.gz" "$(cat /srv/singbox.urls)" \
-    "the musl archive must be tried first and the default one used as fallback"
+assert_eq "sing-box-1.13.15-linux-amd64.tar.gz" "$(cat /srv/singbox.urls)" \
+    "the default archive must be used when the release has no musl build"
 [[ -x /srv/singbox/sing-box ]] || fail_case "fallback archive was not installed"
 
-# An installed binary this kernel cannot exec fails the install and is removed,
-# so the next attempt does not skip installation via the already-installed path.
+# A binary this kernel cannot exec fails the install before anything is placed
+# at the canonical path, so the next attempt does not skip installation.
 reset_case
-AVAILABLE="linux-amd64.tar.gz"
-SERVE_ARCHIVE=/srv/broken.tar.gz
+PUBLISHED=":/srv/broken.tar.gz"
 system_is_musl() { return 1; }
 rc=0
 install_singbox || rc=$?

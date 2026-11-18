@@ -5034,6 +5034,10 @@ system_is_musl() {
 
 # 安装 sing-box（下载官方预编译二进制，按 libc 选择归档，兼容 glibc 与 musl）
 # AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
+#
+# 已有可运行的 binary 时只报告、不改动，与 Xray 的普通安装语义一致：创建节点不应
+# 悄悄升级内核。下载、SHA-256 校验、候选 binary 验证与原子替换都在
+# singbox_install_release 里，全新安装与显式的 singbox-update 走同一条路径。
 install_singbox() {
     if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
         log_info "sing-box already installed, skipping..."
@@ -5041,88 +5045,7 @@ install_singbox() {
     fi
 
     log_info "Installing sing-box (required for AnyTLS / Hysteria2)..."
-
-    local arch sb_arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)   sb_arch="amd64" ;;
-        aarch64|arm64)  sb_arch="arm64" ;;
-        armv7l|armv7)   sb_arch="armv7" ;;
-        i686|i386)      sb_arch="386" ;;
-        *)
-            log_error "Unsupported architecture for sing-box: $arch"
-            return 1
-            ;;
-    esac
-
-    # 获取最新版本号（安全的 API 解析）
-    local tag version
-    tag=$(fetch_github_release_tag "SagerNet/sing-box")
-    if [[ -z "$tag" ]]; then
-        log_error "Failed to get sing-box latest version"
-        return 1
-    fi
-    version="${tag#v}"
-
-    # 归档选择按 libc 而不是按发行版：sing-box >= 1.13.0 的默认 linux 归档动态
-    # 链接 glibc，在 Alpine 上会以 "cannot execute: required file not found"
-    # 失败；静态链接的 "-musl" 归档只从 1.13.0 起提供，更早的版本只有一个已经
-    # 是静态链接的默认归档，所以旧版本仍回落到默认名。
-    local -a archive_names=()
-    if system_is_musl; then
-        log_info "musl libc detected, using the statically linked sing-box build"
-        archive_names+=("sing-box-${version}-linux-${sb_arch}-musl.tar.gz")
-    fi
-    archive_names+=("sing-box-${version}-linux-${sb_arch}.tar.gz")
-
-    log_info "Installing sing-box ${tag} (${sb_arch})..."
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    local archive_name download_url downloaded=0
-    for archive_name in "${archive_names[@]}"; do
-        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${archive_name}"
-        if secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
-            downloaded=1
-            break
-        fi
-        log_warn "sing-box archive not available: $archive_name"
-    done
-    if ((downloaded == 0)); then
-        log_error "Failed to download sing-box ${tag} for ${sb_arch}"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    if ! tar -xzf "${tmp_dir}/sing-box.tar.gz" -C "$tmp_dir" 2>/dev/null; then
-        log_error "Failed to extract sing-box archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local extracted_bin
-    extracted_bin=$(find "$tmp_dir" -type f -name sing-box 2>/dev/null | head -1)
-    if [[ -z "$extracted_bin" ]]; then
-        log_error "sing-box binary not found in archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    mkdir -p "$SINGBOX_DIR" /usr/local/bin
-    install -m 755 "$extracted_bin" "$SINGBOX_BIN"
-    rm -rf "$tmp_dir"
-
-    # 安装后立刻验证可执行性：否则不兼容的二进制要到后面 config check 才暴露，
-    # 并被报成 "Generated sing-box config is invalid"，掩盖真正的原因。
-    if ! "$SINGBOX_BIN" version &>/dev/null; then
-        log_error "Installed sing-box binary cannot be executed on this system"
-        if system_is_musl; then
-            log_error "This system uses musl libc; no compatible sing-box build was found for ${tag}"
-        fi
-        rm -f "$SINGBOX_BIN"
-        return 1
-    fi
+    singbox_install_release fresh || return 1
 
     # 创建服务（systemd 或 OpenRC）
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -5130,8 +5053,6 @@ install_singbox() {
     else
         create_singbox_systemd_service
     fi
-
-    log_info "sing-box ${tag} installed successfully"
     return 0
 }
 
@@ -9768,6 +9689,216 @@ configure_hy2_options() {
     fi
 }
 
+# ============== sing-box Release 管理 ==============
+#
+# 目标与 Xray 的 release 管理一致：没有通过官方 SHA-256 的归档不会被执行，替换失败
+# 能回到旧 binary。实现刻意比 Xray 的事务轻：sing-box 只是一个由本脚本独占管理的
+# binary，这里用"同目录暂存 + rename 原子替换 + 带版本号的备份"覆盖下载损坏、候选
+# 不可执行、新版本拒绝现有配置、替换后服务起不来这四类失败。
+#
+# SHA-256 来自 GitHub release API 中每个资产的 digest 字段（"sha256:<hex>"）。
+# 该字段缺失或格式不符时失败关闭；确需安装这样的 release 时，由操作者用
+# SINGBOX_SHA256=<hex> 明确给出期望值，脚本仍然按它校验。
+SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases"
+SINGBOX_MAX_ARCHIVE_BYTES=$((300 * 1024 * 1024))
+# 低于该版本的 sing-box 缺少 AnyTLS 默认不再上传客户端元数据的修正（1.13.16）。
+SINGBOX_BASELINE_VERSION="1.13.16"
+
+# 请求的固定版本（SINGBOX_VERSION / singbox_version，可带 v 前缀）；未指定输出空串。
+singbox_requested_version() {
+    local raw="${SINGBOX_VERSION:-${singbox_version:-}}"
+    [[ -z "$raw" ]] && return 0
+    raw="${raw#v}"
+    [[ "$raw" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]] || return 1
+    printf '%s' "$raw"
+}
+
+map_singbox_arch() {
+    case "${1:-$(uname -m)}" in
+        x86_64|amd64)   printf '%s' amd64 ;;
+        aarch64|arm64)  printf '%s' arm64 ;;
+        armv7l|armv7)   printf '%s' armv7 ;;
+        i686|i386)      printf '%s' 386 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 取 release 元数据（JSON）。Usage: singbox_release_json [VERSION]（缺省为 latest stable）
+singbox_release_json() {
+    local version="${1:-}" url="$SINGBOX_RELEASE_API/latest"
+    [[ -n "$version" ]] && url="$SINGBOX_RELEASE_API/tags/v${version}"
+    secure_curl "$url" 2>/dev/null
+}
+
+# 从 release JSON 里选出本机应使用的归档，输出一行 "NAME URL SHA256"。
+# musl 主机优先 "-musl" 静态归档；没有它的旧 release 回落到默认归档（1.13 之前的
+# 默认归档本身是静态链接的）。
+# Usage: singbox_select_asset RELEASE_JSON VERSION ARCH
+singbox_select_asset() {
+    local json="$1" version="$2" arch="$3" name row digest
+    local -a names=()
+    system_is_musl && names+=("sing-box-${version}-linux-${arch}-musl.tar.gz")
+    names+=("sing-box-${version}-linux-${arch}.tar.gz")
+    for name in "${names[@]}"; do
+        row=$(jq -r --arg name "$name" \
+            '.assets[]? | select(.name == $name) | "\(.browser_download_url) \(.digest // "")"' \
+            <<<"$json" 2>/dev/null | head -n 1)
+        [[ -n "$row" ]] || continue
+        digest="${row#* }"
+        [[ "${row%% *}" == https://github.com/SagerNet/sing-box/releases/download/* ]] || return 1
+        if [[ -n "${SINGBOX_SHA256:-}" ]]; then
+            digest="sha256:${SINGBOX_SHA256,,}"
+        fi
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            log_error "$(t2 "release 元数据没有 $name 的 SHA-256，拒绝安装未校验的归档（可用 SINGBOX_SHA256=<hex> 明确指定）" \
+                "The release metadata has no SHA-256 for $name; refusing an unverified archive (set SINGBOX_SHA256=<hex> to supply one)")"
+            return 1
+        fi
+        printf '%s %s %s\n' "$name" "${row%% *}" "${digest#sha256:}"
+        return 0
+    done
+    log_error "No sing-box archive for linux-${arch} in release v${version}"
+    return 1
+}
+
+# 下载、校验并解出候选 binary，输出其路径。
+# Usage: singbox_fetch_candidate WORK_DIR NAME URL SHA256 VERSION
+singbox_fetch_candidate() {
+    local work="$1" name="$2" url="$3" expected="$4" version="$5" archive actual size candidate reported
+    archive="$work/$name"
+    if ! secure_curl "$url" -o "$archive"; then
+        log_error "Failed to download $name"
+        return 1
+    fi
+    size=$(stat -c '%s' "$archive" 2>/dev/null) || return 1
+    (( size > 0 && size <= SINGBOX_MAX_ARCHIVE_BYTES )) || { log_error "Unexpected archive size: $size"; return 1; }
+    actual=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "$(t2 "sing-box 归档 SHA-256 不匹配，已丢弃" "sing-box archive SHA-256 mismatch; discarded") (expected $expected, got ${actual:-none})"
+        return 1
+    fi
+    mkdir -p -- "$work/unpacked" || return 1
+    if ! tar -xzf "$archive" -C "$work/unpacked" --no-same-owner 2>/dev/null; then
+        log_error "Failed to extract sing-box archive"
+        return 1
+    fi
+    candidate=$(find "$work/unpacked" -type f -name sing-box 2>/dev/null | head -n 1)
+    if [[ -z "$candidate" ]]; then
+        log_error "sing-box binary not found in archive"
+        return 1
+    fi
+    chmod 755 "$candidate" || return 1
+    # 立刻验证可执行性与版本：不兼容的 binary（例如 musl 主机拿到 glibc 构建）要在
+    # 这里失败，而不是等到 config check 才被报成"配置无效"。
+    if ! reported=$(timeout 20 "$candidate" version 2>/dev/null </dev/null); then
+        log_error "Installed sing-box binary cannot be executed on this system"
+        system_is_musl && log_error "This system uses musl libc; no compatible sing-box build was found for v${version}"
+        return 1
+    fi
+    if [[ ! "$reported" =~ sing-box[[:space:]]+version[[:space:]]+${version//./\\.}([[:space:]]|$) ]]; then
+        log_error "Downloaded sing-box does not report version $version"
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}
+
+# 只保留最近 SINGBOX_BACKUP_KEEP（默认 3）份脚本创建的备份。
+singbox_prune_backups() {
+    local keep="${SINGBOX_BACKUP_KEEP:-3}" backup index=0
+    [[ "$keep" =~ ^[0-9]{1,3}$ ]] || keep=3
+    while IFS= read -r backup; do
+        index=$((index + 1))
+        (( index > keep )) && rm -f -- "$backup"
+    done < <(ls -1t -- "${SINGBOX_BIN}".bak-v*-[0-9]*-[0-9]* 2>/dev/null)
+    return 0
+}
+
+# 安装或更新 sing-box。
+# Usage: singbox_install_release fresh|update
+#   fresh   全新安装（install_singbox 调用）；不重启服务
+#   update  替换已有 binary：新 binary 必须接受现有配置；原先在运行则重启并确认 active，
+#           任一步失败都恢复旧 binary 与原服务状态
+singbox_install_release() {
+    local intent="${1:-update}" version arch json asset name url digest work candidate
+    local old_version="" backup="" stage was_active=0 rc=0
+
+    if ! version=$(singbox_requested_version); then
+        log_error "Invalid SINGBOX_VERSION: ${SINGBOX_VERSION:-${singbox_version:-}}"
+        return 1
+    fi
+    arch=$(map_singbox_arch) || { log_error "Unsupported architecture for sing-box: $(uname -m)"; return 1; }
+    json=$(singbox_release_json "$version") || json=""
+    if [[ -z "$version" ]]; then
+        version=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null)
+        version="${version#v}"
+    fi
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]]; then
+        log_error "Failed to get sing-box release metadata"
+        return 1
+    fi
+
+    old_version=$(singbox_installed_version) || old_version=""
+    if [[ "$intent" == "update" && -n "$old_version" && "$old_version" == "$version" \
+        && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]]; then
+        log_info "$(t2 "sing-box 已是最新版本" "sing-box is already up to date"): v$version"
+        return 0
+    fi
+    if [[ "$intent" == "update" && -n "$old_version" && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]] \
+        && ! version_ge "$version" "$old_version"; then
+        log_warn "$(t2 "已安装的 sing-box 比 stable 更新，不自动降级" "Installed sing-box is newer than stable; refusing an automatic downgrade"): v$old_version > v$version"
+        return 0
+    fi
+
+    asset=$(singbox_select_asset "$json" "$version" "$arch") || return 1
+    read -r name url digest <<<"$asset"
+    system_is_musl && [[ "$name" == *-musl.tar.gz ]] && \
+        log_info "musl libc detected, using the statically linked sing-box build"
+    log_info "Installing sing-box v${version} (${arch})..."
+
+    work=$(mktemp -d) || return 1
+    candidate=$(singbox_fetch_candidate "$work" "$name" "$url" "$digest" "$version") || { rm -rf -- "$work"; return 1; }
+
+    # 新 binary 必须接受现有配置，否则替换后服务必然起不来。
+    if [[ -s "$SINGBOX_CONF" ]] && ! "$candidate" check -c "$SINGBOX_CONF" >/dev/null 2>&1; then
+        log_error "$(t2 "新版 sing-box 不接受现有配置，已取消更新（现有 binary 未改动）" \
+            "The new sing-box rejects the current config; update cancelled (existing binary untouched)")"
+        rm -rf -- "$work"
+        return 1
+    fi
+
+    mkdir -p "$SINGBOX_DIR" "$(dirname "$SINGBOX_BIN")" || { rm -rf -- "$work"; return 1; }
+    stage=$(mktemp "$(dirname "$SINGBOX_BIN")/.sing-box.new.XXXXXXXX") || { rm -rf -- "$work"; return 1; }
+    if ! cp -- "$candidate" "$stage" || ! chmod 755 "$stage"; then
+        rm -rf -- "$work" "$stage"
+        return 1
+    fi
+    rm -rf -- "$work"
+
+    if [[ -f "$SINGBOX_BIN" ]]; then
+        backup="${SINGBOX_BIN}.bak-v${old_version:-unknown}-$(date +%Y%m%d-%H%M%S)"
+        cp -p -- "$SINGBOX_BIN" "$backup" || { rm -f -- "$stage"; return 1; }
+        service_is_active "$SINGBOX_SERVICE" && was_active=1
+    fi
+    # rename 在同一目录内是原子的：任何时刻该路径上要么是旧 binary，要么是新 binary。
+    mv -f -- "$stage" "$SINGBOX_BIN" || { rm -f -- "$stage"; return 1; }
+
+    if (( was_active == 1 )); then
+        service_restart "$SINGBOX_SERVICE" || rc=1
+        sleep 1
+        service_is_active "$SINGBOX_SERVICE" || rc=1
+        if (( rc != 0 )); then
+            log_error "$(t2 "新版 sing-box 启动失败，正在恢复旧版本" "The new sing-box failed to start; restoring the previous version")"
+            cp -p -- "$backup" "${SINGBOX_BIN}.restore" && mv -f -- "${SINGBOX_BIN}.restore" "$SINGBOX_BIN"
+            service_restart "$SINGBOX_SERVICE" || true
+            return 1
+        fi
+    fi
+
+    singbox_prune_backups
+    log_info "sing-box v${version} installed successfully"
+    return 0
+}
+
 # ============== WARP 管理 ==============
 
 cmd_warp() {
@@ -12457,7 +12588,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=501303 body-sha256=5fd6408e12a44938c10cb56cd7107b4a42e702abae2e8fb55d5a4fffc0ff1ca1
-# build-id=5fd6408e12a44938c10cb56cd7107b4a42e702abae2e8fb55d5a4fffc0ff1ca1
+# body-bytes=508791 body-sha256=65257c85510d516a651de4ecde91b4852f858eca623611b861161e7e6f79844e
+# build-id=65257c85510d516a651de4ecde91b4852f858eca623611b861161e7e6f79844e
 # module-count=11
 # proxy-hub-bundle-end-v1
