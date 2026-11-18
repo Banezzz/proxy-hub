@@ -84,6 +84,15 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 `reset_node_state` 仍是这些变量的唯一权威清单；`load_node_for_edit` 是"读入、解密、
 修改后 `save_env` 重存"流程的唯一入口，节点编辑与升级向导共用。
 
+可选的配置加密（`ENABLE_CONFIG_ENCRYPTION=true` 且密钥文件 `ENCRYPTION_KEY_FILE`
+存在）下，`save_env` 加密的字段是 `UUID`、`PRIVATE_KEY`、`SS_PASSWORD`、
+`ANYTLS_PASSWORD`、`HY2_PASSWORD`、`XHTTP_UUID`、`XHTTP_PRIVATE_KEY`、`MLDSA65_SEED`、
+`VLESS_DECRYPTION`、`HY2_OBFS_PASSWORD`。每个密文是以 `U2FsdGVk` 开头的**单行**
+base64，节点文件始终保持一行一个 `KEY=VALUE`。`decrypt_node_secrets` 就地解密
+`safe_load_node_config` 装入的这组全局变量，`load_node_for_edit`、`get_share_link`、
+`show_node_qrcodes` 与 `show_info` 都经过它；新增敏感字段时须同时登记到 `save_env`
+与 `decrypt_node_secrets`。
+
 ## sing-box Release 契约
 
 | 变量 | 兼容别名 | 契约 |
@@ -427,6 +436,11 @@ Hysteria2 密码等敏感字段继续兼容明文和现有 OpenSSL 格式。节�
   都返回非零；下载或验证失败不得停止现有 Xray，替换后的失败必须先尝试回滚。
 - Xray rollback 失败时不得清理 transaction marker 或旧 binary backup，stderr 必须
   给出管理员可直接核对并执行的恢复命令。
+- `decrypt_value VALUE [FIELD [NODE]]` 对明文原样返回；密文无法解密（密钥文件缺失
+  或已更换、密文不完整）时 stdout 为空并返回非零，stderr 指明字段与节点。它不再回退
+  为返回密文。`decrypt_node_secrets`、`load_node_for_edit`、`get_share_link`、
+  `show_info`、`show_node_qrcodes`、`write_config` 与 `write_singbox_config` 遇到这种
+  节点时整体返回非零：不改写节点文件，不替换现有内核配置，也不输出链接。
 
 ## 写操作锁契约
 

@@ -1,5 +1,48 @@
 # 变更记录
 
+## 2026-11-18 — 修复可选配置加密写出多行密文
+
+`ENABLE_CONFIG_ENCRYPTION=true` 且密钥文件存在时，节点文件里的敏感字段会被写坏。
+这个开关没有文档、默认关闭，缺陷早于协议刷新；协议刷新新增的五个敏感字段沿用了同一
+函数，同样受影响。
+
+- **根因**：`encrypt_value` 用 `openssl enc -a`，base64 每 64 个字符换行。明文达到
+  32 字节（UUID、REALITY 私钥、ML-DSA-65 种子、VLESS decryption、SS2022 的 256 位
+  密钥等）时密文是两行，`save_env` 把第二行写成没有键的裸行，逐行读取时被丢弃。
+- **修复**：加密与解密都加 `-A`，密文恒为单行。解密必须同时加：不加时 OpenSSL 3.0
+  拒绝超过约 1KB 的单行 base64。
+- **失败语义**：`decrypt_value` 解不开时原先回显密文，而 openssl 在报错前已经输出了
+  解开的前几个分组，实际流进配置的是"前 16 字节明文 + 密文"。现在 stdout 为空并返回
+  非零，stderr 指明节点与字段；密钥文件缺失也按失败处理。`write_config`、
+  `write_singbox_config`、`load_node_for_edit` 及展示路径遇到这种节点时整体失败，
+  不替换现有配置、不改写节点文件。
+- **展示路径**：`get_share_link`、`show_node_qrcodes`、`show_info` 原先只解密
+  Hysteria2 与 AnyTLS 的密码，Vision/XHTTP/Shadowsocks 节点在启用加密时会把密文当作
+  UUID 或密码印进分享链接。四条"装入全局变量"的路径现在统一经过新增的
+  `decrypt_node_secrets`，`load_node_for_edit` 里逐字段的解密随之收敛到同一份清单。
+
+影响范围：`lib/00_security_state.sh`（`encrypt_value`、`decrypt_value`、新增
+`decrypt_node_secrets`）、`lib/40_config_share.sh`（两个渲染函数与三个展示函数）、
+`lib/50_node_commands.sh`（`load_node_for_edit`）。未启用加密的安装只多了一次对明文的
+原样透传，节点文件格式、渲染结果与链接不变。
+
+兼容性：
+
+- 旧版本写出的**短**密文（明文不超过 31 字节，本来就是单行）继续可读。
+- 旧版本写出的**长**密文不可恢复，涉及的节点现在在渲染、编辑和展示时报错而不是产出
+  无效凭据；该节点会阻塞 `write_config`，需恢复密钥文件或删除并重建。节点文件自写入后
+  若未被 `save_env` 重写，被丢弃的第二行仍以裸行留在对应 `KEY=` 行之后，可手工拼回
+  同一行；被重写过的文件里只剩半截密文。
+- `decrypt_value` 不再在失败时返回密文，直接调用它的代码必须检查返回值。
+
+验证方式：`tests/test_protocol_refresh.sh` 新增 `config-encryption-round-trip`
+场景——带全部十个敏感字段（真实长度）的节点在加密下保存、经 `load_node_for_edit`
+读回两轮逐字段比对，关闭加密后重存与原文件逐行一致；断言节点文件每行都是
+`KEY=VALUE`、渲染出的 Xray/sing-box 配置与各协议链接只含明文；覆盖 1500 字节值、
+旧格式短密文、旧格式截断密文与密钥文件缺失。该场景在修复前的代码上失败。随后重建
+manifest/dist，新增 fixture `tests/fixtures/config-encryption.patch` 并登记到
+`tests/test_structure.sh`，运行 `docs/dev.md` 的完整验证清单。
+
 ## 2026-11-18 — 协议刷新、引导菜单与升级向导
 
 对照上游截至 2026-11 的状态（Xray v26.11.9、sing-box 1.14.4）更新协议层，并为旧版

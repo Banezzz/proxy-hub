@@ -557,7 +557,8 @@ git diff --check
 注明。涉及协议字段的改动应当带着真实内核跑一次——字段名写错在 jq 层面是看不出来的。
 
 这一轮的改动对历史基线的差异集中在 `tests/fixtures/protocol-refresh.patch` 一个累计
-补丁里，由 `diff -U0` 对"基线加既有补丁"与当前 bundle 正文生成。
+补丁里，由 `diff -U0` 对"基线加既有补丁"与当前 bundle 正文生成。其后的配置加密修复
+以同样方式生成 `tests/fixtures/config-encryption.patch`，排在补丁序列的最后。
 
 构建器与 loader 使用相同的安全临时父目录规则，并在发布 manifest/dist 以及递归
 清理前重新核对 staging 目录的 owner 与 device/inode identity；同路径被替换时
