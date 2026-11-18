@@ -617,13 +617,14 @@ cmd_remove() {
 }
 
 # 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
-cmd_edit() {
-    select_node || return 1
+# 把 CURRENT_NODE_NAME 指向的节点完整装入全局变量，供"修改后再 save_env"的流程使用。
+# safe_load 不含 padding；敏感值在这里解密，save_env 重存时才能正确再加密（明文配置下
+# 为 no-op）。节点编辑与升级向导共用这一份，避免两处各自维护字段清单。
+load_node_for_edit() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    safe_load_node_config "$node_file"
+    safe_load_node_config "$node_file" || return 1
 
-    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
     UUID=$(decrypt_value "$UUID")
     PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
@@ -635,6 +636,11 @@ cmd_edit() {
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
     VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
     HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+}
+
+cmd_edit() {
+    select_node || return 1
+    load_node_for_edit || return 1
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false

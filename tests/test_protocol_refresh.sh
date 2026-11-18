@@ -1920,4 +1920,28 @@ assert_fails "a rewritten file is no longer legacy" sysctl_tuning_is_legacy
 assert_contains "$(cat /srv/sysctl.calls)" "--system" "the new values are loaded immediately"
 SCENARIO
 
+# load_node_for_edit followed by save_env must be lossless for every field,
+# including the ones that only some protocols use.
+run_scenario node-edit-round-trip <<'SCENARIO'
+load_modules
+write_node full both \
+    "EXTRA_SHORT_IDS=aa11:bb22" "XHTTP_UUID=22222222-2222-4222-8222-222222222222" \
+    "XHTTP_PUBLIC_KEY=XPub_1" "XHTTP_PRIVATE_KEY=XPriv_1" "XHTTP_SHORT_ID=fedcba9876543210" \
+    "MLDSA65_SEED=Seed_1" "MLDSA65_VERIFY=Verify_1" \
+    "VLESS_DECRYPTION=mlkem768x25519plus.native.600s.DecKey_1" \
+    "VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1" \
+    "HY2_OBFS_PASSWORD=Obfs.Pass_1" "HY2_HOP_PORTS=30000-30100" \
+    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com"
+sed -i 's/^ANYTLS_PADDING_B64=$/ANYTLS_PADDING_B64=c3RvcD04/' "$NODES_DIR/full.env"
+sort "$NODES_DIR/full.env" >/srv/before.env
+CURRENT_NODE_NAME=full
+load_node_for_edit || fail_case "loading the node failed"
+save_env
+sort "$NODES_DIR/full.env" >/srv/after.env
+diff -u /srv/before.env /srv/after.env >&2 || fail_case "load_node_for_edit + save_env changed the node file"
+assert_eq "600" "$(stat -c '%a' "$NODES_DIR/full.env")" "the node file stays private"
+CURRENT_NODE_NAME=missing
+assert_fails "a missing node must fail to load" load_node_for_edit
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

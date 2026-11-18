@@ -1290,28 +1290,45 @@
 +        service_hardening_ensure "$SINGBOX_SERVICE" || true
 @@ -7653,0 +8469 @@
 +        service_hardening_ensure xray || true
-@@ -7921,0 +8738,5 @@
+@@ -7909,2 +8725,4 @@
+-cmd_edit() {
+-    select_node || return 1
++# 把 CURRENT_NODE_NAME 指向的节点完整装入全局变量，供"修改后再 save_env"的流程使用。
++# safe_load 不含 padding；敏感值在这里解密，save_env 重存时才能正确再加密（明文配置下
++# 为 no-op）。节点编辑与升级向导共用这一份，避免两处各自维护字段清单。
++load_node_for_edit() {
+@@ -7913 +8731 @@
+-    safe_load_node_config "$node_file"
++    safe_load_node_config "$node_file" || return 1
+@@ -7915 +8732,0 @@
+-    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
+@@ -7921,0 +8739,10 @@
 +    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
 +    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 +    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
 +    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 +    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
-@@ -7970,0 +8792,2 @@
++}
++
++cmd_edit() {
++    select_node || return 1
++    load_node_for_edit || return 1
+@@ -7970,0 +8798,2 @@
 +                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
 +                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
-@@ -8018,0 +8842,2 @@
+@@ -8018,0 +8848,2 @@
 +                    # ACME 节点的 SNI 即证书域名，两者一起改。
 +                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
-@@ -8028,0 +8854,2 @@
+@@ -8028,0 +8860,2 @@
 +                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
 +                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
-@@ -8033,0 +8861,5 @@
+@@ -8033,0 +8867,5 @@
 +                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
 +                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
 +                        local keep_xhttp_uuid="$XHTTP_UUID"
 +                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
 +                    fi
-@@ -8062,0 +8895,22 @@
+@@ -8062,0 +8901,22 @@
 +            hysteria2:4)
 +                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +                    HY2_OBFS_PASSWORD=""
@@ -1334,10 +1351,10 @@
 +                elif apply_hy2_hop_range "$new_hop"; then
 +                    changed=true
 +                fi ;;
-@@ -8087 +8941 @@
+@@ -8087 +8947 @@
 -        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
 +        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
-@@ -8133,0 +8988,7 @@
+@@ -8133,0 +8994,7 @@
 +    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
 +    hy2_hop_remove
 +    # 移除服务沙箱加固的 drop-in 与跳过标记
@@ -1345,7 +1362,7 @@
 +    service_hardening_remove "$SINGBOX_SERVICE"
 +    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 +
-@@ -8208,0 +9070,10 @@
+@@ -8208,0 +9076,10 @@
 +    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
 +    # 节点本身是可用的，只是应该尽快更新。
 +    local gap_name gap_installed gap_baseline gap_command
@@ -1356,7 +1373,7 @@
 +        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
 +    done < <(core_baseline_gaps)
 +
-@@ -8541,0 +9413,662 @@
+@@ -8541,0 +9419,662 @@
 +# ============== 协议可选增强 ==============
 +#
 +# 安装节点时的可选增强项（后量子、Hysteria2 加固）集中在这里：它们默认关闭，各自对
@@ -2019,7 +2036,7 @@
 +    read -rp "$(msg menu_press_enter)"
 +}
 +
-@@ -8594,0 +10128,46 @@
+@@ -8594,0 +10134,46 @@
 +# WARP 由第三方脚本（fscarmen/warp）安装，它以 root 运行并会自行下载二进制。
 +# 我们无法替它做完整性背书，能做的是让这次执行可审计、可固定：
 +#   - 下载到 mktemp 创建的私有文件，而不是可预测的 /tmp 路径；
@@ -2066,7 +2083,7 @@
 +    return "$rc"
 +}
 +
-@@ -8598,13 +10177,4 @@
+@@ -8598,13 +10183,4 @@
 -    # Security: Download to temp file with secure options
 -    local tmp_warp="/tmp/warp-menu-$$.sh"
 -    if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
@@ -2084,10 +2101,10 @@
 +        log_info "WARP installed successfully"
 +        write_config
 +        service_restart xray
-@@ -8621,2 +10190,0 @@
+@@ -8621,2 +10196,0 @@
 -    elif [[ -f menu.sh ]]; then
 -        bash menu.sh u
-@@ -8624,6 +10192,2 @@
+@@ -8624,6 +10198,2 @@
 -        # Security: Download to temp file with secure options
 -        local tmp_warp="/tmp/warp-menu-$$.sh"
 -        if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
@@ -2096,7 +2113,7 @@
 -        fi
 +        # 不再执行当前目录下碰巧存在的 menu.sh：工作目录里的文件不是可信来源。
 +        warp_run_script u || true
-@@ -8649,2 +10213,7 @@
+@@ -8649,2 +10219,7 @@
 -        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库
 -        ensure_geodata
 +        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库。数据库没有通过校验时
@@ -2106,26 +2123,26 @@
 +            read -rp "$(msg menu_press_enter)"
 +            return
 +        fi
-@@ -8671 +10240,5 @@
+@@ -8671 +10246,5 @@
 -        ensure_geodata
 +        if ! ensure_geodata; then
 +            echo ""
 +            read -rp "$(msg menu_press_enter)"
 +            return
 +        fi
-@@ -8705 +10278,3 @@
+@@ -8705 +10284,3 @@
 -        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ"
 +        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ  ${YELLOW}$(t2 "[推荐]" "[recommended]")${NC}"
 +        menu_note "$(t2 "换用 BBR 拥塞控制，丢包线路上吞吐更稳；对绝大多数 VPS 都是正收益。" \
 +            "Switches to BBR congestion control: steadier throughput on lossy links, a net win on most VPSes.")"
-@@ -8707 +10282,5 @@
+@@ -8707 +10288,5 @@
 -        echo -e "  ${GREEN}3.${NC} Apply TCP optimization"
 +        menu_note "$(t2 "恢复系统默认算法；仅在 BBR 表现异常时使用。" \
 +            "Back to the system default; only when BBR misbehaves.")"
 +        echo -e "  ${GREEN}3.${NC} Apply TCP/UDP optimization"
 +        menu_note "$(t2 "放大收发缓冲区（对高带宽线路和 Hysteria2 有帮助），不改变上面的算法选择。" \
 +            "Raises socket buffers (helps high-bandwidth links and Hysteria2) without changing the algorithm above.")"
-@@ -8749,0 +10329,35 @@
+@@ -8749,0 +10335,35 @@
 +# 网络调优模板。保留当前的拥塞控制与队列规则，只调缓冲区与几个通用开关：
 +#   - 缓冲区上限 32MB：高带宽长距离链路上 TCP 窗口与 QUIC（Hysteria2）收发都受它限制；
 +#   - udp_rmem_min / udp_wmem_min：给每个 UDP socket 一个不至于在突发时丢包的下限；
@@ -2161,7 +2178,7 @@
 +    sysctl --system >/dev/null 2>&1 || true
 +}
 +
-@@ -8752,17 +10366,6 @@
+@@ -8752,17 +10372,6 @@
 -    log_info "Applying TCP optimization..."
 -    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 -    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -2185,7 +2202,7 @@
 +    else
 +        log_error "Failed to write $SYSCTL_TUNING_FILE"
 +    fi
-@@ -10277,0 +11881,118 @@
+@@ -10277,0 +11887,118 @@
 +# ============== 服务沙箱加固 ==============
 +#
 +# Xray 与 sing-box 以 root 运行，却只需要绑定端口和操作网络。加固通过 systemd drop-in
@@ -2304,23 +2321,23 @@
 +    return 2
 +}
 +
-@@ -10784,0 +12506 @@
+@@ -10784,0 +12512 @@
 +        echo -e "  ${GREEN}11.${NC} sing-box $(t2 "版本 / 更新" "Version / Update")"
-@@ -10791 +12513 @@
+@@ -10791 +12519 @@
 -        echo -n "  $(msg menu_choice) [0-10]: "
 +        echo -n "  $(msg menu_choice) [0-11]: "
-@@ -10803,0 +12526 @@
+@@ -10803,0 +12532 @@
 +            11) cmd_singbox_release_menu ;;
-@@ -10982,0 +12706,2 @@
+@@ -10982,0 +12712,2 @@
 +    echo "  singbox-version  Show installed/stable sing-box versions and the security baseline"
 +    echo "  singbox-update   Update sing-box with SHA-256 verification, config check and rollback"
-@@ -11037,0 +12763,5 @@
+@@ -11037,0 +12769,5 @@
 +    echo "sing-box release management:"
 +    echo "  SINGBOX_VERSION=v1.14.4         Install an explicit sing-box version with singbox-update"
 +    echo "  SINGBOX_SHA256=<hex>            Expected archive digest when the release metadata has none"
 +    echo "  SINGBOX_BACKUP_KEEP=3           Number of script-created binary backups to keep"
 +    echo ""
-@@ -11206,0 +12937,7 @@
+@@ -11206,0 +12943,7 @@
 +        ;;
 +    singbox-version)
 +        cmd_singbox_version

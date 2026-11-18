@@ -8722,13 +8722,14 @@ cmd_remove() {
 }
 
 # 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
-cmd_edit() {
-    select_node || return 1
+# 把 CURRENT_NODE_NAME 指向的节点完整装入全局变量，供"修改后再 save_env"的流程使用。
+# safe_load 不含 padding；敏感值在这里解密，save_env 重存时才能正确再加密（明文配置下
+# 为 no-op）。节点编辑与升级向导共用这一份，避免两处各自维护字段清单。
+load_node_for_edit() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    safe_load_node_config "$node_file"
+    safe_load_node_config "$node_file" || return 1
 
-    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
     UUID=$(decrypt_value "$UUID")
     PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
@@ -8740,6 +8741,11 @@ cmd_edit() {
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
     VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
     HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+}
+
+cmd_edit() {
+    select_node || return 1
+    load_node_for_edit || return 1
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -12965,7 +12971,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=527158 body-sha256=c055bad29f0233482fc225170f88f08951d1d7f3f3cffd8992071686dc6ec1db
-# build-id=c055bad29f0233482fc225170f88f08951d1d7f3f3cffd8992071686dc6ec1db
+# body-bytes=527443 body-sha256=c4740b0ef57ae882149813c578647f1a023aea4d69ffa45a52ffc047983d4a3f
+# build-id=c4740b0ef57ae882149813c578647f1a023aea4d69ffa45a52ffc047983d4a3f
 # module-count=11
 # proxy-hub-bundle-end-v1
