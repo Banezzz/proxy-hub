@@ -80,7 +80,7 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
-        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list
+        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed
         n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
         n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
@@ -117,6 +117,15 @@ write_config() {
         # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
         if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
             continue
+        fi
+
+        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
+        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
+        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
+        if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
+            log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
+            return 1
         fi
 
         # 跳过无效节点（VLESS 需要 UUID，Shadowsocks 需要密码）
@@ -164,7 +173,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -192,7 +201,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -475,8 +484,10 @@ save_env() {
     local save_hy2_password="${HY2_PASSWORD:-}"
     local save_xhttp_uuid="${XHTTP_UUID:-}"
     local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
+    local save_mldsa65_seed="${MLDSA65_SEED:-}"
 
     if is_encryption_enabled; then
+        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
         save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
         save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
         # encrypt_value 对空串直接返回空串，因此无需额外判空。
@@ -506,6 +517,8 @@ XHTTP_UUID=$save_xhttp_uuid
 XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
 XHTTP_PRIVATE_KEY=$save_xhttp_private_key
 XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
+MLDSA65_SEED=$save_mldsa65_seed
+MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
@@ -538,7 +551,14 @@ get_vision_link() {
         ip_formatted="[$ip]"
     fi
 
-    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
+    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
+}
+
+# VLESS 分享链接里的后量子参数。pqv 对应客户端的 mldsa65Verify（分享链接标准
+# XTLS/Xray-core discussion #716），值是 base64url，无需转义。
+vless_link_pq_params() {
+    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
+    return 0
 }
 
 # 生成 XHTTP 分享链接
@@ -563,7 +583,73 @@ get_xhttp_link() {
         link_pbk="$XHTTP_PUBLIC_KEY"
         link_sid="${XHTTP_SHORT_ID:-}"
     fi
-    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}#${node_label}"
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
+}
+
+# ---- 后量子增强（可选） ----
+
+# REALITY 目标在握手中返回的证书链总字节数。ML-DSA-65 签名约 3309 字节，以证书扩展
+# 的形式附加；Xray 文档要求目标返回的证书必须长于 3500 字节，否则放不下。
+# Usage: reality_target_cert_bytes DOMAIN   -> 字节数（探测失败为 0）
+reality_target_cert_bytes() {
+    local domain="$1" family_flag
+    local -a family=()
+    family_flag=$(netstack_openssl_family)
+    [[ -n "$family_flag" ]] && family=("$family_flag")
+    timeout 5 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" \
+        -servername "$domain" -showcerts </dev/null 2>/dev/null | awk '
+            /-----BEGIN CERTIFICATE-----/ { inside = 1; next }
+            /-----END CERTIFICATE-----/ { inside = 0; next }
+            inside { chars += length($0) }
+            END { print int(chars * 3 / 4) }'
+}
+
+# 生成 ML-DSA-65 密钥对：MLDSA65_SEED 留在服务端，MLDSA65_VERIFY 发给客户端。
+gen_mldsa65_keys() {
+    local out seed verify
+    out=$("$XRAY_BIN" mldsa65 2>/dev/null | tr -d '\r') || return 1
+    seed=$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<<"$out")
+    verify=$(awk -F': *' '$1 == "Verify" { print $2; exit }' <<<"$out")
+    [[ "$seed" =~ ^[A-Za-z0-9_-]{40,}$ && "$verify" =~ ^[A-Za-z0-9_-]{1000,}$ ]] || return 1
+    MLDSA65_SEED="$seed"
+    MLDSA65_VERIFY="$verify"
+}
+
+# 布尔型环境变量：true/1/y/yes/on 视为启用。
+env_flag_enabled() {
+    case "${1,,}" in
+        true|1|y|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+# 为当前正在安装的 VLESS + REALITY 节点应用可选的后量子增强。
+#   mldsa65=true   REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
+# 默认全部关闭：它们都要求较新的客户端，旧客户端导入带这些参数的链接会连不上。
+# 条件不满足（核心不支持、目标证书太短）时告警并跳过，不让整次安装失败。
+configure_pq_options() {
+    MLDSA65_SEED=""
+    MLDSA65_VERIFY=""
+    env_flag_enabled "${mldsa65:-}" || return 0
+
+    if ! xray_supports mldsa65; then
+        log_warn "$(t2 "当前 Xray 不支持 ML-DSA-65，已跳过（可先执行 xray-update）" \
+            "This Xray does not support ML-DSA-65; skipped (run xray-update first)")"
+        return 0
+    fi
+    local chain_bytes
+    chain_bytes=$(reality_target_cert_bytes "$SNI")
+    if [[ ! "$chain_bytes" =~ ^[0-9]+$ ]] || (( chain_bytes <= 3500 )); then
+        log_warn "$(t2 "目标 $SNI 返回的证书只有 ${chain_bytes:-0} 字节（需大于 3500），放不下 ML-DSA-65 签名，已跳过" \
+            "Target $SNI returned only ${chain_bytes:-0} certificate bytes (more than 3500 required); ML-DSA-65 skipped")"
+        return 0
+    fi
+    if ! gen_mldsa65_keys; then
+        log_error "$(t2 "生成 ML-DSA-65 密钥失败" "Failed to generate ML-DSA-65 keys")"
+        return 1
+    fi
+    log_info "$(t2 "已启用 REALITY ML-DSA-65（目标证书 ${chain_bytes} 字节）" \
+        "REALITY ML-DSA-65 enabled (target certificate: ${chain_bytes} bytes)")"
 }
 
 # 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
@@ -774,7 +860,13 @@ show_qrcode() {
     echo -e "${GREEN}                    $(msg qr_title)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    qrencode -t ANSIUTF8 "$link"
+    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
+    if (( ${#link} > 1200 )); then
+        echo -e "  ${YELLOW}$(t2 "链接过长（${#link} 字符），不生成二维码，请复制下方链接导入" \
+            "The link is too long for a scannable QR code (${#link} characters); copy the link below instead")${NC}"
+    else
+        qrencode -t ANSIUTF8 "$link"
+    fi
     echo ""
     echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
     echo -e "${GREEN}$(msg share_link):${NC}"
@@ -964,6 +1056,9 @@ show_info() {
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
         show_extra_short_ids
+        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
+            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
+        fi
         if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
             echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
             echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"

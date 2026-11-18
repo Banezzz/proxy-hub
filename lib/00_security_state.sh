@@ -400,6 +400,7 @@ reset_node_state() {
     PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
     XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
+    MLDSA65_SEED="" MLDSA65_VERIFY=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
@@ -442,6 +443,8 @@ safe_load_node_config() {
     XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
     XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
     XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
+    MLDSA65_SEED=$(safe_read_config_value "$file" "MLDSA65_SEED")
+    MLDSA65_VERIFY=$(safe_read_config_value "$file" "MLDSA65_VERIFY")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -675,8 +678,9 @@ reality_short_id_list() {
 }
 
 # Build Vision inbound JSON using jq (prevents injection)
-# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED]
 #   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
+#   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -684,6 +688,7 @@ build_vision_inbound() {
     local sni="$4"
     local private_key="$5"
     local short_id="$6"
+    local mldsa65_seed="${7:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -698,6 +703,7 @@ build_vision_inbound() {
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -719,11 +725,11 @@ build_vision_inbound() {
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build XHTTP inbound JSON using jq (prevents injection)
-# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED]
 build_xhttp_inbound() {
     local name="$1"
     local port="$2"
@@ -732,6 +738,7 @@ build_xhttp_inbound() {
     local private_key="$5"
     local short_id="$6"
     local xhttp_path="$7"
+    local mldsa65_seed="${8:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -747,6 +754,7 @@ build_xhttp_inbound() {
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -769,7 +777,7 @@ build_xhttp_inbound() {
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build Shadowsocks inbound JSON using jq (prevents injection)

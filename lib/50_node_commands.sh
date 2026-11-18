@@ -284,6 +284,7 @@ cmd_install() {
         if [[ "$PROTOCOL_TYPE" == "both" ]]; then
             gen_xhttp_credentials || return 1
         fi
+        configure_pq_options || return 1
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -612,6 +613,7 @@ cmd_edit() {
     HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
     XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
     XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
+    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false

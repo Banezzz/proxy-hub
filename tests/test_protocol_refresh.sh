@@ -661,4 +661,116 @@ if use_real_xray; then
 fi
 SCENARIO
 
+# Optional REALITY ML-DSA-65: off by default, gated on the core's capability and
+# on the size of the certificate the target returns.
+run_scenario reality-mldsa65 <<'SCENARIO'
+load_modules
+VERIFY=$(head -c 1952 /dev/zero | base64 -w0 | tr '+/' '-_' | tr -d '=')
+cat >/srv/bin/xray-pq <<XRAY
+#!/bin/sh
+case "\$1" in
+  help) printf '\tmldsa65   ML-DSA-65\n\tvlessenc  VLESS Encryption\n' ;;
+  mldsa65) printf 'Seed: M5gqgH8WoND6770YRg-JDO2qwuGr5vhLgbJBg4xOwMA\nVerify: %s\n' "$VERIFY" ;;
+esac
+XRAY
+chmod 755 /srv/bin/xray-pq
+make_fake_xray /srv/bin/xray-old
+CHAIN_BYTES=4200
+reality_target_cert_bytes() { printf '%s\n' "$CHAIN_BYTES"; }
+SNI=edge.example.com
+
+# Default: nothing is generated and nothing is probed.
+XRAY_BIN=/srv/bin/xray-pq
+XRAY_CAPS=""
+configure_pq_options
+assert_eq "/" "$MLDSA65_SEED/$MLDSA65_VERIFY" "ML-DSA-65 must stay off unless requested"
+
+mldsa65=true configure_pq_options 2>/dev/null
+assert_eq "M5gqgH8WoND6770YRg-JDO2qwuGr5vhLgbJBg4xOwMA" "$MLDSA65_SEED" "the seed must be captured"
+assert_eq "$VERIFY" "$MLDSA65_VERIFY" "the verify key must be captured"
+
+# A target whose certificate is too small cannot carry the signature.
+CHAIN_BYTES=2900
+mldsa65=1 configure_pq_options 2>/srv/pq.warn
+assert_eq "" "$MLDSA65_SEED" "a short target certificate must disable ML-DSA-65"
+assert_contains "$(cat /srv/pq.warn)" "2900 certificate bytes" "the skip must state the measured size"
+CHAIN_BYTES=0
+mldsa65=yes configure_pq_options 2>/dev/null
+assert_eq "" "$MLDSA65_SEED" "an unmeasurable target must disable ML-DSA-65"
+CHAIN_BYTES=4200
+
+# A core without the command skips with a warning instead of failing the install.
+XRAY_BIN=/srv/bin/xray-old
+XRAY_CAPS=""
+mldsa65=true configure_pq_options 2>/srv/pq.warn
+assert_contains "$(cat /srv/pq.warn)" "does not support ML-DSA-65" "an old core must explain the skip"
+assert_eq "" "$MLDSA65_SEED" "an old core must not enable ML-DSA-65"
+
+# Rendering.
+XRAY_BIN=/srv/bin/xray-pq
+XRAY_CAPS=""
+write_node pq both "MLDSA65_SEED=M5gqgH8WoND6770YRg-JDO2qwuGr5vhLgbJBg4xOwMA" "MLDSA65_VERIFY=$VERIFY"
+write_node plain vision
+write_config
+for tag in pq_vision pq_xhttp; do
+    assert_eq "M5gqgH8WoND6770YRg-JDO2qwuGr5vhLgbJBg4xOwMA" \
+        "$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.realitySettings.mldsa65Seed" "$XRAY_CONF")" \
+        "$tag must carry the seed"
+done
+assert_eq "null" \
+    "$(jq -r '.inbounds[] | select(.tag == "plain_vision") | .streamSettings.realitySettings.mldsa65Seed' "$XRAY_CONF")" \
+    "a node without ML-DSA-65 must not gain the field"
+
+CURRENT_NODE_NAME=pq
+safe_load_node_config "$NODES_DIR/pq.env"
+vlink=$(get_vision_link 203.0.113.10 v)
+assert_contains "$vlink" "&pqv=${VERIFY}&type=tcp#v" "the Vision link must carry pqv"
+assert_contains "$(get_xhttp_link 203.0.113.10 x)" "&pqv=${VERIFY}#x" "the XHTTP link must carry pqv"
+assert_not_contains "$vlink" "M5gqgH8WoND" "the seed is a server secret and must never enter a link"
+assert_contains "$(show_info)" "ML-DSA-65" "node info must mention ML-DSA-65"
+CURRENT_NODE_NAME=plain
+safe_load_node_config "$NODES_DIR/plain.env"
+assert_not_contains "$(get_vision_link 203.0.113.10 v)" "pqv=" "ordinary nodes have no pqv"
+
+# Long links are not turned into an unscannable QR code.
+qrencode() { fail_case "qrencode ran for a link that is too long to scan"; }
+assert_contains "$(show_qrcode "$vlink")" "too long for a scannable QR code" "long links must skip the QR code"
+qrencode() { printf 'QR-RENDERED\n'; }
+assert_contains "$(show_qrcode "vless://short")" "QR-RENDERED" "ordinary links still render a QR code"
+
+# An enabled node on a core that lost the capability must fail, not degrade.
+XRAY_BIN=/srv/bin/xray-old
+XRAY_CAPS=""
+rc=0
+write_config 2>/srv/mldsa.err || rc=$?
+assert_eq "1" "$rc" "rendering an ML-DSA-65 node on an unsupporting core must fail"
+assert_contains "$(cat /srv/mldsa.err)" "run xray-update first" "the failure must say how to fix it"
+
+# Certificate-chain measurement.
+unset -f reality_target_cert_bytes
+source /mnt/lib/40_config_share.sh
+cat >/srv/bin/openssl <<'FAKE'
+#!/bin/sh
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=' '-----END CERTIFICATE-----' \
+    'noise' '-----BEGIN CERTIFICATE-----' 'QUJDRA==' '-----END CERTIFICATE-----'
+FAKE
+chmod 755 /srv/bin/openssl
+PATH="/srv/bin:$PATH"
+assert_eq "33" "$(reality_target_cert_bytes edge.example.com)" "chain size sums every certificate in the handshake"
+
+if use_real_xray; then
+    reset_node_state
+    gen_mldsa65_keys || fail_case "the real core did not produce ML-DSA-65 keys"
+    [[ ${#MLDSA65_VERIFY} -gt 2000 ]] || fail_case "unexpected verify key length: ${#MLDSA65_VERIFY}"
+    write_node realpq both "MLDSA65_SEED=$MLDSA65_SEED" "MLDSA65_VERIFY=$MLDSA65_VERIFY"
+    write_config
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+        cat /srv/xray-test.out >&2
+        fail_case "the real core rejected the ML-DSA-65 config"
+    }
+    assert_eq "$MLDSA65_VERIFY" "$(safe_read_config_value "$NODES_DIR/realpq.env" MLDSA65_VERIFY)" \
+        "a real verify key must survive the node-file reader"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
