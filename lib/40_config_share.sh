@@ -59,6 +59,10 @@ write_config() {
     # 构建 inbounds 数组
     local inbounds_json="[]"
 
+    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
+    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
+    xray_probe_capabilities
+
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 

@@ -601,6 +601,62 @@ netstack_openssl_family() {
     esac
 }
 
+# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
+# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
+# Usage: t2 "中文" "English"
+t2() {
+    if [[ "${CURRENT_LANG:-zh}" == "en" ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ============== 内核能力探测 ==============
+#
+# 普通 `install` 发现健康的既有 Xray 时只报告版本、不升级，因此渲染配置时不能假设
+# binary 认识新字段：旧 binary 会在 `xray -test` 阶段拒绝配置，把一次装节点变成安装
+# 失败。这里用 `xray help` 列出的子命令判断能力，而不是比较版本号——子命令是否存在
+# 是 binary 自己的陈述，不依赖我们对发布历史的记忆。
+#   mldsa65  -> REALITY ML-DSA-65 签名；该命令晚于 `target` 别名出现，因此同时用来
+#               判定 `realitySettings.target` 可用
+#   vlessenc -> VLESS Encryption（mlkem768x25519plus）
+# binary 不存在或无法执行时所有能力都按"不支持"处理，产物退回旧写法。
+XRAY_CAPS=""
+XRAY_CAPS_KEY=""
+
+xray_probe_capabilities() {
+    local key="" out="" caps="probed"
+    if [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]]; then
+        key=$(stat -c '%i:%s:%Y' "$XRAY_BIN" 2>/dev/null) || key=""
+    fi
+    if [[ -n "$XRAY_CAPS" && "$key" == "$XRAY_CAPS_KEY" ]]; then
+        return 0
+    fi
+    if [[ -n "$key" ]]; then
+        out=$(timeout 10 "$XRAY_BIN" help 2>/dev/null </dev/null) || out=""
+        [[ "$out" =~ (^|[[:space:]])mldsa65([[:space:]]|$) ]] && caps+=" mldsa65 target"
+        [[ "$out" =~ (^|[[:space:]])vlessenc([[:space:]]|$) ]] && caps+=" vlessenc"
+    fi
+    XRAY_CAPS="$caps"
+    XRAY_CAPS_KEY="$key"
+}
+
+# Usage: xray_supports mldsa65|vlessenc|target
+xray_supports() {
+    xray_probe_capabilities
+    [[ " $XRAY_CAPS " == *" $1 "* ]]
+}
+
+# REALITY 伪装目标的字段名。`dest` 是旧名，新版核心以 `target` 为正式名并保留别名。
+xray_reality_target_key() {
+    if xray_supports target; then
+        printf '%s' target
+    else
+        printf '%s' dest
+    fi
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
 # Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
 build_vision_inbound() {
@@ -623,6 +679,7 @@ build_vision_inbound() {
         --arg short_id "$short_id" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -637,11 +694,10 @@ build_vision_inbound() {
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": [$short_id]
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -672,6 +728,7 @@ build_xhttp_inbound() {
         --arg path "$xhttp_path" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -687,11 +744,10 @@ build_xhttp_inbound() {
                 "xhttpSettings": {"path": $path},
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": [$short_id]
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -6476,6 +6532,10 @@ write_config() {
     # 构建 inbounds 数组
     local inbounds_json="[]"
 
+    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
+    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
+    xray_probe_capabilities
+
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 
@@ -11228,7 +11288,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=436167 body-sha256=fd926be89ee97c5386af0ab14d5c7eee1d8965aa8b13d2d8643441bf2d2f4125
-# build-id=fd926be89ee97c5386af0ab14d5c7eee1d8965aa8b13d2d8643441bf2d2f4125
+# body-bytes=438611 body-sha256=ca471a57ac497dbdf55a428bfebc4130471395805cc61a95e967f83939866d61
+# build-id=ca471a57ac497dbdf55a428bfebc4130471395805cc61a95e967f83939866d61
 # module-count=11
 # proxy-hub-bundle-end-v1
