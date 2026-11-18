@@ -2262,4 +2262,88 @@ assert_eq "hx_hysteria2" "$(jq -r '[.inbounds[].tag] | join(" ")' "$XRAY_CONF")"
     "the Xray config is rebuilt without the failed node"
 SCENARIO
 
+# Real interop on loopback: the configs the builders render are started with
+# the real cores and a real sing-box client connects to them.  A case passes
+# when the server logs the proxied request.  Runs only when both real cores
+# are provided; nothing here is stubbed.
+run_scenario hysteria2-interop <<'SCENARIO'
+load_modules
+if ! use_real_xray || ! use_real_singbox; then
+    printf 'skipped: needs PROXY_HUB_TEST_XRAY_BIN and PROXY_HUB_TEST_SINGBOX_BIN\n'
+    exit 0
+fi
+CLIENT_BIN="$SINGBOX_BIN"
+SERVER_PID="" CLIENT_PID=""
+stop_pair() {
+    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
+    [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" 2>/dev/null
+    wait 2>/dev/null || true
+    SERVER_PID="" CLIENT_PID=""
+}
+trap stop_pair EXIT
+
+# Usage: probe CORE CLIENT_EXTRA_JSON CLIENT_PASSWORD -> prints OK or FAIL
+probe() {
+    local core="$1" extra="$2" password="$3" pattern attempt
+    jq -n --arg pw "$password" --argjson extra "{${extra}}" '
+        {log: {level: "error"},
+         inbounds: [{type: "mixed", listen: "127.0.0.1", listen_port: 11080}],
+         outbounds: [({type: "hysteria2", tag: "hy", server: "127.0.0.1", server_port: 1443, password: $pw,
+                       tls: {enabled: true, server_name: "edge.example.com", insecure: true}} + $extra)]}' >/srv/client.json
+    : >/srv/server.log
+    if [[ "$core" == "xray" ]]; then
+        jq '.log.loglevel = "info"' "$XRAY_CONF" >/srv/server.json
+        "$XRAY_BIN" run -config /srv/server.json >/srv/server.log 2>&1 &
+        pattern='accepted tcp:127.0.0.1:9'
+    else
+        jq '.log.level = "info"' "$SINGBOX_CONF" >/srv/server.json
+        "$SINGBOX_BIN" run -c /srv/server.json >/srv/server.log 2>&1 &
+        pattern='inbound connection to 127.0.0.1:9'
+    fi
+    SERVER_PID=$!
+    "$CLIENT_BIN" run -c /srv/client.json >/srv/client.log 2>&1 &
+    CLIENT_PID=$!
+    for attempt in 1 2 3 4 5 6 7 8; do
+        curl -sS -m 2 --noproxy '' -x socks5h://127.0.0.1:11080 http://127.0.0.1:9/ >/dev/null 2>&1 || true
+        if grep -q "$pattern" /srv/server.log; then
+            stop_pair
+            printf 'OK'
+            return 0
+        fi
+        command sleep 0.4
+    done
+    stop_pair
+    printf 'FAIL'
+}
+OBFS='"obfs":{"type":"salamander","password":"Chosen.Obfs-Pass_1"}'
+
+# The harness itself: with no Hysteria2 node there is nothing to connect to.
+write_node tcp vision
+write_config
+assert_eq "FAIL" "$(probe xray "" SafeHy2Password)" "without a Hysteria2 inbound nothing may be accepted"
+unlink "$NODES_DIR/tcp.env"
+
+for core in xray singbox; do
+    core_field="HY2_CORE="
+    [[ "$core" == xray ]] && core_field="HY2_CORE=xray"
+
+    write_node hy hysteria2 "$core_field"
+    gen_selfsigned_cert hy edge.example.com
+    write_config
+    write_singbox_config
+    assert_eq "OK" "$(probe "$core" "" SafeHy2Password)" "[$core] a plain node accepts its client"
+    assert_eq "FAIL" "$(probe "$core" "" WrongPassword)" "[$core] a wrong password is refused"
+    assert_eq "FAIL" "$(probe "$core" "$OBFS" SafeHy2Password)" "[$core] a client with obfs cannot reach a plain node"
+
+    write_node hy hysteria2 "$core_field" "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+    write_config
+    write_singbox_config
+    assert_eq "OK" "$(probe "$core" "$OBFS" SafeHy2Password)" "[$core] Salamander works with the matching password"
+    assert_eq "FAIL" "$(probe "$core" "" SafeHy2Password)" "[$core] a client without obfs cannot reach an obfuscated node"
+    assert_eq "FAIL" "$(probe "$core" '"obfs":{"type":"salamander","password":"Other.Pass_99"}' SafeHy2Password)" \
+        "[$core] a wrong obfs password is refused"
+done
+printf 'interop: 13 probes against real cores\n'
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
