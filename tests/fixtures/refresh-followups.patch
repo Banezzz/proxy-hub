@@ -84,62 +84,10 @@
 +        }'
 +}
 +
-@@ -1132 +1207,4 @@
--    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
-+    # -A 让 base64 输出保持单行。只用 -a 时 openssl 每 64 个字符换一行，而节点文件
-+    # 是逐行的 KEY=VALUE：UUID 或 REALITY 私钥的密文都超过一行，第二行会在写入后
-+    # 丢失，节点从此读不出来。
-+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:$key" 2>/dev/null
-@@ -1134,0 +1213,10 @@
-+# 解密一个节点字段。未加密的值原样返回（向后兼容）。
-+#
-+# 看起来是密文却解不开时输出空串并告警，而不是把密文当成明文交出去：调用方都把
-+# 结果直接用作 UUID、私钥或密码，把一段 base64 密文写进内核配置只会得到一个永远
-+# 连不上、又看不出原因的节点。典型的解不开的情况：旧版本写出的多行密文只剩
-+# 第一行，或密钥文件已被替换。
-+#
-+# 始终返回 0。调用点大多是 `set -e` 下的裸赋值 `x=$(decrypt_value ...)`，返回非零
-+# 会让整个脚本在没有上下文的位置退出；需要区分"解密失败"的调用方（会把结果重新
-+# 存盘的那些）用 decrypt_into，它据"密文非空而明文为空"判断。
-@@ -1136 +1224 @@
--    local ciphertext="$1"
-+    local ciphertext="$1" key plaintext
-@@ -1146 +1234,5 @@
--    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
-+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-+        log_warn "$(t2 "发现加密的配置值，但密钥文件不存在，无法解密" \
-+            "Found an encrypted config value but the key file is missing; cannot decrypt")"
-+        return 0
-+    fi
-@@ -1148 +1239,0 @@
--    local key
-@@ -1149,0 +1241,9 @@
-+    if plaintext=$(printf '%s\n' "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:$key" 2>/dev/null) \
-+        && [[ -n "$plaintext" ]]; then
-+        printf '%s\n' "$plaintext"
-+        return 0
-+    fi
-+    log_warn "$(t2 "配置值解密失败（密文不完整或密钥不匹配），该值按空处理" \
-+        "Could not decrypt a config value (truncated ciphertext or wrong key); treating it as empty")"
-+    return 0
-+}
-@@ -1151 +1251,11 @@
--    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
-+# 就地解密一个全局变量；密文解不开时返回非零且不改动该变量。
-+# 用于"读入 → 修改 → save_env 重存"的流程：那里把解密失败当成空值继续，会在重存时
-+# 用空值覆盖掉节点文件里仅存的密文。
-+# Usage: decrypt_into VARIABLE_NAME
-+decrypt_into() {
-+    local __dec_name="$1" __dec_cipher="${!1:-}" __dec_plain
-+    __dec_plain=$(decrypt_value "$__dec_cipher" 2>/dev/null)
-+    if [[ -n "$__dec_cipher" && -z "$__dec_plain" ]]; then
-+        return 1
-+    fi
-+    printf -v "$__dec_name" '%s' "$__dec_plain"
-@@ -4920,0 +5031,2 @@
+@@ -4947,0 +5023,2 @@
 +# Hysteria2 节点也可以由 Xray 承载，那时规则要随 xray 服务启动重新下发。
 +HY2_HOP_DROPIN_XRAY="/etc/systemd/system/xray.service.d/20-proxy-hub-hy2-hop.conf"
-@@ -4988,5 +5100,8 @@
+@@ -5015,5 +5092,8 @@
 -    if [[ -e "$HY2_HOP_DROPIN" ]]; then
 -        rm -f -- "$HY2_HOP_DROPIN"
 -        rmdir -- "$(dirname "$HY2_HOP_DROPIN")" 2>/dev/null || true
@@ -153,7 +101,7 @@
 +        removed=1
 +    done
 +    (( removed == 1 )) && { systemctl daemon-reload 2>/dev/null || true; }
-@@ -5056,3 +5171,8 @@
+@@ -5083,3 +5163,8 @@
 -        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
 -        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
 -            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
@@ -165,20 +113,20 @@
 +            printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
 +                "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$hop_dropin" || return 1
 +        done
-@@ -6177,4 +6297 @@
+@@ -6204,4 +6289 @@
 -        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
 -        case "$t" in
 -            anytls|anytls_reality|hysteria2) ((count++)) ;;
 -        esac
 +        [[ "$(node_file_core "$f")" == "singbox" ]] && ((++count))
-@@ -6190,5 +6307 @@
+@@ -6217,5 +6299 @@
 -        t=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
 -        case "$t" in
 -            anytls|anytls_reality|hysteria2) ;;
 -            *) ((count++)) ;;
 -        esac
 +        [[ "$(node_file_core "$f")" == "xray" ]] && ((++count))
-@@ -7096,2 +7209,27 @@
+@@ -7126,2 +7204,29 @@
 -        # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
 -        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
 +        # 由 sing-box 承载的节点（AnyTLS，以及默认情况下的 Hysteria2）在 Xray 配置中跳过
@@ -195,10 +143,12 @@
 +                    "Node '$n_name' runs Hysteria2 on Xray, which needs Xray v26.3.27 or newer; run xray-update first")"
 +                return 1
 +            fi
-+            hy_pw=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_PASSWORD")")
++            hy_pw=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_PASSWORD")" \
++                HY2_PASSWORD "$n_name") || return 1
 +            [[ -z "$hy_pw" ]] && continue
 +            hy_port=$(get_validated_port "$n_port" true) || { log_warn "Invalid Hysteria2 port for node '$n_name', skipping"; continue; }
-+            hy_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
++            hy_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")" \
++                HY2_OBFS_PASSWORD "$n_name") || return 1
 +            hy_sni="${n_sni:-www.bing.com}"
 +            if [[ ! -f "$hy_cert" || ! -f "$hy_key" ]]; then
 +                gen_selfsigned_cert "$n_name" "$hy_sni" || return 1
@@ -208,18 +158,18 @@
 +                return 1
 +            fi
 +            inbounds_json=$(jq --argjson inbound "$hy_inbound" '. += [$inbound]' <<<"$inbounds_json") || return 1
-@@ -7302 +7440 @@
+@@ -7334 +7439 @@
 -        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" || "$n_proto" == "hysteria2" ]] || continue
 +        [[ "$(node_file_core "$node_file")" == "singbox" ]] || continue
-@@ -7549,0 +7688 @@
+@@ -7580,0 +7686 @@
 +HY2_CORE=${HY2_CORE:-}
-@@ -7945 +8084 @@
+@@ -7974 +8080 @@
 -        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
 +        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 ($([[ "${HY2_CORE:-}" == "xray" ]] && echo Xray || echo sing-box))"
-@@ -8126,0 +8266,2 @@
+@@ -8154,0 +8261,2 @@
 +    # 第三个参数是承载该节点的内核；省略时按协议的默认归属判断。
 +    local core="${3:-$(node_core_of "$1" "")}"
-@@ -8133,2 +8274,5 @@
+@@ -8161,2 +8269,5 @@
 -    case "$protocol" in
 -        anytls|anytls_reality|hysteria2)
 +    # 候选节点可能带着端口跳跃范围；节点已删除，这里把 NAT 规则同步回去。
@@ -227,7 +177,7 @@
 +
 +    case "$core" in
 +        singbox)
-@@ -8328 +8472,7 @@
+@@ -8356 +8467,7 @@
 -        install_singbox || { log_error "sing-box 安装失败"; return 1; }
 +        # 后端先定下来，才知道该装哪个内核；默认仍是 sing-box。
 +        resolve_hy2_core || return 1
@@ -236,7 +186,7 @@
 +        else
 +            install_singbox || { log_error "sing-box 安装失败"; return 1; }
 +        fi
-@@ -8419,9 +8569,12 @@
+@@ -8447,9 +8564,12 @@
 -    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
 -        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
 -        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
@@ -258,14 +208,14 @@
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
 +                log_error "Manual recovery may be required"
 +            return 1
-@@ -8428,0 +8582 @@
+@@ -8456,0 +8577 @@
 +    fi
-@@ -8429,0 +8584 @@
+@@ -8457,0 +8579 @@
 +    if [[ "$install_core" == "singbox" ]]; then
-@@ -8433 +8588 @@
+@@ -8461 +8583 @@
 -            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
-@@ -8445 +8600,8 @@
+@@ -8473 +8595,8 @@
 -            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
 +                log_error "Manual recovery may be required for Xray"
@@ -275,44 +225,22 @@
 +        # Xray 承载的 Hysteria2 节点同样需要下发端口跳跃的 NAT 规则。
 +        if [[ "$PROTOCOL_TYPE" == "hysteria2" ]] && ! hy2_hop_sync; then
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
-@@ -8454 +8616 @@
+@@ -8482 +8611 @@
 -            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
-@@ -8463 +8625 @@
+@@ -8491 +8620 @@
 -            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
 +            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
-@@ -8734,10 +8896,11 @@
--    UUID=$(decrypt_value "$UUID")
--    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
--    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
--    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
--    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
--    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
--    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
--    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
--    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
--    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
-+    # 任何一个密文解不开就拒绝继续：调用方随后会 save_env，带着空值重存等于把节点
-+    # 文件里仅存的密文抹掉。
-+    local secret
-+    for secret in UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD \
-+        XHTTP_UUID XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD; do
-+        if ! decrypt_into "$secret"; then
-+            log_error "$(t2 "节点 $CURRENT_NODE_NAME 的 $secret 无法解密，已中止以免覆盖原值" \
-+                "Cannot decrypt $secret of node $CURRENT_NODE_NAME; stopped so the stored value is not overwritten")"
-+            return 1
-+        fi
-+    done
-@@ -8752,0 +8916 @@
+@@ -8771,0 +8901 @@
 +    local core_changed=false
-@@ -8799,0 +8964,3 @@
+@@ -8818,0 +8949,3 @@
 +                echo -e "  ${GREEN}6.${NC} 切换承载内核 / Switch core    ${GRAY}($([[ "$HY2_CORE" == "xray" ]] && echo Xray || echo sing-box))${NC}"
 +                menu_note "$(t2 "sing-box 与 Xray 都能承载 Hysteria2，切换不改变分享链接。机器上只有 Xray 节点时，切到 Xray 可以少维护一个内核。" \
 +                    "Both sing-box and Xray can host Hysteria2 and switching keeps the share link. With only Xray nodes otherwise, Xray means one core less to maintain.")"
-@@ -8808 +8975 @@
+@@ -8827 +8960 @@
 -        echo -n "  选择要修改的项 / Select [0-5]: "
 +        echo -n "  选择要修改的项 / Select [0-6]: "
-@@ -8923,0 +9091,10 @@
+@@ -8942,0 +9076,10 @@
 +            hysteria2:6)
 +                local target_core="xray"
 +                [[ "$HY2_CORE" == "xray" ]] && target_core="singbox"
@@ -323,14 +251,14 @@
 +                    log_info "$(t2 "应用后将由 $target_core 承载" "Will be hosted by $target_core once applied")"
 +                fi ;;
 +
-@@ -8943,0 +9121,6 @@
+@@ -8962,0 +9106,6 @@
 +    # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。与承载内核无关。
 +    if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
 +        rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
 +        gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
 +    fi
 +
-@@ -8945,5 +9128,8 @@
+@@ -8964,5 +9113,8 @@
 -    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
 -        # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
 -        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
@@ -344,14 +272,14 @@
 +        if ! cmd_regenerate; then
 +            log_error "$(t2 "应用失败：切换内核后配置未能生效" "Apply failed: the configuration did not come up after switching cores")"
 +            return 1
-@@ -8950,0 +9137,2 @@
+@@ -8969,0 +9122,2 @@
 +        open_node_firewall_ports "$proto_type"
 +    elif [[ "$(node_core_of "$proto_type" "$HY2_CORE")" == "singbox" ]]; then
-@@ -8960,0 +9149,3 @@
+@@ -8979,0 +9134,3 @@
 +        if [[ "$proto_type" == "hysteria2" ]]; then
 +            hy2_hop_sync || return 1
 +        fi
-@@ -9661,0 +9853,38 @@
+@@ -9680,0 +9838,38 @@
 +# 某个内核能否承载"当前正在配置的" Hysteria2 节点（读取全局的 HY2_DOMAIN /
 +# HY2_HOP_PORTS）。sing-box 没有限制；Xray 有三条：版本够新、不能用 ACME（Xray 不会
 +# 自己签证书）、OpenRC 上不能配端口跳跃（Xray 的 OpenRC 脚本没有重下发规则的钩子）。
@@ -390,14 +318,14 @@
 +    esac
 +}
 +
-@@ -9806,0 +10036,3 @@
+@@ -9825,0 +10021,3 @@
 +
 +    # 选项定下来之后再核对后端：ACME 与（OpenRC 上的）端口跳跃只有 sing-box 支持。
 +    hy2_core_allowed "${HY2_CORE:-singbox}" || return 1
-@@ -12505 +12737 @@
+@@ -12524 +12722 @@
 -# node.<节点名>.<sni|port443|split|vlessenc|hy2obfs|ss>。
 +# node.<节点名>.<sni|port443|shortid|split|vlessenc|hy2obfs|ss>。
-@@ -12660,0 +12893,10 @@
+@@ -12679,0 +12878,10 @@
 +                local short_id
 +                short_id=$(safe_read_config_value "$file" "SHORT_ID")
 +                if [[ -n "$short_id" ]] && (( ${#short_id} < 16 )); then
@@ -408,13 +336,13 @@
 +                        "$(t2 "新 shortId 随机生成。客户端需要重新导入这个节点的链接。" \
 +                            "The new short ID is random. Clients must re-import this node's link.")"
 +                fi
-@@ -12873,0 +13116,5 @@
+@@ -12892,0 +13101,5 @@
 +        shortid)
 +            SHORT_ID=$(openssl rand -hex 8) || return 1
 +            # 已拆分凭据的 both 节点，XHTTP 那一个同样换成满长度。
 +            [[ -n "$XHTTP_SHORT_ID" ]] && (( ${#XHTTP_SHORT_ID} < 16 )) && XHTTP_SHORT_ID=$(openssl rand -hex 8)
 +            ;;
-@@ -13546,0 +13794,9 @@
+@@ -13565,0 +13779,9 @@
 +    echo "  hy2obfs=true  Salamander obfuscation with a random password (or hy2obfs=<password>)"
 +    echo "  hy2hop=auto   Port hopping over a random 200-port UDP range (or hy2hop=START-END)"
 +    echo "  hy2domain=xxx Obtain an ACME certificate for this domain (hy2email=xxx optional)"

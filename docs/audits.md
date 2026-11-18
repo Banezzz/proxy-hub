@@ -184,6 +184,21 @@
   需要扫描服务器的邻近网段，脚本没有做这件事。
 - 临时缓解：自行找到同 ASN 的目标后，用 `reym=` 或 SNI 菜单的"手动输入"指定。
 
+## 可选的配置加密没有完整性校验，密钥经命令行传入
+
+- 严重性：low（仅在启用该未公开选项时）
+- 影响范围：设置了 `ENABLE_CONFIG_ENCRYPTION=true` 且存在
+  `/root/.reality_vision_key` 的安装。
+- 触发条件：密钥文件被换成另一把密钥后读取既有节点；或本机其他用户在加解密的瞬间
+  读取进程参数。
+- 影响：`openssl enc -aes-256-cbc` 不带认证，用错误密钥解密时约每 256 次有 1 次通过
+  padding 检查并返回乱码（实测 300 次中 2 次），这时 `decrypt_value` 无法识别失败。
+  密钥以 `-pass pass:<key>` 传给 openssl，在该进程存活期间出现在
+  `/proc/<pid>/cmdline` 中。另外 `is_encryption_enabled` 要求密钥文件已存在，
+  `setup_encryption_key` 因此不会被触发，密钥需手工生成。
+- 临时缓解：不要更换密钥文件；需要更换时先关闭加密并让每个节点经 `save_env` 重存为
+  明文。多用户主机上挂载 `/proc` 时使用 `hidepid=2`。
+
 ## Xray 承载的 Hysteria2 在 IPv6 上未经验证
 
 - 严重性：low

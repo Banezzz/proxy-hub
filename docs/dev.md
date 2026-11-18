@@ -283,19 +283,6 @@ Hysteria2 默认由 sing-box 承载，也可以由 Xray 的原生入站承载（
   直连而绕过被测链路，要用 `--noproxy ''` 清空该列表。两者都会让"反例也通过"，所以
   每组用例都保留至少一个必须失败的对照。
 
-### 可选的配置加密
-
-`encrypt_value` 曾经用 `openssl enc -a`，其 base64 每 64 字符换行，而节点文件是逐行
-的 `KEY=VALUE`：UUID 和 REALITY 私钥的密文都是两行，第二行在下一次读取时丢失。现在
-加解密都带 `-A`，密文恒为单行。
-
-失败处理有两层，分工不同：`decrypt_value` 对解不开的密文输出空串并告警，但始终返回
-0——它的调用点几乎都是 `set -e` 下的裸赋值，返回非零会让脚本在没有上下文的位置
-退出；渲染路径拿到空值后把该节点当作无效节点处理。会把结果重新存盘的流程
-（`load_node_for_edit`）改用 `decrypt_into`，它据"密文非空而明文为空"报告失败，于是
-编辑与升级向导遇到解不开的字段时中止，而不是带着空值 `save_env`、抹掉节点文件里
-仅存的密文。旧实现在解密失败时把密文原样返回，等于把一段 base64 写进内核配置。
-
 ## 网络栈（IPv4 / IPv6）选择
 
 一个实例级设置（`/root/.proxy_hub_netstack`，取值 `dual`/`v4`/`v6`，默认 `dual`）
@@ -609,8 +596,9 @@ git diff --check
 注明。涉及协议字段的改动应当带着真实内核跑一次——字段名写错在 jq 层面是看不出来的。
 
 协议刷新对历史基线的差异集中在 `tests/fixtures/protocol-refresh.patch` 一个累计补丁
-里，其后的改动记在 `tests/fixtures/refresh-followups.patch`；两者都由 `diff -U0` 对
-"基线加排在它前面的全部补丁"与当前 bundle 正文生成。
+里；其后的配置加密修复记在 `tests/fixtures/config-encryption.patch`，再之后的改动记在
+`tests/fixtures/refresh-followups.patch`。三者都由 `diff -U0` 对"基线加排在它前面的
+全部补丁"与当前 bundle 正文生成，顺序即应用顺序。
 
 构建器与 loader 使用相同的安全临时父目录规则，并在发布 manifest/dist 以及递归
 清理前重新核对 staging 目录的 owner 与 device/inode identity；同路径被替换时
