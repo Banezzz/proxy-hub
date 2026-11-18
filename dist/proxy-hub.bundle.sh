@@ -420,7 +420,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -470,6 +470,7 @@ safe_load_node_config() {
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
+    HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
 
     return 0
 }
@@ -929,7 +930,9 @@ validate_tls_server_name() {
 }
 
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
+#   伪装站点随之失去意义，因此同时去掉 masquerade。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -937,12 +940,14 @@ build_hysteria2_inbound() {
     local sni="$4"
     local cert="$5"
     local key="$6"
+    local obfs_password="${7:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
     [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
         --arg tag "${name}_hysteria2" \
@@ -953,6 +958,7 @@ build_hysteria2_inbound() {
         --arg cert "$cert" \
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
+        --arg obfs_password "$obfs_password" \
         '{
             "type": "hysteria2",
             "tag": $tag,
@@ -970,7 +976,9 @@ build_hysteria2_inbound() {
                 "url": "https://www.bing.com",
                 "rewrite_host": true
             }
-        }'
+        } | if $obfs_password != "" then
+                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
+            else . end'
 }
 
 # Optional encryption for sensitive config values
@@ -5512,6 +5520,37 @@ gen_hy2_password() {
     log_info "Hysteria2 密码已生成"
 }
 
+# ============== Hysteria2 加固选项 ==============
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
+
+# 为当前正在安装的 Hysteria2 节点应用可选加固。
+#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
+configure_hy2_options() {
+    HY2_OBFS_PASSWORD=""
+
+    local obfs_request="${hy2obfs:-}"
+    case "${obfs_request,,}" in
+        ""|false|0|n|no|off) ;;
+        true|1|y|yes|on)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+            ;;
+        *)
+            if [[ ! "$obfs_request" =~ ^[a-zA-Z0-9._-]{8,128}$ ]]; then
+                log_error "$(t2 "hy2obfs 密码需为 8-128 位字母、数字或 ._-" \
+                    "hy2obfs password must be 8-128 characters of letters, digits or ._-")"
+                return 1
+            fi
+            HY2_OBFS_PASSWORD="$obfs_request"
+            ;;
+    esac
+    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
+            "Salamander obfuscation enabled (clients must use the same obfs password)")"
+    fi
+}
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -7055,8 +7094,10 @@ write_singbox_config() {
             if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
+            local n_obfs
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -7193,8 +7234,10 @@ save_env() {
     local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
     local save_mldsa65_seed="${MLDSA65_SEED:-}"
     local save_vless_decryption="${VLESS_DECRYPTION:-}"
+    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
 
     if is_encryption_enabled; then
+        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
         save_vless_decryption=$(encrypt_value "$save_vless_decryption")
         save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
         save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
@@ -7235,6 +7278,7 @@ SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
+HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 ENV
     chmod 600 "$node_file"
 
@@ -7566,6 +7610,7 @@ get_hy2_link() {
     query="sni=${SNI:-www.bing.com}&insecure=1"
     pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
     [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
 
     echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
 }
@@ -7598,6 +7643,7 @@ get_share_link() {
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
@@ -7768,8 +7814,12 @@ show_info() {
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
+        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
+        fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
         echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
         echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
@@ -8143,6 +8193,7 @@ cmd_install() {
             return 1
         fi
         choose_ports || return 1
+        configure_hy2_options || return 1
 
         UUID=""
         PUBLIC_KEY=""
@@ -8543,6 +8594,7 @@ cmd_edit() {
     XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
     VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
+    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -8592,6 +8644,7 @@ cmd_edit() {
                 echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
                 echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -8690,6 +8743,17 @@ cmd_edit() {
             hysteria2:3)
                 unset hy2pwd
                 gen_hy2_password
+                changed=true ;;
+            hysteria2:4)
+                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+                    HY2_OBFS_PASSWORD=""
+                    log_warn "$(t2 "已关闭 Salamander 混淆，客户端需同步去掉混淆设置" \
+                        "Salamander obfuscation disabled; clients must drop their obfs setting")"
+                else
+                    HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+                    log_warn "$(t2 "已启用 Salamander 混淆，客户端需重新导入链接" \
+                        "Salamander obfuscation enabled; clients must re-import the link")"
+                fi
                 changed=true ;;
 
             # ---- AnyTLS padding ----
@@ -11859,7 +11923,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=469123 body-sha256=8efbf600c990ae432b232d3bbac17af64fe8d20baf43012cf3046ee3521541e7
-# build-id=8efbf600c990ae432b232d3bbac17af64fe8d20baf43012cf3046ee3521541e7
+# body-bytes=472635 body-sha256=7df18c976d05a7148e6521e4b5577b8642421ff122e26598109f3259f0b8f547
+# build-id=7df18c976d05a7148e6521e4b5577b8642421ff122e26598109f3259f0b8f547
 # module-count=11
 # proxy-hub-bundle-end-v1

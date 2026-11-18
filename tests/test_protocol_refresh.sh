@@ -877,4 +877,57 @@ if use_real_xray; then
 fi
 SCENARIO
 
+# Hysteria2 Salamander obfuscation: optional, validated, and reflected in the
+# inbound, the share link and the node info.
+run_scenario hysteria2-obfs <<'SCENARIO'
+load_modules
+
+configure_hy2_options
+assert_eq "" "$HY2_OBFS_PASSWORD" "obfuscation must stay off unless requested"
+hy2obfs=true configure_hy2_options 2>/dev/null
+[[ "$HY2_OBFS_PASSWORD" =~ ^[0-9a-f]{32}$ ]] || fail_case "hy2obfs=true must generate a random password"
+hy2obfs=Chosen.Obfs-Pass_1 configure_hy2_options 2>/dev/null
+assert_eq "Chosen.Obfs-Pass_1" "$HY2_OBFS_PASSWORD" "an explicit obfs password must be kept"
+hy2obfs=off configure_hy2_options
+assert_eq "" "$HY2_OBFS_PASSWORD" "a false value leaves obfuscation off"
+for bad in short 'has space' 'semi;colon' 'quote"x12345'; do
+    rc=0
+    ( hy2obfs="$bad" configure_hy2_options 2>/dev/null ) || rc=$?
+    assert_eq "1" "$rc" "obfs password '$bad' must be rejected"
+done
+
+assert_fails "the builder must reject an unsafe obfs password" \
+    build_hysteria2_inbound n 4443 SafeHy2Password edge.example.com /c /k 'bad"pw12345'
+
+write_node obfs hysteria2 "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+write_node clear hysteria2
+gen_selfsigned_cert obfs edge.example.com
+gen_selfsigned_cert clear edge.example.com
+write_singbox_config
+assert_eq '{"type":"salamander","password":"Chosen.Obfs-Pass_1"}' \
+    "$(jq -c '.inbounds[] | select(.tag == "obfs_hysteria2") | .obfs' "$SINGBOX_CONF")" "obfs block"
+assert_eq "null" "$(jq -r '.inbounds[] | select(.tag == "obfs_hysteria2") | .masquerade' "$SINGBOX_CONF")" \
+    "an obfuscated inbound cannot serve an HTTP/3 masquerade"
+assert_eq "null/proxy" \
+    "$(jq -r '.inbounds[] | select(.tag == "clear_hysteria2") | "\(.obfs)/\(.masquerade.type)"' "$SINGBOX_CONF")" \
+    "a node without obfuscation keeps the masquerade and gains no obfs block"
+
+CURRENT_NODE_NAME=obfs
+link=$(get_share_link)
+assert_contains "$link" "&obfs=salamander&obfs-password=Chosen.Obfs-Pass_1#" "the link must carry the obfs settings"
+assert_contains "$link" "pinSHA256=" "obfuscation and certificate pinning combine"
+assert_contains "$(show_info)" "salamander" "node info must show the obfuscation"
+CURRENT_NODE_NAME=clear
+assert_not_contains "$(get_share_link)" "obfs" "an ordinary link has no obfs parameters"
+
+safe_load_node_config "$NODES_DIR/obfs.env"
+save_env
+assert_eq "Chosen.Obfs-Pass_1" "$(safe_read_config_value "$NODES_DIR/obfs.env" HY2_OBFS_PASSWORD)" \
+    "save_env must persist the obfs password"
+
+if use_real_singbox; then
+    write_singbox_config || fail_case "the real sing-box rejected the Salamander config"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

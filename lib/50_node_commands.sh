@@ -215,6 +215,7 @@ cmd_install() {
             return 1
         fi
         choose_ports || return 1
+        configure_hy2_options || return 1
 
         UUID=""
         PUBLIC_KEY=""
@@ -615,6 +616,7 @@ cmd_edit() {
     XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
     VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
+    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -664,6 +666,7 @@ cmd_edit() {
                 echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
                 echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -762,6 +765,17 @@ cmd_edit() {
             hysteria2:3)
                 unset hy2pwd
                 gen_hy2_password
+                changed=true ;;
+            hysteria2:4)
+                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+                    HY2_OBFS_PASSWORD=""
+                    log_warn "$(t2 "已关闭 Salamander 混淆，客户端需同步去掉混淆设置" \
+                        "Salamander obfuscation disabled; clients must drop their obfs setting")"
+                else
+                    HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+                    log_warn "$(t2 "已启用 Salamander 混淆，客户端需重新导入链接" \
+                        "Salamander obfuscation enabled; clients must re-import the link")"
+                fi
                 changed=true ;;
 
             # ---- AnyTLS padding ----

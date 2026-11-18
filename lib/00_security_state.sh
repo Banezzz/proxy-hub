@@ -404,7 +404,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -454,6 +454,7 @@ safe_load_node_config() {
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
+    HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
 
     return 0
 }
@@ -913,7 +914,9 @@ validate_tls_server_name() {
 }
 
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
+#   伪装站点随之失去意义，因此同时去掉 masquerade。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -921,12 +924,14 @@ build_hysteria2_inbound() {
     local sni="$4"
     local cert="$5"
     local key="$6"
+    local obfs_password="${7:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
     [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
         --arg tag "${name}_hysteria2" \
@@ -937,6 +942,7 @@ build_hysteria2_inbound() {
         --arg cert "$cert" \
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
+        --arg obfs_password "$obfs_password" \
         '{
             "type": "hysteria2",
             "tag": $tag,
@@ -954,7 +960,9 @@ build_hysteria2_inbound() {
                 "url": "https://www.bing.com",
                 "rewrite_host": true
             }
-        }'
+        } | if $obfs_password != "" then
+                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
+            else . end'
 }
 
 # Optional encryption for sensitive config values

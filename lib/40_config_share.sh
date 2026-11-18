@@ -356,8 +356,10 @@ write_singbox_config() {
             if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
+            local n_obfs
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -494,8 +496,10 @@ save_env() {
     local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
     local save_mldsa65_seed="${MLDSA65_SEED:-}"
     local save_vless_decryption="${VLESS_DECRYPTION:-}"
+    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
 
     if is_encryption_enabled; then
+        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
         save_vless_decryption=$(encrypt_value "$save_vless_decryption")
         save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
         save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
@@ -536,6 +540,7 @@ SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
+HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 ENV
     chmod 600 "$node_file"
 
@@ -867,6 +872,7 @@ get_hy2_link() {
     query="sni=${SNI:-www.bing.com}&insecure=1"
     pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
     [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
 
     echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
 }
@@ -899,6 +905,7 @@ get_share_link() {
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
@@ -1069,8 +1076,12 @@ show_info() {
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
+        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
+        fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
         echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
         echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"

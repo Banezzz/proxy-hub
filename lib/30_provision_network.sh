@@ -127,6 +127,37 @@ gen_hy2_password() {
     log_info "Hysteria2 密码已生成"
 }
 
+# ============== Hysteria2 加固选项 ==============
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
+
+# 为当前正在安装的 Hysteria2 节点应用可选加固。
+#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
+configure_hy2_options() {
+    HY2_OBFS_PASSWORD=""
+
+    local obfs_request="${hy2obfs:-}"
+    case "${obfs_request,,}" in
+        ""|false|0|n|no|off) ;;
+        true|1|y|yes|on)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+            ;;
+        *)
+            if [[ ! "$obfs_request" =~ ^[a-zA-Z0-9._-]{8,128}$ ]]; then
+                log_error "$(t2 "hy2obfs 密码需为 8-128 位字母、数字或 ._-" \
+                    "hy2obfs password must be 8-128 characters of letters, digits or ._-")"
+                return 1
+            fi
+            HY2_OBFS_PASSWORD="$obfs_request"
+            ;;
+    esac
+    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
+            "Salamander obfuscation enabled (clients must use the same obfs password)")"
+    fi
+}
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
