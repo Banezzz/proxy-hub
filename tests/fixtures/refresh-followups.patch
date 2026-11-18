@@ -74,3 +74,23 @@
 +            return 1
 +        fi
 +    done
+@@ -12505 +12541 @@
+-# node.<节点名>.<sni|port443|split|vlessenc|hy2obfs|ss>。
++# node.<节点名>.<sni|port443|shortid|split|vlessenc|hy2obfs|ss>。
+@@ -12660,0 +12697,10 @@
++                local short_id
++                short_id=$(safe_read_config_value "$file" "SHORT_ID")
++                if [[ -n "$short_id" ]] && (( ${#short_id} < 16 )); then
++                    upgrade_add "node.$node.shortid" relink \
++                        "$(t2 "节点 $node：把 shortId 换成 16 位（当前 ${#short_id} 位）" "Node $node: replace the short ID with a 16-character one (now ${#short_id})")" \
++                        "$(t2 "新装节点已使用满长度的 shortId。收益很有限：只是与新节点统一格式，不换也不影响安全性。" \
++                            "New nodes use full-length short IDs. The gain is small: it only aligns the format, and keeping the old one is not a weakness.")" \
++                        "$(t2 "新 shortId 随机生成。客户端需要重新导入这个节点的链接。" \
++                            "The new short ID is random. Clients must re-import this node's link.")"
++                fi
+@@ -12872,0 +12919,5 @@
++            ;;
++        shortid)
++            SHORT_ID=$(openssl rand -hex 8) || return 1
++            # 已拆分凭据的 both 节点，XHTTP 那一个同样换成满长度。
++            [[ -n "$XHTTP_SHORT_ID" ]] && (( ${#XHTTP_SHORT_ID} < 16 )) && XHTTP_SHORT_ID=$(openssl rand -hex 8)

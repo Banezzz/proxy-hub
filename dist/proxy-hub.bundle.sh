@@ -12538,7 +12538,7 @@ prompt_timesync_for_ss2022() {
 #
 # 项的 ID 是稳定标识：core.xray / core.singbox / cfg.reality-fields /
 # svc.hardening / geodata.cron / sysctl.template / links.pin，以及
-# node.<节点名>.<sni|port443|split|vlessenc|hy2obfs|ss>。
+# node.<节点名>.<sni|port443|shortid|split|vlessenc|hy2obfs|ss>。
 UPGRADE_STATE_FILE="/root/.proxy_hub_upgrade"
 UPGRADE_BACKUP_ROOT="/var/lib/proxy-hub/upgrade-backups"
 declare -ga UPG_IDS=() UPG_CLASS=() UPG_TITLE=() UPG_NOTE=() UPG_COST=() UPG_SEL=()
@@ -12693,6 +12693,16 @@ upgrade_scan() {
                             "Vision and XHTTP share one UUID and key pair today, so exposing one exposes the other.")" \
                         "$(t2 "新凭据自动生成。只有 XHTTP 的链接会变，Vision 链接不受影响。" \
                             "New credentials are generated for you. Only the XHTTP link changes; the Vision link keeps working.")"
+                fi
+                local short_id
+                short_id=$(safe_read_config_value "$file" "SHORT_ID")
+                if [[ -n "$short_id" ]] && (( ${#short_id} < 16 )); then
+                    upgrade_add "node.$node.shortid" relink \
+                        "$(t2 "节点 $node：把 shortId 换成 16 位（当前 ${#short_id} 位）" "Node $node: replace the short ID with a 16-character one (now ${#short_id})")" \
+                        "$(t2 "新装节点已使用满长度的 shortId。收益很有限：只是与新节点统一格式，不换也不影响安全性。" \
+                            "New nodes use full-length short IDs. The gain is small: it only aligns the format, and keeping the old one is not a weakness.")" \
+                        "$(t2 "新 shortId 随机生成。客户端需要重新导入这个节点的链接。" \
+                            "The new short ID is random. Clients must re-import this node's link.")"
                 fi
                 if [[ "$proto" != "anytls_reality" && -z "$(safe_read_config_value "$file" "VLESS_DECRYPTION")" ]] \
                     && xray_supports vlessenc; then
@@ -12906,6 +12916,11 @@ upgrade_apply_node() {
             ;;
         hy2obfs)
             HY2_OBFS_PASSWORD=$(openssl rand -hex 16) || return 1
+            ;;
+        shortid)
+            SHORT_ID=$(openssl rand -hex 8) || return 1
+            # 已拆分凭据的 both 节点，XHTTP 那一个同样换成满长度。
+            [[ -n "$XHTTP_SHORT_ID" ]] && (( ${#XHTTP_SHORT_ID} < 16 )) && XHTTP_SHORT_ID=$(openssl rand -hex 8)
             ;;
         *) return 1 ;;
     esac
@@ -13807,7 +13822,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=571778 body-sha256=cc694a1fcd6677102655765bf911cae3ff9321da96e2e93d2461b9212991eba8
-# build-id=cc694a1fcd6677102655765bf911cae3ff9321da96e2e93d2461b9212991eba8
+# body-bytes=573047 body-sha256=2f6142ef50d32959d8b43d77d85bc51da3457af1bae1a712da666482b0ab3e7a
+# build-id=2f6142ef50d32959d8b43d77d85bc51da3457af1bae1a712da666482b0ab3e7a
 # module-count=11
 # proxy-hub-bundle-end-v1

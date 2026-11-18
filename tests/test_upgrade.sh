@@ -322,6 +322,10 @@ assert_contains "$found" "node.hy.hy2obfs" "a plain Hysteria2 node is offered ob
 assert_contains "$found" "node.ss.ss" "Shadowsocks nodes get a positioning note"
 assert_contains "$found" "links.pin" "self-signed Hysteria2 links get the pin note"
 assert_not_contains "$found" "node.plain" "plain AnyTLS has nothing to upgrade"
+assert_contains "$found" "node.hk.shortid" "an 8-character short ID can be replaced"
+assert_contains "$found" "node.ar.shortid" "AnyTLS + REALITY nodes have short IDs too"
+assert_not_contains "$found" "node.hy.shortid" "Hysteria2 has no short ID"
+assert_eq "relink" "$(class_of node.hk.shortid)" "replacing a short ID changes the link"
 for id in node.apple.sni node.pair.split node.hk.vlessenc node.hy.hy2obfs; do
     assert_eq "relink" "$(class_of "$id")" "$id changes the share link"
 done
@@ -351,13 +355,15 @@ done
 ACTIVE_SERVICES=""
 
 # Already-upgraded nodes drop out of the scan.
+set_node_field hk SHORT_ID 0123456789abcdef
+set_node_field ar SHORT_ID ""
 set_node_field pair XHTTP_PUBLIC_KEY SplitPub
 set_node_field hk VLESS_DECRYPTION mlkem768x25519plus.native.600s.Key
 set_node_field hy HY2_OBFS_PASSWORD Obfs.Pass_12
 set_node_field apple SNI www.tesla.com
 upgrade_scan
 found=$(ids)
-for gone in node.pair.split node.hk.vlessenc node.hy.hy2obfs node.apple.sni; do
+for gone in node.pair.split node.hk.vlessenc node.hy.hy2obfs node.apple.sni node.hk.shortid node.ar.shortid; do
     assert_not_contains "$found" "$gone" "$gone must disappear once the node is upgraded"
 done
 # An ACME node has no pinned link and is not offered obfuscation by the scan.
@@ -488,6 +494,22 @@ upgrade_apply node.old.split || fail_case "splitting a typeless node failed"
 assert_eq "both" "$(node_field old PROTOCOL_TYPE)" "an inferred both node must not be saved as vision"
 assert_eq "2" "$(jq '[.inbounds[] | select(.tag | startswith("old_"))] | length' "$XRAY_CONF")" \
     "both inbounds of the typeless node survive"
+
+# Replacing a short ID: the primary one, and the XHTTP one of a split node.
+set_node_field pair XHTTP_SHORT_ID abcd1234
+upgrade_scan
+upgrade_apply node.hk.shortid node.pair.shortid || fail_case "replacing short IDs failed"
+[[ "$(node_field hk SHORT_ID)" =~ ^[0-9a-f]{16}$ ]] || fail_case "hk did not get a 16-character short ID"
+[[ "$(node_field pair SHORT_ID)" =~ ^[0-9a-f]{16}$ ]] || fail_case "pair did not get a 16-character short ID"
+[[ "$(node_field pair XHTTP_SHORT_ID)" =~ ^[0-9a-f]{16}$ ]] || fail_case "the XHTTP short ID of a split node must be replaced too"
+assert_eq "LegacyPublicKey_1" "$(node_field hk PUBLIC_KEY)" "replacing a short ID must not touch the key pair"
+assert_eq "$(node_field hk SHORT_ID)" \
+    "$(jq -r '.inbounds[] | select(.tag == "hk_vision") | .streamSettings.realitySettings.shortIds[0]' "$XRAY_CONF")" \
+    "the rendered config uses the new short ID"
+upgrade_scan
+for gone in node.hk.shortid node.pair.shortid; do
+    assert_not_contains "$(ids)" "$gone" "$gone must disappear once the short ID is replaced"
+done
 
 # Moving to 443 updates the node and opens the port.
 : >/srv/firewall.calls
@@ -670,6 +692,9 @@ is_root() { return 0; }
 log_info() { printf 'info: %s\n' "$*" >>/srv/wizard.log; }
 : >/srv/wizard.log
 write_legacy_node hk vision
+# A full-length short ID, so this scenario's item numbering is not shifted by
+# the short-ID item (covered in upgrade-scan and upgrade-apply).
+set_node_field hk SHORT_ID 0123456789abcdef
 write_legacy_node hy hysteria2
 set_node_field hy HY2_PASSWORD SafeHy2Password
 write_legacy_node ss shadowsocks
