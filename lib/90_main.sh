@@ -207,6 +207,8 @@ show_help() {
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
     echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
+    echo "  upgrade     Review and apply protocol / core upgrades for existing nodes"
+    echo "              (upgrade check lists them without changing anything)"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -460,6 +462,14 @@ case "${1:-}" in
     singbox-update)
         check_lock_for_write_ops
         cmd_singbox_update
+        ;;
+    upgrade|migrate)
+        # check 是只读的，不占用写锁；其余形式会修改节点与内核。
+        if [[ "${2:-}" != "check" && "${2:-}" != "--check" ]]; then
+            check_lock_for_write_ops
+        fi
+        init_language_if_needed
+        cmd_upgrade "${@:2}"
         ;;
     ports)
         check_lock_for_write_ops

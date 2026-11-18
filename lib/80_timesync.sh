@@ -636,3 +636,321 @@ prompt_timesync_for_ss2022() {
         *) return 0 ;;
     esac
 }
+
+# ============== 协议 / 内核升级向导 ==============
+#
+# 用旧版本脚本装过节点的机器，升级脚本之后节点文件和运行中的内核仍然是旧的：普通
+# 安装从不替换健康的既有内核，也不会回头改已有节点。这里提供一条显式的迁移路径。
+#
+# 整个流程分三步，对应三组函数：
+#   upgrade_scan     离线扫描（不联网、不改任何东西），列出可升级项；
+#   upgrade_apply    执行选中的项，节点改动先快照、失败整体回滚；
+#   cmd_upgrade      向导界面与 CLI 入口。
+#
+# 每个可升级项属于三类之一，界面按类别分组，默认勾选也按类别决定：
+#   safe    只动服务端，客户端零改动 —— 推荐，默认勾选；
+#   relink  会改变分享链接，客户端必须重新导入 —— 可选，默认不勾选；
+#   info    只是告知，没有可执行的动作。
+#
+# 项的 ID 是稳定标识：core.xray / core.singbox / cfg.reality-fields /
+# svc.hardening / geodata.cron / sysctl.template / links.pin，以及
+# node.<节点名>.<sni|port443|split|vlessenc|hy2obfs|ss>。
+UPGRADE_STATE_FILE="/root/.proxy_hub_upgrade"
+UPGRADE_BACKUP_ROOT="/var/lib/proxy-hub/upgrade-backups"
+declare -ga UPG_IDS=() UPG_CLASS=() UPG_TITLE=() UPG_NOTE=() UPG_COST=() UPG_SEL=()
+
+# Usage: upgrade_add ID CLASS TITLE NOTE COST
+upgrade_add() {
+    UPG_IDS+=("$1")
+    UPG_CLASS+=("$2")
+    UPG_TITLE+=("$3")
+    UPG_NOTE+=("$4")
+    UPG_COST+=("$5")
+    # 默认勾选：只有"客户端零改动"的推荐项。
+    if [[ "$2" == "safe" ]]; then UPG_SEL+=(1); else UPG_SEL+=(0); fi
+}
+
+upgrade_has() {
+    local id
+    for id in ${UPG_IDS[@]+"${UPG_IDS[@]}"}; do
+        [[ "$id" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# 节点的协议类型，含旧节点没有 PROTOCOL_TYPE 时按端口推断的兼容规则。
+upgrade_node_protocol() {
+    local file="$1" proto
+    proto=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
+    if [[ -z "$proto" ]]; then
+        if [[ -n "$(safe_read_config_value "$file" "PORT")" && -n "$(safe_read_config_value "$file" "XHTTP_PORT")" ]]; then
+            proto="both"
+        elif [[ -n "$(safe_read_config_value "$file" "XHTTP_PORT")" ]]; then
+            proto="xhttp"
+        else
+            proto="vision"
+        fi
+    fi
+    printf '%s' "$proto"
+}
+
+# 离线扫描，结果写入 UPG_* 数组。不联网、不修改任何文件或服务。
+upgrade_scan() {
+    UPG_IDS=() UPG_CLASS=() UPG_TITLE=() UPG_NOTE=() UPG_COST=() UPG_SEL=()
+    local name installed baseline
+
+    # ---- 内核低于安全基线 ----
+    while read -r name installed baseline; do
+        case "$name" in
+            xray)
+                upgrade_add core.xray safe \
+                    "$(t2 "更新 Xray：v$installed → 最新稳定版" "Update Xray: v$installed → latest stable")" \
+                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本默认关闭 MPTCP（规避 Linux 内核漏洞）并移除了有问题的根证书。" \
+                        "Below the security baseline v$baseline: later releases turn MPTCP off by default (a Linux kernel flaw) and drop compromised root certificates.")" \
+                    "$(t2 "自动校验官方 SHA-256，先用新版本检查现有配置，启动失败自动回滚。服务会重启一次（几秒）。" \
+                        "Verifies the official SHA-256, checks the current config with the new version, and rolls back if it fails to start. One restart of a few seconds.")"
+                ;;
+            sing-box)
+                upgrade_add core.singbox safe \
+                    "$(t2 "更新 sing-box：v$installed → 最新稳定版" "Update sing-box: v$installed → latest stable")" \
+                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本里 AnyTLS 默认不再上传客户端信息，Hysteria2 也有多项改进。" \
+                        "Below the security baseline v$baseline: later releases stop AnyTLS from uploading client metadata and improve Hysteria2.")" \
+                    "$(t2 "自动校验官方 SHA-256，先用新版本检查现有配置，启动失败自动回滚。服务会重启一次（几秒）。" \
+                        "Verifies the official SHA-256, checks the current config with the new version, and rolls back if it fails to start. One restart of a few seconds.")"
+                ;;
+        esac
+    done < <(core_baseline_gaps)
+
+    # ---- Xray 配置仍在用旧字段 ----
+    if [[ -s "$XRAY_CONF" ]] && jq -e '[.inbounds[]?.streamSettings.realitySettings // empty
+            | select(has("dest") or has("fingerprint"))] | length > 0' "$XRAY_CONF" >/dev/null 2>&1; then
+        if xray_supports target || upgrade_has core.xray; then
+            upgrade_add cfg.reality-fields safe \
+                "$(t2 "重新生成 Xray 配置（改用新版字段写法）" "Regenerate the Xray config with current field names")" \
+                "$(t2 "现有配置还在用旧字段 dest 和一个服务端无效的 fingerprint；新版核心以 target 为正式写法。" \
+                    "The config still uses the legacy dest field and a fingerprint that servers ignore; current cores use target.")" \
+                "$(t2 "只改服务端配置文件，节点参数与分享链接完全不变。Xray 会重启一次。" \
+                    "Only the server config changes; node parameters and share links stay the same. Xray restarts once.")"
+        fi
+    fi
+
+    # ---- 服务沙箱加固 ----
+    if service_hardening_applicable; then
+        local svc pending=""
+        for svc in xray "$SINGBOX_SERVICE"; do
+            if service_is_active "$svc" && ! service_hardening_is_applied "$svc" \
+                && [[ ! -e "$(service_hardening_skip_marker "$svc")" ]]; then
+                pending+="${pending:+ / }$svc"
+            fi
+        done
+        if [[ -n "$pending" ]]; then
+            upgrade_add svc.hardening safe \
+                "$(t2 "为服务启用沙箱加固：$pending" "Enable sandbox hardening for: $pending")" \
+                "$(t2 "代理内核以 root 运行却只需要网络权限；加固后即使内核出现漏洞，能造成的破坏也小得多。" \
+                    "The cores run as root but only need the network; hardening limits what a compromised core could do.")" \
+                "$(t2 "服务重启一次；如果在这台机器上加固后起不来，会自动撤销并恢复原状。" \
+                    "One restart; if the service cannot start hardened on this machine, it is reverted automatically.")"
+        fi
+    fi
+
+    # ---- GeoData 定时更新未校验 ----
+    if geodata_cron_is_legacy; then
+        upgrade_add geodata.cron safe \
+            "$(t2 "把 GeoIP/GeoSite 的定时更新换成带校验的版本" "Switch the scheduled GeoIP/GeoSite update to the verified one")" \
+            "$(t2 "现在的定时任务把下载结果直接覆盖到数据文件上，下载中断或被篡改都会让路由数据损坏。" \
+                "The current job writes downloads straight over the live files, so an interrupted or tampered download corrupts routing data.")" \
+            "$(t2 "只替换定时任务；现有数据文件不动，下次更新开始校验 SHA-256。" \
+                "Only the cron job changes; existing data is untouched and the next update verifies SHA-256.")"
+    fi
+
+    # ---- sysctl 调优模板过时 ----
+    if sysctl_tuning_is_legacy; then
+        upgrade_add sysctl.template safe \
+            "$(t2 "刷新网络调优参数" "Refresh the network tuning parameters")" \
+            "$(t2 "现有调优文件含一个内核早已忽略的参数，缓冲区上限也偏小。" \
+                "The tuning file sets a key the kernel has long ignored and uses a low buffer ceiling.")" \
+            "$(t2 "保留你当前的拥塞控制算法，立即生效，无需重启。" \
+                "Keeps your current congestion control, takes effect immediately, no restart.")"
+    fi
+
+    # ---- 逐节点 ----
+    local file node proto sni main_port port443_offered=0 pinned_nodes=""
+    for file in "$NODES_DIR"/*.env; do
+        [[ -f "$file" ]] || continue
+        node=$(basename "$file" .env)
+        proto=$(upgrade_node_protocol "$file")
+        sni=$(safe_read_config_value "$file" "SNI")
+        case "$proto" in
+            vision|xhttp|both|anytls_reality)
+                if reality_target_discouraged "$sni"; then
+                    upgrade_add "node.$node.sni" relink \
+                        "$(t2 "节点 $node：更换 REALITY 伪装域名（当前 $sni）" "Node $node: replace the REALITY target (now $sni)")" \
+                        "$(t2 "Apple / iCloud 域名被太多节点借用，已成为被重点关照的特征，新版 Xray 也会对此告警。" \
+                            "Apple / iCloud domains are borrowed by so many nodes that they draw attention; current Xray warns about them.")" \
+                        "$(t2 "自动测速并选出新的域名，无需你填写。客户端需要重新导入这个节点的链接。" \
+                            "A new domain is picked by the latency test for you. Clients must re-import this node's link.")"
+                fi
+                main_port=$(safe_read_config_value "$file" "PORT")
+                [[ "$proto" == "xhttp" ]] && main_port=$(safe_read_config_value "$file" "XHTTP_PORT")
+                if [[ -n "$main_port" && "$main_port" != "443" ]] && (( port443_offered == 0 )) \
+                    && is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
+                    port443_offered=1
+                    upgrade_add "node.$node.port443" relink \
+                        "$(t2 "节点 $node：把端口从 $main_port 改到 443" "Node $node: move the port from $main_port to 443")" \
+                        "$(t2 "REALITY 伪装成访问真实网站，而真实网站都在 443；用其他端口时伪装效果打折。" \
+                            "REALITY poses as a visit to a real website, and real websites answer on 443; another port weakens the disguise.")" \
+                        "$(t2 "需在云安全组放行 443/tcp。客户端需要重新导入这个节点的链接。" \
+                            "Allow 443/tcp in the cloud firewall. Clients must re-import this node's link.")"
+                fi
+                if [[ "$proto" == "both" && -z "$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")" ]]; then
+                    upgrade_add "node.$node.split" relink \
+                        "$(t2 "节点 $node：给 XHTTP 生成独立凭据" "Node $node: give XHTTP its own credentials")" \
+                        "$(t2 "Vision 和 XHTTP 现在共用同一套 UUID 和密钥，其中一个暴露，另一个也跟着暴露。" \
+                            "Vision and XHTTP share one UUID and key pair today, so exposing one exposes the other.")" \
+                        "$(t2 "新凭据自动生成。只有 XHTTP 的链接会变，Vision 链接不受影响。" \
+                            "New credentials are generated for you. Only the XHTTP link changes; the Vision link keeps working.")"
+                fi
+                if [[ "$proto" != "anytls_reality" && -z "$(safe_read_config_value "$file" "VLESS_DECRYPTION")" ]] \
+                    && xray_supports vlessenc; then
+                    upgrade_add "node.$node.vlessenc" relink \
+                        "$(t2 "节点 $node：启用 VLESS Encryption（后量子加密）" "Node $node: enable VLESS Encryption (post-quantum)")" \
+                        "$(t2 "防止今天被录下的流量将来被量子计算机解密。密钥自动生成。" \
+                            "Keeps traffic recorded today from being decrypted by a future quantum computer. Keys are generated for you.")" \
+                        "$(t2 "要求客户端内核为 Xray 25.9 或更新；旧客户端将无法连接。客户端需要重新导入链接。" \
+                            "Requires a client core of Xray 25.9 or newer; older clients stop connecting. Clients must re-import the link.")"
+                fi
+                ;;
+            hysteria2)
+                if [[ -z "$(safe_read_config_value "$file" "HY2_DOMAIN")" ]]; then
+                    pinned_nodes+="${pinned_nodes:+, }$node"
+                    if [[ -z "$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")" ]]; then
+                        upgrade_add "node.$node.hy2obfs" relink \
+                            "$(t2 "节点 $node：启用 Salamander 混淆" "Node $node: enable Salamander obfuscation")" \
+                            "$(t2 "Hysteria2 默认的握手特征很容易被识别；混淆后流量看不出协议。密码随机生成。" \
+                                "Plain Hysteria2 is easy to recognise by its handshake; obfuscation hides the protocol. The password is random.")" \
+                            "$(t2 "客户端需要重新导入这个节点的链接（混淆密码已包含在链接里）。" \
+                                "Clients must re-import this node's link (the obfs password is included in it).")"
+                    fi
+                fi
+                ;;
+            shadowsocks)
+                upgrade_add "node.$node.ss" info \
+                    "$(t2 "节点 $node 使用 Shadowsocks" "Node $node uses Shadowsocks")" \
+                    "$(t2 "Shadowsocks 没有流量伪装，新版 Xray 已对它给出弃用警告；建议只用于中转或落地，跨境直连改用 REALITY 系协议。" \
+                        "Shadowsocks has no disguise and current Xray prints a deprecation warning for it; keep it for relay or landing hops.")" \
+                    "$(t2 "无需操作，节点可继续使用。" "No action needed; the node keeps working.")"
+                ;;
+        esac
+    done
+
+    if [[ -n "$pinned_nodes" ]]; then
+        upgrade_add links.pin info \
+            "$(t2 "Hysteria2 分享链接已加入证书指纹：$pinned_nodes" "Hysteria2 share links now pin the certificate: $pinned_nodes")" \
+            "$(t2 "Xray 内核的客户端自 2026-06-01 起不再接受只带 insecure 的自签名链接，新链接多了 pinSHA256。" \
+                "Clients on an Xray core stopped accepting insecure-only links for self-signed nodes on 2026-06-01; new links add pinSHA256.")" \
+            "$(t2 "服务端无需改动。客户端连不上时，在主菜单「查看节点信息」里重新复制链接即可。" \
+                "Nothing changes on the server. If a client cannot connect, copy the link again from the node info view.")"
+    fi
+}
+
+# 当前扫描结果的指纹：ID 集合排序后的 SHA-256。用于记住用户已经看过哪一批。
+upgrade_findings_digest() {
+    (( ${#UPG_IDS[@]} > 0 )) || return 0
+    printf '%s\n' "${UPG_IDS[@]}" | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+# 记住"这一批已处理/已知悉"，之后只有出现新的项才再次提示。
+upgrade_ack_save() {
+    upgrade_scan
+    upgrade_findings_digest >"$UPGRADE_STATE_FILE" 2>/dev/null || return 0
+    chmod 600 "$UPGRADE_STATE_FILE" 2>/dev/null || true
+}
+
+# 是否存在用户还没看过的可升级项（会先执行一次扫描）。状态文件按不可信输入处理。
+upgrade_pending() {
+    local digest acked=""
+    upgrade_scan
+    (( ${#UPG_IDS[@]} > 0 )) || return 1
+    digest=$(upgrade_findings_digest)
+    if [[ -f "$UPGRADE_STATE_FILE" && ! -L "$UPGRADE_STATE_FILE" ]]; then
+        read -r acked <"$UPGRADE_STATE_FILE" 2>/dev/null || acked=""
+        acked="${acked//[^0-9a-f]/}"
+    fi
+    [[ "$digest" != "$acked" ]]
+}
+
+# 分组打印扫描结果。Usage: upgrade_print_findings [with_selection]
+upgrade_print_findings() {
+    local with_selection="${1:-}" class index number=0 box header shown
+    for class in safe relink info; do
+        shown=0
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_CLASS[$index]}" == "$class" ]] || continue
+            if (( shown == 0 )); then
+                case "$class" in
+                    safe) header="${GREEN}$(t2 "推荐 · 客户端无需任何改动" "Recommended · nothing changes for clients")${NC}" ;;
+                    relink) header="${YELLOW}$(t2 "可选 · 客户端需要重新导入链接" "Optional · clients must re-import the link")${NC}" ;;
+                    *) header="${BLUE}$(t2 "提示 · 无需操作" "Notes · no action needed")${NC}" ;;
+                esac
+                echo ""
+                echo -e "  $header"
+                shown=1
+            fi
+            if [[ "$class" == "info" ]]; then
+                echo -e "   ${BLUE}·${NC} ${UPG_TITLE[$index]}"
+            else
+                number=$((number + 1))
+                box=""
+                if [[ -n "$with_selection" ]]; then
+                    if [[ "${UPG_SEL[$index]}" == 1 ]]; then box="${GREEN}[x]${NC} "; else box="[ ] "; fi
+                fi
+                echo -e "   ${box}${GREEN}${number}.${NC} ${UPG_TITLE[$index]}"
+            fi
+            menu_note "${UPG_NOTE[$index]}" "${UPG_COST[$index]}"
+        done
+    done
+}
+
+# 第 N 个可选择项（safe / relink，按显示顺序编号）对应的数组下标。
+upgrade_index_of_number() {
+    local want="$1" class index number=0
+    for class in safe relink; do
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_CLASS[$index]}" == "$class" ]] || continue
+            number=$((number + 1))
+            if (( number == want )); then
+                printf '%s' "$index"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# 只读列出可升级项（CLI: upgrade check）。
+cmd_upgrade_check() {
+    upgrade_scan
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "协议 / 内核升级检查" "Protocol / core upgrade check")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    if (( ${#UPG_IDS[@]} == 0 )); then
+        echo ""
+        echo -e "  ${GREEN}$(t2 "没有可升级项：节点与内核都已是当前写法。" "Nothing to upgrade: nodes and cores are current.")${NC}"
+        echo ""
+        return 0
+    fi
+    upgrade_print_findings
+    echo ""
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+    echo -e "  $(t2 "进入升级向导" "Open the upgrade wizard"): ${YELLOW}bash $0 upgrade${NC}"
+    echo ""
+}
+
+# CLI 入口。Usage: cmd_upgrade [check]
+cmd_upgrade() {
+    case "${1:-}" in
+        check|--check) cmd_upgrade_check ;;
+        *) cmd_upgrade_check ;;
+    esac
+}
