@@ -627,6 +627,41 @@ t2() {
     fi
 }
 
+# ---- 交互终端读写 ----
+#
+# 新增的引导式菜单统一经过这三个函数与用户对话，而不是各自写死 /dev/tty：
+#   tty_available  当前能否提问（没有控制终端时返回非零，调用方按默认值处理）
+#   tty_print      把一段界面输出到终端（从 stdin 读入内容）
+#   tty_read VAR   读一行输入到变量
+# PROXY_HUB_TTY_FD / PROXY_HUB_TTY_OUT 是测试用的接缝：分别指定读取答案的文件描述符
+# 和界面输出的文件，使菜单逻辑可以在没有终端的测试沙箱里被完整驱动。
+tty_available() {
+    [[ -n "${PROXY_HUB_TTY_FD:-}" ]] || ( : >/dev/tty ) 2>/dev/null
+}
+
+tty_print() {
+    cat >>"${PROXY_HUB_TTY_OUT:-/dev/tty}"
+}
+
+tty_read() {
+    local __tty_line=""
+    if [[ -n "${PROXY_HUB_TTY_FD:-}" ]]; then
+        IFS= read -r -u "$PROXY_HUB_TTY_FD" __tty_line || __tty_line=""
+    else
+        IFS= read -r __tty_line </dev/tty || __tty_line=""
+    fi
+    printf -v "$1" '%s' "$__tty_line"
+}
+
+# 菜单项下方的说明文字：缩进、灰色，每个参数一行。
+# Usage: menu_note "第一行" ["第二行"...]
+menu_note() {
+    local line
+    for line in "$@"; do
+        echo -e "     ${GRAY}${line}${NC}"
+    done
+}
+
 # ============== 内核能力探测 ==============
 #
 # 普通 `install` 发现健康的既有 Xray 时只报告版本、不升级，因此渲染配置时不能假设
@@ -9399,27 +9434,38 @@ prompt_pq_options() {
     xray_supports vlessenc || xray_supports mldsa65 || return 0
     # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
     # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
-    ( : >/dev/tty ) 2>/dev/null || return 0
+    tty_available || return 0
 
     {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}        $(t2 "后量子增强（可选）" "Post-quantum options (optional)")${NC}"
+    echo -e "${GREEN}        $(t2 "后量子增强（可选，回车跳过）" "Post-quantum options (optional, Enter to skip)")${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${YELLOW}$(t2 "两项都要求较新的客户端；不确定客户端是否支持时请保持关闭。" \
-        "Both need a recent client; leave them off when unsure about client support.")${NC}"
+    menu_note "$(t2 "作用：防止今天被录下的流量在将来被量子计算机解密或伪造。" \
+        "Purpose: keep traffic recorded today from being decrypted or forged by a future quantum computer.")" \
+        "$(t2 "密钥全部自动生成，无需填写；代价是客户端必须足够新。" \
+        "All keys are generated for you; the cost is that clients must be recent enough.")"
     echo ""
     echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
-    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${GRAY}(mlkem768x25519plus)${NC}"
-    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65  ${GRAY}($(t2 "证书后量子签名" "post-quantum certificate signature"))${NC}"
+    menu_note "$(t2 "兼容所有客户端。不确定客户端版本时选这个。" \
+        "Works with every client. Pick this when unsure about client versions.")"
+    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${YELLOW}$(t2 "[新客户端推荐]" "[recommended for recent clients]")${NC}"
+    menu_note "$(t2 "给 VLESS 加一层后量子密钥交换，链接仍然很短、可以扫码。" \
+        "Adds a post-quantum key exchange to VLESS; the link stays short and scannable.")" \
+        "$(t2 "要求客户端内核为 Xray 25.9 或更新。" "Requires a client core of Xray 25.9 or newer.")"
+    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65"
+    menu_note "$(t2 "给 REALITY 证书加后量子签名，防止服务器被冒充。" \
+        "Adds a post-quantum signature to the REALITY certificate so the server cannot be impersonated.")" \
+        "$(t2 "链接会变成约 3KB，无法生成二维码，只能复制粘贴导入。" \
+        "The link grows to about 3 kB: no QR code, copy and paste only.")"
     echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
     echo ""
     echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
-    } >/dev/tty
+    } | tty_print
 
     local choice=""
-    read -r choice </dev/tty || choice=""
+    tty_read choice
     case "$choice" in
         1) PQ_WANT_VLESSENC="x25519" ;;
         2) PQ_WANT_MLDSA65="true" ;;
@@ -9556,25 +9602,133 @@ apply_hy2_acme_domain() {
         "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
 }
 
+# 引导式选择 Hysteria2 加固方案，结果写入 HY2_REQ_OBFS / HY2_REQ_HOP /
+# HY2_REQ_DOMAIN / HY2_REQ_EMAIL（取值与同名环境变量相同）。
+#
+# 设计目标是让用户不需要理解每个参数：前两个方案的全部参数都随机生成，回车即采用
+# 推荐方案；每个方案下面写明它做什么、需要用户额外做什么。只有"自定义"才逐项提问，
+# 且每一问都有可以直接回车的默认值。
+prompt_hy2_hardening() {
+    local choice="" answer="" hop_hint=""
+    HY2_REQ_OBFS="" HY2_REQ_HOP="" HY2_REQ_DOMAIN="" HY2_REQ_EMAIL=""
+    command -v iptables >/dev/null 2>&1 || \
+        hop_hint="  ${RED}$(t2 "(本机没有 iptables，暂不可用)" "(unavailable: iptables is not installed)")${NC}"
+
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "Hysteria2 加固方案（回车采用推荐）" "Hysteria2 hardening (Enter for the recommended preset)")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    menu_note "$(t2 "Hysteria2 默认是明文特征的 QUIC + 自签名证书，握手很容易被认出来。" \
+        "By default Hysteria2 is recognisable QUIC with a self-signed certificate.")" \
+        "$(t2 "下面的方案会自动生成随机参数，装完直接导入链接即可使用。" \
+        "The presets below generate random parameters; import the link afterwards and you are done.")"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} $(t2 "Salamander 混淆" "Salamander obfuscation")  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
+    menu_note "$(t2 "随机生成混淆密码，把流量打乱成看不出协议的数据。" \
+        "Generates a random password and scrambles the traffic so the protocol is not recognisable.")" \
+        "$(t2 "主流 Hysteria2 客户端都支持，密码已包含在分享链接里。" \
+        "Supported by mainstream Hysteria2 clients; the password travels in the share link.")"
+    echo -e "  ${GREEN}2.${NC} $(t2 "混淆 + 端口跳跃" "Obfuscation + port hopping")${hop_hint}"
+    menu_note "$(t2 "在方案 1 之上，随机挑一段 200 个 UDP 端口轮换，对抗针对单个端口的限速或封锁。" \
+        "On top of preset 1, rotates across a random range of 200 UDP ports against per-port throttling or blocking.")" \
+        "$(t2 "需要你到云厂商安全组放行这段 UDP 端口（安装后会显示），否则会间歇断流。" \
+        "You must allow that UDP range in the cloud firewall (shown after install), or connections will stall.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "不加固" "No hardening")"
+    menu_note "$(t2 "保持最简形态，兼容最老的客户端；被识别的风险最高。" \
+        "Plain Hysteria2 for the oldest clients; the easiest to recognise.")"
+    echo -e "  ${GREEN}4.${NC} $(t2 "自定义" "Custom")"
+    menu_note "$(t2 "逐项选择：混淆密码、跳跃范围、用自己的域名申请真证书（ACME）。" \
+        "Choose each item: obfs password, hop range, and a real certificate (ACME) for your own domain.")"
+    echo ""
+    echo -n "  $(t2 "请选择" "Select") [1-4] ($(t2 "默认" "default") 1): "
+    } | tty_print
+    tty_read choice
+
+    case "$choice" in
+        2)
+            HY2_REQ_OBFS="true"
+            if [[ -z "$hop_hint" ]]; then
+                HY2_REQ_HOP="auto"
+            else
+                log_warn "$(t2 "没有 iptables，已改用方案 1（仅混淆）" "iptables is missing; using preset 1 (obfuscation only)")"
+            fi
+            ;;
+        3) ;;
+        4)
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "Salamander 混淆密码" "Salamander obfs password")${NC}"
+            menu_note "$(t2 "回车 = 随机生成（推荐）；输入 n = 不启用；也可以自己输入 8 位以上的密码。" \
+                "Enter = random (recommended); n = off; or type your own password of 8+ characters.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            case "${answer,,}" in
+                "") HY2_REQ_OBFS="true" ;;
+                n|no) HY2_REQ_OBFS="" ;;
+                *) HY2_REQ_OBFS="$answer" ;;
+            esac
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "端口跳跃范围" "Port hopping range")${NC}${hop_hint}"
+            menu_note "$(t2 "回车 = 不启用；输入 a = 随机挑一段（推荐）；或输入 起始-结束，例如 20000-20200。" \
+                "Enter = off; a = pick a random range (recommended); or START-END such as 20000-20200.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            case "${answer,,}" in
+                "") HY2_REQ_HOP="" ;;
+                a|auto) HY2_REQ_HOP="auto" ;;
+                *) HY2_REQ_HOP="$answer" ;;
+            esac
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "ACME 证书域名" "ACME certificate domain")${NC}"
+            menu_note "$(t2 "回车 = 用自签名证书（无需域名）。" "Enter = keep the self-signed certificate (no domain needed).")" \
+                "$(t2 "有域名且已解析到本机时填在这里，客户端就不再需要 insecure；需要 80 或 443/tcp 空闲。" \
+                "If you own a domain that already points here, type it: clients no longer need insecure. Needs 80 or 443/tcp free.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            HY2_REQ_DOMAIN="$answer"
+            ;;
+        *) HY2_REQ_OBFS="true" ;;
+    esac
+}
+
 # 为当前正在安装的 Hysteria2 节点应用可选加固。
 #   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
 #   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
 #   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
+#
+# 两条入口：完全交互的安装走引导菜单（默认采用推荐方案）；只要调用方用 proto= 或
+# 任一 hy2* 变量驱动安装，就只按环境变量执行、不追加提问，默认全部关闭——既有的
+# 无人值守脚本因此得到与升级前完全相同的节点。
 configure_hy2_options() {
     HY2_OBFS_PASSWORD=""
     HY2_HOP_PORTS=""
     HY2_DOMAIN=""
     HY2_EMAIL=""
 
-    if [[ -n "${hy2domain:-}" ]]; then
-        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
+    HY2_REQ_OBFS="${hy2obfs:-}"
+    HY2_REQ_HOP="${hy2hop:-}"
+    HY2_REQ_DOMAIN="${hy2domain:-}"
+    HY2_REQ_EMAIL="${hy2email:-}"
+    if [[ -z "${proto:-}${hy2obfs:-}${hy2hop:-}${hy2domain:-}" ]] && tty_available; then
+        prompt_hy2_hardening
     fi
 
-    if [[ -n "${hy2hop:-}" ]]; then
-        apply_hy2_hop_range "$hy2hop" || return 1
+    if [[ -n "$HY2_REQ_DOMAIN" ]]; then
+        apply_hy2_acme_domain "$HY2_REQ_DOMAIN" "$HY2_REQ_EMAIL" || return 1
     fi
 
-    local obfs_request="${hy2obfs:-}"
+    if [[ -n "$HY2_REQ_HOP" ]]; then
+        apply_hy2_hop_range "$HY2_REQ_HOP" || return 1
+    fi
+
+    local obfs_request="$HY2_REQ_OBFS"
     case "${obfs_request,,}" in
         ""|false|0|n|no|off) ;;
         true|1|y|yes|on)
@@ -9590,8 +9744,8 @@ configure_hy2_options() {
             ;;
     esac
     if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
-        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
-            "Salamander obfuscation enabled (clients must use the same obfs password)")"
+        log_info "$(t2 "已启用 Salamander 混淆（密码已写入分享链接，客户端导入即可）" \
+            "Salamander obfuscation enabled (the password is in the share link; just import it)")"
     fi
 }
 
@@ -12284,7 +12438,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=490320 body-sha256=beaaaf02de92e6b3989bc0b0aadebe74aad3ca743a8d8418cdc759363ccbf57d
-# build-id=beaaaf02de92e6b3989bc0b0aadebe74aad3ca743a8d8418cdc759363ccbf57d
+# body-bytes=499078 body-sha256=9486c54a1e2f79b3a9d086e3311c8fdbfb28e7278236c396a7008344c7583dc3
+# build-id=9486c54a1e2f79b3a9d086e3311c8fdbfb28e7278236c396a7008344c7583dc3
 # module-count=11
 # proxy-hub-bundle-end-v1

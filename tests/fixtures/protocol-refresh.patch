@@ -25,7 +25,7 @@
 +    HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
 +    HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
 +    HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
-@@ -603,0 +619,83 @@
+@@ -603,0 +619,118 @@
 +# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
 +# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
 +# Usage: t2 "中文" "English"
@@ -35,6 +35,41 @@
 +    else
 +        printf '%s' "$1"
 +    fi
++}
++
++# ---- 交互终端读写 ----
++#
++# 新增的引导式菜单统一经过这三个函数与用户对话，而不是各自写死 /dev/tty：
++#   tty_available  当前能否提问（没有控制终端时返回非零，调用方按默认值处理）
++#   tty_print      把一段界面输出到终端（从 stdin 读入内容）
++#   tty_read VAR   读一行输入到变量
++# PROXY_HUB_TTY_FD / PROXY_HUB_TTY_OUT 是测试用的接缝：分别指定读取答案的文件描述符
++# 和界面输出的文件，使菜单逻辑可以在没有终端的测试沙箱里被完整驱动。
++tty_available() {
++    [[ -n "${PROXY_HUB_TTY_FD:-}" ]] || ( : >/dev/tty ) 2>/dev/null
++}
++
++tty_print() {
++    cat >>"${PROXY_HUB_TTY_OUT:-/dev/tty}"
++}
++
++tty_read() {
++    local __tty_line=""
++    if [[ -n "${PROXY_HUB_TTY_FD:-}" ]]; then
++        IFS= read -r -u "$PROXY_HUB_TTY_FD" __tty_line || __tty_line=""
++    else
++        IFS= read -r __tty_line </dev/tty || __tty_line=""
++    fi
++    printf -v "$1" '%s' "$__tty_line"
++}
++
++# 菜单项下方的说明文字：缩进、灰色，每个参数一行。
++# Usage: menu_note "第一行" ["第二行"...]
++menu_note() {
++    local line
++    for line in "$@"; do
++        echo -e "     ${GRAY}${line}${NC}"
++    done
 +}
 +
 +# ============== 内核能力探测 ==============
@@ -109,63 +144,63 @@
 +    fi
 +}
 +
-@@ -605 +703,4 @@
+@@ -605 +738,4 @@
 -# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
 +# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED] [DECRYPTION]
 +#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
 +#   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
 +#   DECRYPTION 非空时启用 VLESS Encryption（`xray vlessenc` 生成的 decryption 串）。
-@@ -612,0 +714,2 @@
+@@ -612,0 +749,2 @@
 +    local mldsa65_seed="${7:-}"
 +    local decryption="${8:-}"
-@@ -625,0 +729,3 @@
+@@ -625,0 +764,3 @@
 +        --arg target_key "$(xray_reality_target_key)" \
 +        --arg mldsa65_seed "$mldsa65_seed" \
 +        --arg decryption "$decryption" \
-@@ -633 +739 @@
+@@ -633 +774 @@
 -                "decryption": "none"
 +                "decryption": (if $decryption == "" then "none" else $decryption end)
-@@ -640 +746 @@
+@@ -640 +781 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -643,2 +749 @@
+@@ -643,2 +784 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
 +                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
-@@ -648 +753 @@
+@@ -648 +788 @@
 -        }'
 +        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
-@@ -652 +757,3 @@
+@@ -652 +792,3 @@
 -# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH
 +# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED] [DECRYPTION]
 +#   启用 VLESS Encryption 后 flow 改为 xtls-rprx-vision：Vision 流控原本只能用在
 +#   TCP + TLS/REALITY 上，VLESS Encryption 解除了对底层传输的限制。
-@@ -660,0 +768,2 @@
+@@ -660,0 +803,2 @@
 +    local mldsa65_seed="${8:-}"
 +    local decryption="${9:-}"
-@@ -674,0 +784,3 @@
+@@ -674,0 +819,3 @@
 +        --arg target_key "$(xray_reality_target_key)" \
 +        --arg mldsa65_seed "$mldsa65_seed" \
 +        --arg decryption "$decryption" \
-@@ -681,2 +793,2 @@
+@@ -681,2 +828,2 @@
 -                "clients": [{"id": $uuid, "flow": ""}],
 -                "decryption": "none"
 +                "clients": [{"id": $uuid, "flow": (if $decryption == "" then "" else "xtls-rprx-vision" end)}],
 +                "decryption": (if $decryption == "" then "none" else $decryption end)
-@@ -690 +802 @@
+@@ -690 +837 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -693,2 +805 @@
+@@ -693,2 +840 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
 +                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
-@@ -698 +809 @@
+@@ -698 +844 @@
 -        }'
 +        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
-@@ -767 +878 @@
+@@ -767 +913 @@
 -                    "short_id": [$sid]
 +                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
-@@ -823,0 +935,45 @@
+@@ -823,0 +970,45 @@
 +# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
 +version_ge() {
 +    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
@@ -211,35 +246,35 @@
 +          end'
 +}
 +
-@@ -825 +981,4 @@
+@@ -825 +1016,4 @@
 -# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
 +# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
 +#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
 +#   伪装站点随之失去意义，因此同时去掉 masquerade。
 +#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
-@@ -832,0 +992,2 @@
+@@ -832,0 +1027,2 @@
 +    local obfs_password="${7:-}"
 +    local tls_json="${8:-}"
-@@ -838 +999,3 @@
+@@ -838 +1034,3 @@
 -    [[ -n "$cert" && -n "$key" ]] || return 1
 +    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
 +    [[ -n "$tls_json" ]] || tls_json=null
 +    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
-@@ -848,0 +1012,2 @@
+@@ -848,0 +1047,2 @@
 +        --arg obfs_password "$obfs_password" \
 +        --argjson tls_override "$tls_json" \
-@@ -855 +1020 @@
+@@ -855 +1055 @@
 -            "tls": {
 +            "tls": ($tls_override // {
-@@ -860 +1025 @@
+@@ -860 +1060 @@
 -            },
 +            }),
-@@ -866 +1031,3 @@
+@@ -866 +1066,3 @@
 -        }'
 +        } | if $obfs_password != "" then
 +                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
 +            else . end'
-@@ -960 +1127,12 @@
+@@ -960 +1162,12 @@
 -# SNI 域名列表（完整列表，用于延迟测试）
 +# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
 +# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
@@ -253,42 +288,42 @@
 +}
 +
 +# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
-@@ -977 +1154,0 @@
+@@ -977 +1189,0 @@
 -    "xp.apple.com"
-@@ -979 +1155,0 @@
+@@ -979 +1190,0 @@
 -    "www.apple.com"
-@@ -984,2 +1159,0 @@
+@@ -984,2 +1194,0 @@
 -    "www.icloud.com"
 -    "apps.apple.com"
-@@ -995 +1168,0 @@
+@@ -995 +1203,0 @@
 -    "ocsp2.apple.com"
-@@ -1003 +1175,0 @@
+@@ -1003 +1210,0 @@
 -    "apps.mzstatic.com"
-@@ -1010 +1181,0 @@
+@@ -1010 +1216,0 @@
 -    "statici.icloud.com"
-@@ -1029 +1199,0 @@
+@@ -1029 +1234,0 @@
 -    "is1-ssl.mzstatic.com"
-@@ -1036 +1205,0 @@
+@@ -1036 +1240,0 @@
 -    "gsp-ssl.ls.apple.com"
-@@ -1047 +1215,0 @@
+@@ -1047 +1250,0 @@
 -    "fpinit.itunes.apple.com"
-@@ -1051,2 +1218,0 @@
+@@ -1051,2 +1253,0 @@
 -    "iosapps.itunes.apple.com"
 -    "se-edge.itunes.apple.com"
-@@ -1056 +1221,0 @@
+@@ -1056 +1256,0 @@
 -    "configuration.ls.apple.com"
-@@ -1060 +1224,0 @@
+@@ -1060 +1259,0 @@
 -    "amp-api-edge.apps.apple.com"
-@@ -1073 +1236,0 @@
+@@ -1073 +1271,0 @@
 -    "downloaddispatch.itunes.apple.com"
-@@ -4664,0 +4828,6 @@
+@@ -4664,0 +4863,6 @@
 +
 +start_pre() {
 +    # Hysteria2 端口跳跃的 NAT 规则不持久，随服务启动重新下发（helper 不存在则跳过）。
 +    [ -x /usr/local/libexec/proxy-hub-hy2-hop ] && /usr/local/libexec/proxy-hub-hy2-hop apply
 +    return 0
 +}
-@@ -4668,0 +4838,144 @@
+@@ -4668,0 +4873,144 @@
 +# ============== Hysteria2 端口跳跃 ==============
 +#
 +# 服务端只监听一个 UDP 端口；端口跳跃靠 NAT 把一段 UDP 端口重定向到它。规则放在
@@ -433,13 +468,13 @@
 +    fi
 +}
 +
-@@ -5411,0 +5725,5 @@
+@@ -5411,0 +5760,5 @@
 +# ============== Hysteria2 加固选项 ==============
 +#
 +# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
 +# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
 +
-@@ -5429,0 +5748,37 @@
+@@ -5429,0 +5783,37 @@
 +# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
 +# 已经分配给别的节点的端口再发一次。
 +# Usage: node_tcp_port_claimed PORT
@@ -477,25 +512,25 @@
 +    gen_random_free_port "$exclude_port"
 +}
 +
-@@ -5522 +5877,5 @@
+@@ -5522 +5912,5 @@
 -            default_at_port=$(gen_random_free_port)
 +            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 +                default_at_port=$(default_reality_port)
 +            else
 +                default_at_port=$(gen_random_free_port)
 +            fi
-@@ -5559 +5918 @@
+@@ -5559 +5953 @@
 -            default_vision_port=$(gen_random_free_port)
 +            default_vision_port=$(default_reality_port)
-@@ -5575 +5934 @@
+@@ -5575 +5969 @@
 -            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
 +            default_xhttp_port=$(default_reality_port "${PORT:-0}")
-@@ -5634 +5993,3 @@
+@@ -5634 +6028,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +6013,16 @@
+@@ -5651,0 +6048,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -512,11 +547,11 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +6087,3 @@
+@@ -5709,0 +6122,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -5951,0 +6332,104 @@
+@@ -5951,0 +6367,104 @@
 +# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
 +# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
 +# 预热一次，后台子 shell 直接继承。
@@ -621,21 +656,21 @@
 +    done
 +}
 +
-@@ -5959 +6443 @@
+@@ -5959 +6478 @@
 -    local t1 t2 family_flag
 +    local t1 t2 family_flag tls13_flag
-@@ -5962,0 +6447,3 @@
+@@ -5962,0 +6482,3 @@
 +    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
 +    tls13_flag=$(sni_tls13_flag)
 +    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
-@@ -5987,0 +6475 @@
+@@ -5987,0 +6510 @@
 +    sni_tls13_flag >/dev/null
-@@ -6082,0 +6571 @@
+@@ -6082,0 +6606 @@
 +    sni_tls13_flag >/dev/null
-@@ -6201 +6690 @@
+@@ -6201 +6725 @@
 -    # 获取排序后的 Top 5 域名
 +    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
-@@ -6204,6 +6693 @@
+@@ -6204,6 +6728 @@
 -    while IFS=' ' read -r lat dom; do
 -        top_domains+=("$dom")
 -        top_latencies+=("$lat")
@@ -643,13 +678,13 @@
 -        echo "${latency_map[$domain]} $domain"
 -    done | sort -n | head -5)
 +    rank_sni_candidates latency_map top_domains top_latencies
-@@ -6303 +6787,4 @@
+@@ -6303 +6822,4 @@
 -                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
 +                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
 +                printf "\n"
-@@ -6377,0 +6865,9 @@
+@@ -6377,0 +6900,9 @@
 +# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
 +# 自己的理由（例如目标与服务器同 ASN）。
 +# Usage: warn_discouraged_reality_target DOMAIN
@@ -659,21 +694,21 @@
 +        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
 +}
 +
-@@ -6398,0 +6895 @@
+@@ -6398,0 +6930 @@
 +            warn_discouraged_reality_target "$SNI"
-@@ -6478,0 +6976,4 @@
+@@ -6478,0 +7011,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +6985 @@
+@@ -6484 +7020 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +6997,3 @@
+@@ -6495,0 +7032,3 @@
 +        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
 +        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
 +        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
-@@ -6501,0 +7006,14 @@
+@@ -6501,0 +7041,14 @@
 +        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
 +        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
 +        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
@@ -688,7 +723,7 @@
 +            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
 +        fi
 +
-@@ -6517,0 +7036,17 @@
+@@ -6517,0 +7071,17 @@
 +        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
 +        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
 +        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
@@ -706,20 +741,20 @@
 +            return 1
 +        fi
 +
-@@ -6563 +7098 @@
+@@ -6563 +7133 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
-@@ -6591 +7126 @@
+@@ -6591 +7161 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
 +            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
-@@ -6695 +7230 @@
+@@ -6695 +7265 @@
 -    local inbounds_json="[]"
 +    local inbounds_json="[]" providers_json="[]"
-@@ -6709 +7244,2 @@
+@@ -6709 +7279,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6734 +7270,20 @@
+@@ -6734 +7305,20 @@
 -            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
 +            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
 +            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
@@ -741,37 +776,37 @@
 +                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
 +                n_sni="$n_domain"
 +            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-@@ -6738 +7293 @@
+@@ -6738 +7328 @@
 -                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
 +                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
-@@ -6781,0 +7337 @@
+@@ -6781,0 +7372 @@
 +        --argjson providers "$providers_json" \
-@@ -6787 +7343 @@
+@@ -6787 +7378 @@
 -        }' 2>&1); then
 +        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
-@@ -6815,0 +7372 @@
+@@ -6815,0 +7407 @@
 +        hy2_hop_sync
-@@ -6830,0 +7388,5 @@
+@@ -6830,0 +7423,5 @@
 +    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
 +    if ! hy2_hop_sync; then
 +        return 1
 +    fi
 +
-@@ -6870,0 +7433,5 @@
+@@ -6870,0 +7468,5 @@
 +    local save_xhttp_uuid="${XHTTP_UUID:-}"
 +    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
 +    local save_mldsa65_seed="${MLDSA65_SEED:-}"
 +    local save_vless_decryption="${VLESS_DECRYPTION:-}"
 +    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
-@@ -6872,0 +7440,5 @@
+@@ -6872,0 +7475,5 @@
 +        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
 +        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
 +        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
 +        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
 +        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
-@@ -6891,0 +7464 @@
+@@ -6891,0 +7499 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6894,0 +7468,8 @@
+@@ -6894,0 +7503,8 @@
 +XHTTP_UUID=$save_xhttp_uuid
 +XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
 +XHTTP_PRIVATE_KEY=$save_xhttp_private_key
@@ -780,12 +815,12 @@
 +MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
 +VLESS_DECRYPTION=$save_vless_decryption
 +VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
-@@ -6899,0 +7481,4 @@
+@@ -6899,0 +7516,4 @@
 +HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 +HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 +HY2_DOMAIN=${HY2_DOMAIN:-}
 +HY2_EMAIL=${HY2_EMAIL:-}
-@@ -6927 +7512,8 @@
+@@ -6927 +7547,8 @@
 -    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
 +    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
 +}
@@ -795,12 +830,12 @@
 +vless_link_pq_params() {
 +    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
 +    return 0
-@@ -6941 +7533,3 @@
+@@ -6941 +7568,3 @@
 -    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
 +    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
 +    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
 +    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
-@@ -6944 +7538,28 @@
+@@ -6944 +7573,28 @@
 -    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
 +    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
 +    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
@@ -830,7 +865,7 @@
 +    PRIVATE_KEY="$keep_private"
 +    SHORT_ID="$keep_sid"
 +    return "$rc"
-@@ -6989,0 +7611,31 @@
+@@ -6989,0 +7646,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -862,15 +897,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7643,5 @@
+@@ -6990,0 +7678,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7652 @@
+@@ -6994,0 +7687 @@
 +    local pin="" query
-@@ -7000 +7658,26 @@
+@@ -7000 +7693,26 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
@@ -898,9 +933,9 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7016,0 +7700 @@
+@@ -7016,0 +7735 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7082 +7766,7 @@
+@@ -7082 +7801,7 @@
 -    qrencode -t ANSIUTF8 "$link"
 +    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
 +    if (( ${#link} > 1200 )); then
@@ -909,23 +944,23 @@
 +    else
 +        qrencode -t ANSIUTF8 "$link"
 +    fi
-@@ -7092,0 +7783,6 @@
+@@ -7092,0 +7818,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7174,0 +7871 @@
+@@ -7174,0 +7906 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7176,0 +7874,6 @@
+@@ -7176,0 +7909,6 @@
 +        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
 +        fi
 +        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
 +            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
 +        fi
-@@ -7178,2 +7881,8 @@
+@@ -7178,2 +7916,8 @@
 -        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
 -        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +        if [[ -n "${HY2_DOMAIN:-}" ]]; then
@@ -936,11 +971,11 @@
 +            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +            show_selfsigned_cert_pins
 +        fi
-@@ -7207,0 +7917 @@
+@@ -7207,0 +7952 @@
 +            show_extra_short_ids
-@@ -7212,0 +7923 @@
+@@ -7212,0 +7958 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +7973,12 @@
+@@ -7261,0 +8008,12 @@
 +        show_extra_short_ids
 +        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
 +            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
@@ -953,7 +988,7 @@
 +            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
 +            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
 +        fi
-@@ -7378,0 +8102,9 @@
+@@ -7378,0 +8137,9 @@
 +            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
 +            if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +                local acme_port
@@ -963,50 +998,50 @@
 +                        log_warn "Could not automatically open TCP port $acme_port for ACME"
 +                done
 +            fi
-@@ -7534,0 +8267,3 @@
+@@ -7534,0 +8302,3 @@
 +        configure_hy2_options || return 1
 +        # ACME 节点的 TLS SNI 就是证书域名。
 +        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
-@@ -7552,0 +8288 @@
+@@ -7552,0 +8323 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7572,0 +8309 @@
+@@ -7572,0 +8344 @@
 +            apply_extra_short_ids || return 1
-@@ -7588,0 +8326 @@
+@@ -7588,0 +8361 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7595,0 +8334,6 @@
+@@ -7595,0 +8369,6 @@
 +        apply_extra_short_ids || return 1
 +        # both 节点的两个 inbound 各用一套凭据，互不牵连。
 +        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
 +            gen_xhttp_credentials || return 1
 +        fi
 +        configure_pq_options || return 1
-@@ -7607,2 +8351,2 @@
+@@ -7607,2 +8386,2 @@
 -        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
 -        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
 +        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
 +        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
-@@ -7921,0 +8666,5 @@
+@@ -7921,0 +8701,5 @@
 +    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
 +    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 +    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
 +    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 +    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
-@@ -7970,0 +8720,2 @@
+@@ -7970,0 +8755,2 @@
 +                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
 +                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
-@@ -8018,0 +8770,2 @@
+@@ -8018,0 +8805,2 @@
 +                    # ACME 节点的 SNI 即证书域名，两者一起改。
 +                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
-@@ -8028,0 +8782,2 @@
+@@ -8028,0 +8817,2 @@
 +                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
 +                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
-@@ -8033,0 +8789,5 @@
+@@ -8033,0 +8824,5 @@
 +                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
 +                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
 +                        local keep_xhttp_uuid="$XHTTP_UUID"
 +                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
 +                    fi
-@@ -8062,0 +8823,22 @@
+@@ -8062,0 +8858,22 @@
 +            hysteria2:4)
 +                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +                    HY2_OBFS_PASSWORD=""
@@ -1029,14 +1064,14 @@
 +                elif apply_hy2_hop_range "$new_hop"; then
 +                    changed=true
 +                fi ;;
-@@ -8087 +8869 @@
+@@ -8087 +8904 @@
 -        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
 +        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
-@@ -8133,0 +8916,3 @@
+@@ -8133,0 +8951,3 @@
 +    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
 +    hy2_hop_remove
 +
-@@ -8539,0 +9325,271 @@
+@@ -8539,0 +9360,390 @@
 +}
 +
 +# ============== 协议可选增强 ==============
@@ -1114,27 +1149,38 @@
 +    xray_supports vlessenc || xray_supports mldsa65 || return 0
 +    # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
 +    # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
-+    ( : >/dev/tty ) 2>/dev/null || return 0
++    tty_available || return 0
 +
 +    {
 +    echo ""
 +    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-+    echo -e "${GREEN}        $(t2 "后量子增强（可选）" "Post-quantum options (optional)")${NC}"
++    echo -e "${GREEN}        $(t2 "后量子增强（可选，回车跳过）" "Post-quantum options (optional, Enter to skip)")${NC}"
 +    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 +    echo ""
-+    echo -e "  ${YELLOW}$(t2 "两项都要求较新的客户端；不确定客户端是否支持时请保持关闭。" \
-+        "Both need a recent client; leave them off when unsure about client support.")${NC}"
++    menu_note "$(t2 "作用：防止今天被录下的流量在将来被量子计算机解密或伪造。" \
++        "Purpose: keep traffic recorded today from being decrypted or forged by a future quantum computer.")" \
++        "$(t2 "密钥全部自动生成，无需填写；代价是客户端必须足够新。" \
++        "All keys are generated for you; the cost is that clients must be recent enough.")"
 +    echo ""
 +    echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
-+    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${GRAY}(mlkem768x25519plus)${NC}"
-+    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65  ${GRAY}($(t2 "证书后量子签名" "post-quantum certificate signature"))${NC}"
++    menu_note "$(t2 "兼容所有客户端。不确定客户端版本时选这个。" \
++        "Works with every client. Pick this when unsure about client versions.")"
++    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${YELLOW}$(t2 "[新客户端推荐]" "[recommended for recent clients]")${NC}"
++    menu_note "$(t2 "给 VLESS 加一层后量子密钥交换，链接仍然很短、可以扫码。" \
++        "Adds a post-quantum key exchange to VLESS; the link stays short and scannable.")" \
++        "$(t2 "要求客户端内核为 Xray 25.9 或更新。" "Requires a client core of Xray 25.9 or newer.")"
++    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65"
++    menu_note "$(t2 "给 REALITY 证书加后量子签名，防止服务器被冒充。" \
++        "Adds a post-quantum signature to the REALITY certificate so the server cannot be impersonated.")" \
++        "$(t2 "链接会变成约 3KB，无法生成二维码，只能复制粘贴导入。" \
++        "The link grows to about 3 kB: no QR code, copy and paste only.")"
 +    echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
 +    echo ""
 +    echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
-+    } >/dev/tty
++    } | tty_print
 +
 +    local choice=""
-+    read -r choice </dev/tty || choice=""
++    tty_read choice
 +    case "$choice" in
 +        1) PQ_WANT_VLESSENC="x25519" ;;
 +        2) PQ_WANT_MLDSA65="true" ;;
@@ -1271,25 +1317,133 @@
 +        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
 +}
 +
++# 引导式选择 Hysteria2 加固方案，结果写入 HY2_REQ_OBFS / HY2_REQ_HOP /
++# HY2_REQ_DOMAIN / HY2_REQ_EMAIL（取值与同名环境变量相同）。
++#
++# 设计目标是让用户不需要理解每个参数：前两个方案的全部参数都随机生成，回车即采用
++# 推荐方案；每个方案下面写明它做什么、需要用户额外做什么。只有"自定义"才逐项提问，
++# 且每一问都有可以直接回车的默认值。
++prompt_hy2_hardening() {
++    local choice="" answer="" hop_hint=""
++    HY2_REQ_OBFS="" HY2_REQ_HOP="" HY2_REQ_DOMAIN="" HY2_REQ_EMAIL=""
++    command -v iptables >/dev/null 2>&1 || \
++        hop_hint="  ${RED}$(t2 "(本机没有 iptables，暂不可用)" "(unavailable: iptables is not installed)")${NC}"
++
++    {
++    echo ""
++    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
++    echo -e "${GREEN}        $(t2 "Hysteria2 加固方案（回车采用推荐）" "Hysteria2 hardening (Enter for the recommended preset)")${NC}"
++    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
++    echo ""
++    menu_note "$(t2 "Hysteria2 默认是明文特征的 QUIC + 自签名证书，握手很容易被认出来。" \
++        "By default Hysteria2 is recognisable QUIC with a self-signed certificate.")" \
++        "$(t2 "下面的方案会自动生成随机参数，装完直接导入链接即可使用。" \
++        "The presets below generate random parameters; import the link afterwards and you are done.")"
++    echo ""
++    echo -e "  ${GREEN}1.${NC} $(t2 "Salamander 混淆" "Salamander obfuscation")  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
++    menu_note "$(t2 "随机生成混淆密码，把流量打乱成看不出协议的数据。" \
++        "Generates a random password and scrambles the traffic so the protocol is not recognisable.")" \
++        "$(t2 "主流 Hysteria2 客户端都支持，密码已包含在分享链接里。" \
++        "Supported by mainstream Hysteria2 clients; the password travels in the share link.")"
++    echo -e "  ${GREEN}2.${NC} $(t2 "混淆 + 端口跳跃" "Obfuscation + port hopping")${hop_hint}"
++    menu_note "$(t2 "在方案 1 之上，随机挑一段 200 个 UDP 端口轮换，对抗针对单个端口的限速或封锁。" \
++        "On top of preset 1, rotates across a random range of 200 UDP ports against per-port throttling or blocking.")" \
++        "$(t2 "需要你到云厂商安全组放行这段 UDP 端口（安装后会显示），否则会间歇断流。" \
++        "You must allow that UDP range in the cloud firewall (shown after install), or connections will stall.")"
++    echo -e "  ${GREEN}3.${NC} $(t2 "不加固" "No hardening")"
++    menu_note "$(t2 "保持最简形态，兼容最老的客户端；被识别的风险最高。" \
++        "Plain Hysteria2 for the oldest clients; the easiest to recognise.")"
++    echo -e "  ${GREEN}4.${NC} $(t2 "自定义" "Custom")"
++    menu_note "$(t2 "逐项选择：混淆密码、跳跃范围、用自己的域名申请真证书（ACME）。" \
++        "Choose each item: obfs password, hop range, and a real certificate (ACME) for your own domain.")"
++    echo ""
++    echo -n "  $(t2 "请选择" "Select") [1-4] ($(t2 "默认" "default") 1): "
++    } | tty_print
++    tty_read choice
++
++    case "$choice" in
++        2)
++            HY2_REQ_OBFS="true"
++            if [[ -z "$hop_hint" ]]; then
++                HY2_REQ_HOP="auto"
++            else
++                log_warn "$(t2 "没有 iptables，已改用方案 1（仅混淆）" "iptables is missing; using preset 1 (obfuscation only)")"
++            fi
++            ;;
++        3) ;;
++        4)
++            {
++            echo ""
++            echo -e "  ${BLUE}$(t2 "Salamander 混淆密码" "Salamander obfs password")${NC}"
++            menu_note "$(t2 "回车 = 随机生成（推荐）；输入 n = 不启用；也可以自己输入 8 位以上的密码。" \
++                "Enter = random (recommended); n = off; or type your own password of 8+ characters.")"
++            echo -n "  > "
++            } | tty_print
++            tty_read answer
++            case "${answer,,}" in
++                "") HY2_REQ_OBFS="true" ;;
++                n|no) HY2_REQ_OBFS="" ;;
++                *) HY2_REQ_OBFS="$answer" ;;
++            esac
++            {
++            echo ""
++            echo -e "  ${BLUE}$(t2 "端口跳跃范围" "Port hopping range")${NC}${hop_hint}"
++            menu_note "$(t2 "回车 = 不启用；输入 a = 随机挑一段（推荐）；或输入 起始-结束，例如 20000-20200。" \
++                "Enter = off; a = pick a random range (recommended); or START-END such as 20000-20200.")"
++            echo -n "  > "
++            } | tty_print
++            tty_read answer
++            case "${answer,,}" in
++                "") HY2_REQ_HOP="" ;;
++                a|auto) HY2_REQ_HOP="auto" ;;
++                *) HY2_REQ_HOP="$answer" ;;
++            esac
++            {
++            echo ""
++            echo -e "  ${BLUE}$(t2 "ACME 证书域名" "ACME certificate domain")${NC}"
++            menu_note "$(t2 "回车 = 用自签名证书（无需域名）。" "Enter = keep the self-signed certificate (no domain needed).")" \
++                "$(t2 "有域名且已解析到本机时填在这里，客户端就不再需要 insecure；需要 80 或 443/tcp 空闲。" \
++                "If you own a domain that already points here, type it: clients no longer need insecure. Needs 80 or 443/tcp free.")"
++            echo -n "  > "
++            } | tty_print
++            tty_read answer
++            HY2_REQ_DOMAIN="$answer"
++            ;;
++        *) HY2_REQ_OBFS="true" ;;
++    esac
++}
++
 +# 为当前正在安装的 Hysteria2 节点应用可选加固。
 +#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
 +#   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
 +#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
++#
++# 两条入口：完全交互的安装走引导菜单（默认采用推荐方案）；只要调用方用 proto= 或
++# 任一 hy2* 变量驱动安装，就只按环境变量执行、不追加提问，默认全部关闭——既有的
++# 无人值守脚本因此得到与升级前完全相同的节点。
 +configure_hy2_options() {
 +    HY2_OBFS_PASSWORD=""
 +    HY2_HOP_PORTS=""
 +    HY2_DOMAIN=""
 +    HY2_EMAIL=""
 +
-+    if [[ -n "${hy2domain:-}" ]]; then
-+        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
++    HY2_REQ_OBFS="${hy2obfs:-}"
++    HY2_REQ_HOP="${hy2hop:-}"
++    HY2_REQ_DOMAIN="${hy2domain:-}"
++    HY2_REQ_EMAIL="${hy2email:-}"
++    if [[ -z "${proto:-}${hy2obfs:-}${hy2hop:-}${hy2domain:-}" ]] && tty_available; then
++        prompt_hy2_hardening
 +    fi
 +
-+    if [[ -n "${hy2hop:-}" ]]; then
-+        apply_hy2_hop_range "$hy2hop" || return 1
++    if [[ -n "$HY2_REQ_DOMAIN" ]]; then
++        apply_hy2_acme_domain "$HY2_REQ_DOMAIN" "$HY2_REQ_EMAIL" || return 1
 +    fi
 +
-+    local obfs_request="${hy2obfs:-}"
++    if [[ -n "$HY2_REQ_HOP" ]]; then
++        apply_hy2_hop_range "$HY2_REQ_HOP" || return 1
++    fi
++
++    local obfs_request="$HY2_REQ_OBFS"
 +    case "${obfs_request,,}" in
 +        ""|false|0|n|no|off) ;;
 +        true|1|y|yes|on)
@@ -1305,6 +1459,6 @@
 +            ;;
 +    esac
 +    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
-+        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
-+            "Salamander obfuscation enabled (clients must use the same obfs password)")"
++        log_info "$(t2 "已启用 Salamander 混淆（密码已写入分享链接，客户端导入即可）" \
++            "Salamander obfuscation enabled (the password is in the share link; just import it)")"
 +    fi

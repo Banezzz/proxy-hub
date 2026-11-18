@@ -1154,4 +1154,136 @@ if use_real_singbox; then
 fi
 SCENARIO
 
+# Guided presets: an interactive install explains every choice, generates all
+# parameters itself, and Enter picks the recommended preset.  A scripted install
+# (proto= or any option variable) is never asked and keeps everything off.
+run_scenario guided-presets <<'SCENARIO'
+load_modules
+cat >/srv/bin/iptables <<'FAKE'
+#!/bin/sh
+exit 0
+FAKE
+chmod 755 /srv/bin/iptables
+SAFE_PATH="$PATH"
+PATH="/srv/bin:$PATH"
+CURRENT_NODE_NAME=fresh
+PROXY_HUB_TTY_OUT=/srv/tty.out
+
+# Feed answers through the test seam: one line per question.
+answer_with() {
+    printf '%s\n' "$@" >/srv/tty.answers
+    exec 7</srv/tty.answers
+    PROXY_HUB_TTY_FD=7
+    : >/srv/tty.out
+}
+done_answering() { exec 7<&-; unset PROXY_HUB_TTY_FD; }
+
+# Enter: the recommended preset, obfuscation with a random password.
+answer_with ""
+configure_hy2_options 2>/dev/null
+done_answering
+[[ "$HY2_OBFS_PASSWORD" =~ ^[0-9a-f]{32}$ ]] || fail_case "Enter must enable obfuscation with a random password"
+assert_eq "/" "$HY2_HOP_PORTS/$HY2_DOMAIN" "the default preset adds neither hopping nor ACME"
+screen=$(cat /srv/tty.out)
+assert_contains "$screen" "[recommended, default]" "the menu must mark the recommended preset"
+assert_contains "$screen" "scrambles the traffic" "each preset must explain what it does"
+assert_contains "$screen" "allow that UDP range in the cloud firewall" "the hopping preset must state its cost"
+first_password="$HY2_OBFS_PASSWORD"
+answer_with "1"
+configure_hy2_options 2>/dev/null
+done_answering
+assert_ne_pw() { [[ "$1" != "$2" ]] || fail_case "$3"; }
+assert_ne_pw "$first_password" "$HY2_OBFS_PASSWORD" "every install must get its own random password"
+
+# Preset 2: obfuscation plus a random hop range.
+answer_with "2"
+configure_hy2_options 2>/dev/null
+done_answering
+[[ -n "$HY2_OBFS_PASSWORD" ]] || fail_case "preset 2 must enable obfuscation"
+validate_hop_range "$HY2_HOP_PORTS" >/dev/null || fail_case "preset 2 must pick a hop range: $HY2_HOP_PORTS"
+
+# Preset 2 without iptables degrades to preset 1 and says so.
+mkdir -p /srv/nopath
+for tool in bash sh cat awk sort head shuf openssl getent tr basename dirname mktemp rm mkdir chmod mv timeout stat; do
+    tool_path=$(PATH="$SAFE_PATH" command -v "$tool") && ln -sf "$tool_path" "/srv/nopath/$tool"
+done
+answer_with "2"
+PATH=/srv/nopath configure_hy2_options 2>/srv/preset.warn
+done_answering
+[[ -n "$HY2_OBFS_PASSWORD" && -z "$HY2_HOP_PORTS" ]] || fail_case "without iptables preset 2 must fall back to obfuscation only"
+assert_contains "$(cat /srv/preset.warn)" "using preset 1" "the fallback must be announced"
+assert_contains "$(cat /srv/tty.out)" "iptables is not installed" "the menu must show why hopping is unavailable"
+
+# Preset 3: nothing.
+answer_with "3"
+configure_hy2_options
+done_answering
+assert_eq "//" "$HY2_OBFS_PASSWORD/$HY2_HOP_PORTS/$HY2_DOMAIN" "preset 3 leaves the node plain"
+
+# Custom: every question has an Enter default.
+answer_with "4" "" "a" ""
+configure_hy2_options 2>/dev/null
+done_answering
+[[ "$HY2_OBFS_PASSWORD" =~ ^[0-9a-f]{32}$ ]] || fail_case "custom: Enter must generate the obfs password"
+validate_hop_range "$HY2_HOP_PORTS" >/dev/null || fail_case "custom: 'a' must pick a random hop range"
+assert_eq "" "$HY2_DOMAIN" "custom: Enter keeps the self-signed certificate"
+assert_contains "$(cat /srv/tty.out)" "Enter = random (recommended)" "custom questions must state their defaults"
+
+answer_with "4" "n" "41000-41100" ""
+configure_hy2_options 2>/dev/null
+done_answering
+assert_eq "/41000-41100" "$HY2_OBFS_PASSWORD/$HY2_HOP_PORTS" "custom: explicit answers are honoured"
+
+answer_with "4" "My.Own-Pass_99" "" ""
+configure_hy2_options 2>/dev/null
+done_answering
+assert_eq "My.Own-Pass_99/" "$HY2_OBFS_PASSWORD/$HY2_HOP_PORTS" "custom: a typed password is kept"
+
+# A scripted install is never asked and stays off by default.
+answer_with "2"
+proto=hysteria2 configure_hy2_options
+assert_eq "//" "$HY2_OBFS_PASSWORD/$HY2_HOP_PORTS/$HY2_DOMAIN" "proto= must suppress the menu and keep defaults off"
+assert_eq "" "$(cat /srv/tty.out)" "proto= must not draw the menu"
+hy2obfs=false configure_hy2_options
+assert_eq "" "$(cat /srv/tty.out)" "an option variable must not draw the menu"
+done_answering
+
+# Post-quantum menu.
+make_fake_xray /srv/bin/xray-pq mldsa65 vlessenc
+XRAY_BIN=/srv/bin/xray-pq
+XRAY_CAPS=""
+answer_with ""
+prompt_pq_options
+done_answering
+assert_eq "/" "$PQ_WANT_VLESSENC/$PQ_WANT_MLDSA65" "Enter keeps post-quantum options off"
+screen=$(cat /srv/tty.out)
+assert_contains "$screen" "Works with every client" "the off choice must explain itself"
+assert_contains "$screen" "[recommended for recent clients]" "the menu must say which option to prefer"
+assert_contains "$screen" "no QR code" "the ML-DSA-65 cost must be stated"
+answer_with "1"
+prompt_pq_options
+done_answering
+assert_eq "x25519/" "$PQ_WANT_VLESSENC/$PQ_WANT_MLDSA65" "choice 1 selects VLESS Encryption"
+answer_with "3"
+prompt_pq_options
+done_answering
+assert_eq "x25519/true" "$PQ_WANT_VLESSENC/$PQ_WANT_MLDSA65" "choice 3 selects both"
+answer_with "1"
+proto=vision prompt_pq_options
+assert_eq "" "$(cat /srv/tty.out)" "a scripted install must not draw the post-quantum menu"
+make_fake_xray /srv/bin/xray-old
+XRAY_BIN=/srv/bin/xray-old
+XRAY_CAPS=""
+prompt_pq_options
+assert_eq "" "$(cat /srv/tty.out)" "a core without either capability must not draw the menu"
+done_answering
+
+# Without a terminal and without the seam nothing is asked.
+unset PROXY_HUB_TTY_FD
+if ! ( : >/dev/tty ) 2>/dev/null; then
+    configure_hy2_options
+    assert_eq "" "$HY2_OBFS_PASSWORD" "no terminal: defaults stay off instead of failing"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

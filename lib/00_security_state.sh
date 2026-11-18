@@ -611,6 +611,41 @@ t2() {
     fi
 }
 
+# ---- 交互终端读写 ----
+#
+# 新增的引导式菜单统一经过这三个函数与用户对话，而不是各自写死 /dev/tty：
+#   tty_available  当前能否提问（没有控制终端时返回非零，调用方按默认值处理）
+#   tty_print      把一段界面输出到终端（从 stdin 读入内容）
+#   tty_read VAR   读一行输入到变量
+# PROXY_HUB_TTY_FD / PROXY_HUB_TTY_OUT 是测试用的接缝：分别指定读取答案的文件描述符
+# 和界面输出的文件，使菜单逻辑可以在没有终端的测试沙箱里被完整驱动。
+tty_available() {
+    [[ -n "${PROXY_HUB_TTY_FD:-}" ]] || ( : >/dev/tty ) 2>/dev/null
+}
+
+tty_print() {
+    cat >>"${PROXY_HUB_TTY_OUT:-/dev/tty}"
+}
+
+tty_read() {
+    local __tty_line=""
+    if [[ -n "${PROXY_HUB_TTY_FD:-}" ]]; then
+        IFS= read -r -u "$PROXY_HUB_TTY_FD" __tty_line || __tty_line=""
+    else
+        IFS= read -r __tty_line </dev/tty || __tty_line=""
+    fi
+    printf -v "$1" '%s' "$__tty_line"
+}
+
+# 菜单项下方的说明文字：缩进、灰色，每个参数一行。
+# Usage: menu_note "第一行" ["第二行"...]
+menu_note() {
+    local line
+    for line in "$@"; do
+        echo -e "     ${GRAY}${line}${NC}"
+    done
+}
+
 # ============== 内核能力探测 ==============
 #
 # 普通 `install` 发现健康的既有 Xray 时只报告版本、不升级，因此渲染配置时不能假设
