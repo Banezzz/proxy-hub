@@ -1944,4 +1944,93 @@ CURRENT_NODE_NAME=missing
 assert_fails "a missing node must fail to load" load_node_for_edit
 SCENARIO
 
+# Optional config encryption: every secret must survive a save/load round trip,
+# and a value that cannot be decrypted must never be used or overwritten.
+run_scenario config-encryption-round-trip <<'SCENARIO'
+load_modules
+ENCRYPTION_KEY_FILE=/srv/state/config.key
+ENABLE_CONFIG_ENCRYPTION=true
+setup_encryption_key
+is_encryption_enabled || fail_case "encryption must be active for this scenario"
+
+# Ciphertext is a single line whatever the plaintext length.
+LONG=$(head -c 96 /dev/zero | tr '\0' 'k')
+for plain in x 11111111-1111-4111-8111-111111111111 0L7o52zLQdOiD9cNmJwq0t9hmBupbWOBAhSmJVSXDVY "$LONG"; do
+    cipher=$(encrypt_value "$plain")
+    assert_eq "1" "$(printf '%s\n' "$cipher" | wc -l | tr -d ' ')" "ciphertext of a ${#plain}-byte value must be one line"
+    [[ "$cipher" =~ ^U2FsdGVk[A-Za-z0-9+/=]+$ ]] || fail_case "ciphertext must fit the node-file character set"
+    assert_eq "$plain" "$(decrypt_value "$cipher")" "a ${#plain}-byte value must decrypt to itself"
+done
+assert_eq "" "$(encrypt_value "")" "an empty value stays empty"
+assert_eq "plain-value" "$(decrypt_value plain-value)" "an unencrypted value passes through"
+
+# A node carrying every secret field round-trips through save_env and the loader.
+reset_node_state
+CURRENT_NODE_NAME=enc
+NODE_NAME=enc PROTOCOL_TYPE=both PORT=1443 XHTTP_PORT=2443 XHTTP_PATH=/e SNI=edge.example.com
+UUID=11111111-1111-4111-8111-111111111111
+PUBLIC_KEY=PubKey_1 PRIVATE_KEY=0L7o52zLQdOiD9cNmJwq0t9hmBupbWOBAhSmJVSXDVY SHORT_ID=0123456789abcdef
+XHTTP_UUID=22222222-2222-4222-8222-222222222222 XHTTP_PUBLIC_KEY=XPub_1
+XHTTP_PRIVATE_KEY=YEaD36oML8mWHgw86qao95BwbYgzHxa6_xnLkoKR8aA XHTTP_SHORT_ID=fedcba9876543210
+MLDSA65_SEED=M5gqgH8WoND6770YRg-JDO2qwuGr5vhLgbJBg4xOwMA MLDSA65_VERIFY=Verify_1
+VLESS_DECRYPTION=mlkem768x25519plus.native.600s.92MSizeJKdX-kGZU3lc1LSGA3tl7WGZmhUgy-zczYeMKLO3sUKrWYx66jmwt6B41LUbrSDvFgiJQvOmSenNtjw
+VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1
+SS_PASSWORD=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= ANYTLS_PASSWORD=0123456789abcdef0123456789abcdef
+HY2_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef HY2_OBFS_PASSWORD=Obfs.Pass_1234567890
+declare -A expected=()
+SECRETS="UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD"
+for field in $SECRETS; do expected[$field]="${!field}"; done
+save_env
+file="$NODES_DIR/enc.env"
+for field in $SECRETS; do
+    stored=$(grep "^${field}=" "$file" | cut -d= -f2-)
+    [[ "$stored" == U2FsdGVk* ]] || fail_case "$field must be stored encrypted"
+    assert_eq "1" "$(grep -c "^${field}=" "$file")" "$field must occupy exactly one line"
+done
+assert_eq "0" "$(grep -vc '^[A-Z0-9_]*=' "$file")" "the node file must contain only KEY=VALUE lines"
+assert_not_contains "$(cat "$file")" "0L7o52zLQdOiD9cNmJwq0t9hmBupbWOBAhSmJVSXDVY" "the private key must not be stored in the clear"
+
+reset_node_state
+CURRENT_NODE_NAME=enc
+load_node_for_edit || fail_case "an encrypted node must load"
+for field in $SECRETS; do
+    assert_eq "${expected[$field]}" "${!field}" "$field must survive the encrypted round trip"
+done
+
+# The renderer sees the decrypted values.
+make_fake_xray /srv/bin/xray-pq mldsa65 mlkem768 vlessenc
+XRAY_BIN=/srv/bin/xray-pq
+XRAY_CAPS=""
+write_config
+assert_eq "11111111-1111-4111-8111-111111111111" \
+    "$(jq -r '.inbounds[] | select(.tag == "enc_vision") | .settings.clients[0].id' "$XRAY_CONF")" \
+    "the rendered config must contain the decrypted UUID"
+assert_eq "YEaD36oML8mWHgw86qao95BwbYgzHxa6_xnLkoKR8aA" \
+    "$(jq -r '.inbounds[] | select(.tag == "enc_xhttp") | .streamSettings.realitySettings.privateKey' "$XRAY_CONF")" \
+    "the rendered config must contain the decrypted XHTTP key"
+
+# A truncated ciphertext, as the old multi-line output left behind, is neither
+# used as a credential nor overwritten.
+broken=$(grep '^PRIVATE_KEY=' "$file" | cut -d= -f2- | cut -c1-64)
+sed -i "s|^PRIVATE_KEY=.*|PRIVATE_KEY=${broken}|" "$file"
+assert_eq "" "$(decrypt_value "$broken" 2>/dev/null)" "an undecryptable value must not be returned as if it were plaintext"
+assert_contains "$(decrypt_value "$broken" 2>&1 >/dev/null)" "Could not decrypt" "the failure must be reported"
+before=$(sha256sum "$file")
+reset_node_state
+CURRENT_NODE_NAME=enc
+rc=0
+load_node_for_edit 2>/srv/enc.err || rc=$?
+assert_eq "1" "$rc" "a node with an undecryptable secret must refuse to load for editing"
+assert_contains "$(cat /srv/enc.err)" "Cannot decrypt PRIVATE_KEY" "the refusal must name the field"
+assert_eq "$before" "$(sha256sum "$file")" "a refused load must leave the node file untouched"
+
+# A missing key file behaves the same way.
+ENCRYPTION_KEY_FILE=/srv/state/absent.key
+assert_eq "" "$(decrypt_value "$(grep '^UUID=' "$file" | cut -d= -f2-)" 2>/dev/null)" \
+    "without the key an encrypted value is empty, not ciphertext"
+var_holder=$(grep '^UUID=' "$file" | cut -d= -f2-)
+assert_fails "decrypt_into must fail without the key" decrypt_into var_holder
+[[ "$var_holder" == U2FsdGVk* ]] || fail_case "a failed decrypt_into must leave the variable alone"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

@@ -626,16 +626,17 @@ load_node_for_edit() {
     safe_load_node_config "$node_file" || return 1
 
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
-    UUID=$(decrypt_value "$UUID")
-    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
-    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
-    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
-    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
-    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
-    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
-    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
-    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+    # 任何一个密文解不开就拒绝继续：调用方随后会 save_env，带着空值重存等于把节点
+    # 文件里仅存的密文抹掉。
+    local secret
+    for secret in UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD \
+        XHTTP_UUID XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD; do
+        if ! decrypt_into "$secret"; then
+            log_error "$(t2 "节点 $CURRENT_NODE_NAME 的 $secret 无法解密，已中止以免覆盖原值" \
+                "Cannot decrypt $secret of node $CURRENT_NODE_NAME; stopped so the stored value is not overwritten")"
+            return 1
+        fi
+    done
 }
 
 cmd_edit() {

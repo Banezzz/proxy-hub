@@ -1113,11 +1113,24 @@ encrypt_value() {
     local key
     key=$(cat "$ENCRYPTION_KEY_FILE")
 
-    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
+    # -A 让 base64 输出保持单行。只用 -a 时 openssl 每 64 个字符换一行，而节点文件
+    # 是逐行的 KEY=VALUE：UUID 或 REALITY 私钥的密文都超过一行，第二行会在写入后
+    # 丢失，节点从此读不出来。
+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:$key" 2>/dev/null
 }
 
+# 解密一个节点字段。未加密的值原样返回（向后兼容）。
+#
+# 看起来是密文却解不开时输出空串并告警，而不是把密文当成明文交出去：调用方都把
+# 结果直接用作 UUID、私钥或密码，把一段 base64 密文写进内核配置只会得到一个永远
+# 连不上、又看不出原因的节点。典型的解不开的情况：旧版本写出的多行密文只剩
+# 第一行，或密钥文件已被替换。
+#
+# 始终返回 0。调用点大多是 `set -e` 下的裸赋值 `x=$(decrypt_value ...)`，返回非零
+# 会让整个脚本在没有上下文的位置退出；需要区分"解密失败"的调用方（会把结果重新
+# 存盘的那些）用 decrypt_into，它据"密文非空而明文为空"判断。
 decrypt_value() {
-    local ciphertext="$1"
+    local ciphertext="$1" key plaintext
     [[ -z "$ciphertext" ]] && return 0
 
     # Check if value is encrypted (starts with U2FsdGVk after base64 decode)
@@ -1127,12 +1140,34 @@ decrypt_value() {
         return 0
     fi
 
-    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        log_warn "$(t2 "发现加密的配置值，但密钥文件不存在，无法解密" \
+            "Found an encrypted config value but the key file is missing; cannot decrypt")"
+        return 0
+    fi
 
-    local key
     key=$(cat "$ENCRYPTION_KEY_FILE")
+    if plaintext=$(printf '%s\n' "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:$key" 2>/dev/null) \
+        && [[ -n "$plaintext" ]]; then
+        printf '%s\n' "$plaintext"
+        return 0
+    fi
+    log_warn "$(t2 "配置值解密失败（密文不完整或密钥不匹配），该值按空处理" \
+        "Could not decrypt a config value (truncated ciphertext or wrong key); treating it as empty")"
+    return 0
+}
 
-    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
+# 就地解密一个全局变量；密文解不开时返回非零且不改动该变量。
+# 用于"读入 → 修改 → save_env 重存"的流程：那里把解密失败当成空值继续，会在重存时
+# 用空值覆盖掉节点文件里仅存的密文。
+# Usage: decrypt_into VARIABLE_NAME
+decrypt_into() {
+    local __dec_name="$1" __dec_cipher="${!1:-}" __dec_plain
+    __dec_plain=$(decrypt_value "$__dec_cipher" 2>/dev/null)
+    if [[ -n "$__dec_cipher" && -z "$__dec_plain" ]]; then
+        return 1
+    fi
+    printf -v "$__dec_name" '%s' "$__dec_plain"
 }
 
 # Check if config encryption is enabled
