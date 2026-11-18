@@ -51,6 +51,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | `hy2hop` | Hysteria2 端口跳跃；`auto` 随机选 200 个端口，或 `起始-结束`（跨度不超过 20000，不得覆盖其他节点的 UDP 端口或跳跃范围）；需要 iptables |
 | `hy2domain` | 用 ACME 为该域名签发证书；需 80/tcp 或 443/tcp 至少一个空闲 |
 | `hy2email` | ACME 账户邮箱，可选 |
+| `hy2core` | Hysteria2 的承载内核：`singbox`/`sing-box`（默认）或 `xray`；其他值返回非零 |
 | `vlessenc` | VLESS Encryption；布尔真值或 `x25519` 使用 X25519 认证，`mlkem` 使用 ML-KEM-768 认证 |
 | `mldsa65` | 布尔真值启用 REALITY ML-DSA-65；目标证书不超过 3500 字节或内核不支持时告警并跳过 |
 | `sids` | 附加 REALITY shortId，逗号或冒号分隔；每个为 2-16 位、偶数长度的十六进制 |
@@ -80,9 +81,34 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | `HY2_OBFS_PASSWORD` | 非空即启用 Salamander 混淆 |
 | `HY2_HOP_PORTS` | 端口跳跃范围 `起始-结束` |
 | `HY2_DOMAIN`, `HY2_EMAIL` | 非空即使用 ACME 证书 |
+| `HY2_CORE` | Hysteria2 的承载内核；`xray` 表示 Xray，空或其他值表示 sing-box |
 
 `reset_node_state` 仍是这些变量的唯一权威清单；`load_node_for_edit` 是"读入、解密、
 修改后 `save_env` 重存"流程的唯一入口，节点编辑与升级向导共用。
+
+### 节点归属
+
+一个节点由哪个内核承载只由 `node_core_of PROTOCOL_TYPE [HY2_CORE]` 决定，节点计数、
+两个内核的配置渲染、安装、编辑与回滚都经过它：
+
+| `PROTOCOL_TYPE` | `HY2_CORE` | 内核 |
+| --- | --- | --- |
+| `anytls`, `anytls_reality` | 任意 | sing-box |
+| `hysteria2` | `xray` | Xray |
+| `hysteria2` | 空或其他 | sing-box |
+| 其余（含缺失） | 任意 | Xray |
+
+### 可选的配置加密
+
+`ENABLE_CONFIG_ENCRYPTION=true` 且密钥文件 `/root/.reality_vision_key` 存在时，
+`save_env` 把敏感字段写成密文。契约：
+
+- 密文是**单行** base64（以 `U2FsdGVk` 开头），符合节点文件的字符集与逐行格式。
+- `decrypt_value` 对未加密的值原样返回；对解不开的密文输出**空串**并告警，始终返回
+  0。它从不把密文当作明文返回。
+- `decrypt_into VAR` 就地解密一个全局变量，解不开时返回非零且不改动该变量。
+  `load_node_for_edit` 用它：任何一个敏感字段解不开就拒绝加载，从而不会在随后的
+  `save_env` 里用空值覆盖节点文件中仅存的密文。
 
 ## sing-box Release 契约
 
@@ -129,6 +155,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | `sysctl.template` | safe | 调优文件含 `tcp_low_latency` | 按当前算法重写 |
 | `node.<name>.sni` | relink | REALITY 目标是 Apple/iCloud 系域名 | 测速并按 ASN/CDN 评分自动换域名 |
 | `node.<name>.port443` | relink | REALITY 节点不在 443，且 443/tcp 空闲、未被节点登记；每次扫描至多提供给一个节点 | 端口改为 443 并放行 |
+| `node.<name>.shortid` | relink | REALITY 节点的 shortId 非空且不足 16 位 | 换成随机的 16 位 shortId（已拆分凭据的 `both` 节点连同 XHTTP 的一起换） |
 | `node.<name>.split` | relink | `both` 节点没有 XHTTP 独立凭据 | 生成 XHTTP 凭据 |
 | `node.<name>.vlessenc` | relink | VLESS 节点未启用 VLESS Encryption，且内核支持 | 生成 X25519 认证的密钥对 |
 | `node.<name>.hy2obfs` | relink | 自签名 Hysteria2 节点未启用混淆 | 生成随机混淆密码 |
@@ -290,9 +317,20 @@ Xray release 路径不要求 `pgrep`。
 | `anytls`, `anytls_reality` | sing-box | TCP | `PORT/tcp` |
 | `hysteria2` | sing-box | UDP/QUIC | `PORT/udp` |
 
-AnyTLS 与 Hysteria2 聚合到同一个 `/usr/local/etc/sing-box/config.json` 和 sing-box
-service；Hysteria2 不引入独立二进制或每节点 service。云平台安全组不属于本机防火墙
-契约，调用方仍须按上表开放外部入口。
+由 sing-box 承载的 AnyTLS 与 Hysteria2 聚合到同一个
+`/usr/local/etc/sing-box/config.json` 和 sing-box service；Hysteria2 不引入独立
+二进制或每节点 service。云平台安全组不属于本机防火墙契约，调用方仍须按上表开放
+外部入口。
+
+`HY2_CORE=xray` 的 Hysteria2 节点改由 Xray 承载，渲染进 Xray 配置：
+`protocol: hysteria`、`settings.version: 2`、`streamSettings.network: hysteria`、
+`security: tls`（`alpn: ["h3"]`，证书仍是 `SINGBOX_CERT_DIR` 下的逐节点证书）；未启用
+混淆时带 `hysteriaSettings.masquerade`，启用时改为
+`streamSettings.finalmask.udp[{type: salamander}]`。监听地址与 `sockopt.v6only` 跟随
+网络栈设置。对客户端而言它与 sing-box 承载的节点等价，**分享链接不随内核改变**。
+限制：需要 Xray ≥ v26.3.27，否则配置生成失败；不支持 `HY2_DOMAIN`（ACME）；OpenRC
+上不支持 `HY2_HOP_PORTS`。这些组合在安装与编辑时被拒绝。上表"内核"一列对这类节点
+读作 Xray，transport 与防火墙规则不变。
 
 Hysteria2 的证书与链接：
 
@@ -307,7 +345,8 @@ Hysteria2 的证书与链接：
   链接追加 `obfs=salamander&obfs-password=...`。
 - `HY2_HOP_PORTS` 非空时链接追加 `mport=<范围>`；NAT 规则位于专用链
   `PROXY_HUB_HY2_HOP`，由 `/usr/local/libexec/proxy-hub-hy2-hop apply` 幂等重建，并随
-  sing-box 服务启动重新下发。
+  sing-box 与 xray 两个服务的启动重新下发（systemd drop-in；OpenRC 只有 sing-box
+  有该钩子）。
 
 REALITY 入站（Xray）：内核支持时写 `target`，否则写 `dest`，两者不同时出现；不写
 `fingerprint`；`shortIds` 为主 shortId 加 `EXTRA_SHORT_IDS`。节点带有 `MLDSA65_SEED`

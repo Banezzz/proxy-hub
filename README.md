@@ -14,7 +14,8 @@ AnyTLS、Hysteria2、多节点管理、WARP 分流、系统优化工具和多语
 - **Hysteria2** - 基于 sing-box 的 QUIC/UDP 协议，适合高延迟或不稳定链路；
   可选 Salamander 混淆、端口跳跃与 ACME 真证书
 
-> AnyTLS 与 Hysteria2 由 sing-box 提供；VLESS 与 Shadowsocks 由 Xray 提供。
+> AnyTLS 由 sing-box 提供；VLESS 与 Shadowsocks 由 Xray 提供；Hysteria2 默认由
+> sing-box 承载，也可以用 `hy2core=xray` 交给 Xray（分享链接不变）。
 > 脚本按节点类型安装、生成并同步对应内核的配置。每个 AnyTLS 节点都会生成
 > **独立、随机化的 padding scheme**；Hysteria2 使用独立密码和自签名 TLS 证书，
 > 分享链接同时带 `insecure=1` 与证书指纹 `pinSHA256`（用域名申请 ACME 证书后两者都不需要）。
@@ -303,6 +304,9 @@ name=hy2 proto=hysteria2 hy2obfs=true hy2hop=auto ./proxy-hub.sh install
 # Hysteria2 使用自己的域名申请 ACME 真证书（需 80 或 443/tcp 空闲）
 name=hy3 proto=hysteria2 hy2domain=hy.example.com ./proxy-hub.sh install
 
+# Hysteria2 由 Xray 承载（机器上不必再装 sing-box；分享链接与 sing-box 承载时相同）
+name=hy4 proto=hysteria2 hy2core=xray ./proxy-hub.sh install
+
 # VLESS 后量子增强（需要较新的客户端）
 name=pq1 proto=vision vlessenc=true ./proxy-hub.sh install
 name=pq2 proto=vision mldsa65=true ./proxy-hub.sh install
@@ -335,6 +339,7 @@ name=de1 proto=vision vlpt=12345 reym=www.tesla.com ./proxy-hub.sh install
 | `hy2hop` | Hysteria2 端口跳跃范围：`auto` 随机 200 个端口，或 `起始-结束` | `hy2hop=auto` |
 | `hy2domain` | 用 ACME 为该域名签发真证书（替代自签名） | `hy2domain=hy.example.com` |
 | `hy2email` | ACME 账户邮箱（可选） | `hy2email=ops@example.com` |
+| `hy2core` | Hysteria2 的承载内核：`singbox`（默认）或 `xray`（需 Xray ≥ v26.3.27） | `hy2core=xray` |
 | `vlessenc` | VLESS Encryption：`true`/`x25519`（链接短）或 `mlkem`（认证也后量子） | `vlessenc=true` |
 | `mldsa65` | REALITY ML-DSA-65 证书签名 | `mldsa65=true` |
 | `sids` | 附加 REALITY shortId，逗号分隔 | `sids=aa11,bb22cc33` |
@@ -401,7 +406,7 @@ ipstack=v4 name=hk1 ./proxy-hub.sh install
 | 分组 | 含义 | 默认 |
 |------|------|------|
 | 推荐 · 客户端无需任何改动 | 更新低于安全基线的内核、改用新版配置字段、服务沙箱加固、带校验的 GeoData 更新、刷新调优参数 | 已勾选 |
-| 可选 · 客户端需要重新导入链接 | 更换 Apple/iCloud 伪装域名、改到 443 端口、给 XHTTP 独立凭据、启用 VLESS Encryption、给 Hysteria2 启用混淆 | 未勾选 |
+| 可选 · 客户端需要重新导入链接 | 更换 Apple/iCloud 伪装域名、改到 443 端口、shortId 换成 16 位、给 XHTTP 独立凭据、启用 VLESS Encryption、给 Hysteria2 启用混淆 | 未勾选 |
 | 提示 · 无需操作 | Shadowsocks 的定位说明、Hysteria2 链接新增证书指纹 | — |
 
 直接回车就是"执行全部推荐项"，这些都不需要动客户端。会让旧链接失效的项必须主动
@@ -702,6 +707,13 @@ SNI: www.bing.com
 用 `hy2domain` 申请了 ACME 证书的节点，链接只带 `sni=<域名>`，不需要 `insecure`
 也不需要指纹。
 
+**承载内核。** Hysteria2 默认跑在 sing-box 上；Xray 自 v26.3.27 起也有原生的
+Hysteria2 入站。两者对客户端完全等价——同一个 UDP 端口、密码、证书、伪装与混淆
+设置，分享链接一字不差——所以可以随时切换而不用动客户端：安装时加
+`hy2core=xray`，或在"编辑节点"里选"切换承载内核"。机器上其余节点都在 Xray 上时，
+切到 Xray 可以少装、少维护一个内核。Xray 承载有三条限制，不满足时脚本会拒绝并
+说明原因：Xray 需 ≥ v26.3.27；不支持 ACME 证书；OpenRC（Alpine）上不支持端口跳跃。
+
 ### 推荐客户端
 
 | 平台 | 客户端 |
@@ -841,6 +853,15 @@ Hysteria2 节点在同一个 sing-box 配置中作为多个 inbounds。两个内
 脚本会按现有节点类型同步和重启需要的服务。
 
 ## 更新日志
+
+### v5.7.1
+- **修复**：可选的配置加密（`ENABLE_CONFIG_ENCRYPTION`）会把密文写成两行，节点文件
+  读不回来。现在密文固定为单行；解不开的密文不再被当作明文使用，也不会在编辑节点
+  时被空值覆盖
+- **Hysteria2 可由 Xray 承载**：`hy2core=xray` 或在"编辑节点"里切换，分享链接不变；
+  经真实 Xray 与 sing-box 客户端在本机回环上互通验证
+- 升级向导新增可选项：把现有 REALITY 节点的 shortId 换成 16 位（收益有限，默认不勾选）
+- `help` 补全了 Hysteria2、REALITY、VLESS 的安装参数
 
 ### v5.7.0
 - **升级向导**：打开菜单时检测旧版脚本留下的节点与内核并提示一次；向导逐项说明
