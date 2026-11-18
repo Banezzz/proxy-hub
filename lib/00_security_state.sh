@@ -1113,9 +1113,17 @@ encrypt_value() {
     local key
     key=$(cat "$ENCRYPTION_KEY_FILE")
 
-    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
+    # -A 让 base64 保持单行。节点文件是逐行的 KEY=VALUE，而 openssl 默认每 64 个字符
+    # 换行：明文达到 32 字节（UUID、REALITY 私钥等）时密文会变成两行，第二行在读取时
+    # 被丢弃，剩下的半截密文无法还原。
+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:$key" 2>/dev/null
 }
 
+# Usage: decrypt_value VALUE [FIELD [NODE]]
+# 明文原样返回。密文解不开（密钥文件缺失或已更换、密文不完整）时不输出任何内容并返回
+# 非零，FIELD/NODE 只用于报错。调用方必须检查返回值：旧实现在失败时回显密文，而
+# openssl 在报错前已经输出了解开的前几个分组，结果是"半截明文 + 密文"被当作凭据写进
+# 配置和分享链接。旧版本写出的被截断密文（见 encrypt_value）无法还原，同样走这条路径。
 decrypt_value() {
     local ciphertext="$1"
     [[ -z "$ciphertext" ]] && return 0
@@ -1123,16 +1131,35 @@ decrypt_value() {
     # Check if value is encrypted (starts with U2FsdGVk after base64 decode)
     if [[ ! "$ciphertext" =~ ^U2FsdGVk ]]; then
         # Not encrypted, return as-is (backward compatibility)
-        echo "$ciphertext"
+        printf '%s\n' "$ciphertext"
         return 0
     fi
 
-    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
+    # 解密同样需要 -A：不加时 openssl 拒绝超过约 1KB 的单行 base64。
+    local key="" plaintext=""
+    if [[ -f "$ENCRYPTION_KEY_FILE" ]] && key=$(cat "$ENCRYPTION_KEY_FILE") && \
+        plaintext=$(printf '%s\n' "$ciphertext" | \
+            openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:$key" 2>/dev/null); then
+        printf '%s\n' "$plaintext"
+        return 0
+    fi
 
-    local key
-    key=$(cat "$ENCRYPTION_KEY_FILE")
+    log_error "$(t2 "无法解密${3:+节点 '$3' 的 }${2:-配置值}：密钥文件 $ENCRYPTION_KEY_FILE 缺失或已更换，或密文不完整" \
+        "Cannot decrypt ${2:-a config value}${3:+ of node '$3'}: key file $ENCRYPTION_KEY_FILE is missing or was replaced, or the ciphertext is incomplete")"
+    log_error "$(t2 "旧版本会截断较长的密文，这类值无法还原。请恢复密钥文件，或删除并重建该节点" \
+        "Older versions truncated long ciphertexts, which cannot be recovered. Restore the key file, or delete and recreate the node")"
+    return 1
+}
 
-    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
+# 就地解密 safe_load_node_config 装入全局变量的全部敏感字段，清单与 save_env 加密的
+# 字段一一对应。任何一个失败即返回非零，此时这些变量不可再用于渲染、展示或 save_env。
+decrypt_node_secrets() {
+    local field value
+    for field in UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID \
+        XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD; do
+        value=$(decrypt_value "${!field:-}" "$field" "${NODE_NAME:-${CURRENT_NODE_NAME:-}}") || return 1
+        printf -v "$field" '%s' "$value"
+    done
 }
 
 # Check if config encryption is enabled

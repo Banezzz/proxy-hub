@@ -626,16 +626,7 @@ load_node_for_edit() {
     safe_load_node_config "$node_file" || return 1
 
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
-    UUID=$(decrypt_value "$UUID")
-    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
-    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
-    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
-    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
-    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
-    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
-    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
-    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+    decrypt_node_secrets
 }
 
 cmd_edit() {

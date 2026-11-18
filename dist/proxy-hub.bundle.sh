@@ -1129,9 +1129,17 @@ encrypt_value() {
     local key
     key=$(cat "$ENCRYPTION_KEY_FILE")
 
-    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -pass "pass:$key" 2>/dev/null
+    # -A 让 base64 保持单行。节点文件是逐行的 KEY=VALUE，而 openssl 默认每 64 个字符
+    # 换行：明文达到 32 字节（UUID、REALITY 私钥等）时密文会变成两行，第二行在读取时
+    # 被丢弃，剩下的半截密文无法还原。
+    echo -n "$plaintext" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:$key" 2>/dev/null
 }
 
+# Usage: decrypt_value VALUE [FIELD [NODE]]
+# 明文原样返回。密文解不开（密钥文件缺失或已更换、密文不完整）时不输出任何内容并返回
+# 非零，FIELD/NODE 只用于报错。调用方必须检查返回值：旧实现在失败时回显密文，而
+# openssl 在报错前已经输出了解开的前几个分组，结果是"半截明文 + 密文"被当作凭据写进
+# 配置和分享链接。旧版本写出的被截断密文（见 encrypt_value）无法还原，同样走这条路径。
 decrypt_value() {
     local ciphertext="$1"
     [[ -z "$ciphertext" ]] && return 0
@@ -1139,16 +1147,35 @@ decrypt_value() {
     # Check if value is encrypted (starts with U2FsdGVk after base64 decode)
     if [[ ! "$ciphertext" =~ ^U2FsdGVk ]]; then
         # Not encrypted, return as-is (backward compatibility)
-        echo "$ciphertext"
+        printf '%s\n' "$ciphertext"
         return 0
     fi
 
-    [[ ! -f "$ENCRYPTION_KEY_FILE" ]] && { echo "$ciphertext"; return 0; }
+    # 解密同样需要 -A：不加时 openssl 拒绝超过约 1KB 的单行 base64。
+    local key="" plaintext=""
+    if [[ -f "$ENCRYPTION_KEY_FILE" ]] && key=$(cat "$ENCRYPTION_KEY_FILE") && \
+        plaintext=$(printf '%s\n' "$ciphertext" | \
+            openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:$key" 2>/dev/null); then
+        printf '%s\n' "$plaintext"
+        return 0
+    fi
 
-    local key
-    key=$(cat "$ENCRYPTION_KEY_FILE")
+    log_error "$(t2 "无法解密${3:+节点 '$3' 的 }${2:-配置值}：密钥文件 $ENCRYPTION_KEY_FILE 缺失或已更换，或密文不完整" \
+        "Cannot decrypt ${2:-a config value}${3:+ of node '$3'}: key file $ENCRYPTION_KEY_FILE is missing or was replaced, or the ciphertext is incomplete")"
+    log_error "$(t2 "旧版本会截断较长的密文，这类值无法还原。请恢复密钥文件，或删除并重建该节点" \
+        "Older versions truncated long ciphertexts, which cannot be recovered. Restore the key file, or delete and recreate the node")"
+    return 1
+}
 
-    echo "$ciphertext" | openssl enc -aes-256-cbc -pbkdf2 -d -a -pass "pass:$key" 2>/dev/null || echo "$ciphertext"
+# 就地解密 safe_load_node_config 装入全局变量的全部敏感字段，清单与 save_env 加密的
+# 字段一一对应。任何一个失败即返回非零，此时这些变量不可再用于渲染、展示或 save_env。
+decrypt_node_secrets() {
+    local field value
+    for field in UUID PRIVATE_KEY SS_PASSWORD ANYTLS_PASSWORD HY2_PASSWORD XHTTP_UUID \
+        XHTTP_PRIVATE_KEY MLDSA65_SEED VLESS_DECRYPTION HY2_OBFS_PASSWORD; do
+        value=$(decrypt_value "${!field:-}" "$field" "${NODE_NAME:-${CURRENT_NODE_NAME:-}}") || return 1
+        printf -v "$field" '%s' "$value"
+    done
 }
 
 # Check if config encryption is enabled
@@ -7063,16 +7090,19 @@ write_config() {
         n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
         n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
-        # 处理可能加密的敏感值
-        n_private_key=$(decrypt_value "$n_private_key")
-        n_uuid=$(decrypt_value "$n_uuid")
-        n_ss_password=$(decrypt_value "$n_ss_password")
+        # 处理可能加密的敏感值。解不开时整次渲染失败并保留现有配置：跳过该节点会让
+        # 它从服务里悄悄消失，继续渲染则会把不可用的凭据写进配置。
+        n_private_key=$(decrypt_value "$n_private_key" PRIVATE_KEY "$n_name") || return 1
+        n_uuid=$(decrypt_value "$n_uuid" UUID "$n_name") || return 1
+        n_ss_password=$(decrypt_value "$n_ss_password" SS_PASSWORD "$n_name") || return 1
 
         # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
         # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
         # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
-        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
-        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
+        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")" \
+            XHTTP_UUID "$n_name") || return 1
+        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")" \
+            XHTTP_PRIVATE_KEY "$n_name") || return 1
         n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
         [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
         if [[ -z "$n_xhttp_private_key" ]]; then
@@ -7100,7 +7130,8 @@ write_config() {
 
         # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
         # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
-        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
+        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")" \
+            MLDSA65_SEED "$n_name") || return 1
         if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
             log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
                 "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
@@ -7108,7 +7139,8 @@ write_config() {
         fi
 
         # 可选的 VLESS Encryption，同样在核心不支持时失败而不是静默退回明文 VLESS。
-        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")")
+        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")" \
+            VLESS_DECRYPTION "$n_name") || return 1
         if [[ -n "$n_decryption" ]] && ! xray_supports vlessenc; then
             log_error "$(t2 "节点 '$n_name' 启用了 VLESS Encryption，但当前 Xray 不支持，请先执行 xray-update" \
                 "Node '$n_name' uses VLESS Encryption, which this Xray does not support; run xray-update first")"
@@ -7308,16 +7340,14 @@ write_singbox_config() {
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
         n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
             "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-        if [[ "$n_proto" == "hysteria2" ]]; then
-            n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
-        else
-            n_pw=$(safe_read_config_value "$node_file" "ANYTLS_PASSWORD")
-        fi
+        local n_pw_field="ANYTLS_PASSWORD"
+        [[ "$n_proto" == "hysteria2" ]] && n_pw_field="HY2_PASSWORD"
+        n_pw=$(safe_read_config_value "$node_file" "$n_pw_field")
         n_pad_b64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
 
-        # 解密可能加密的敏感值
-        n_priv=$(decrypt_value "$n_priv")
-        n_pw=$(decrypt_value "$n_pw")
+        # 解密可能加密的敏感值；失败时与 write_config 一样整体失败
+        n_priv=$(decrypt_value "$n_priv" PRIVATE_KEY "$n_name") || return 1
+        n_pw=$(decrypt_value "$n_pw" "$n_pw_field" "$n_name") || return 1
 
         [[ -z "$n_pw" ]] && continue
 
@@ -7333,7 +7363,8 @@ write_singbox_config() {
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
             local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
-            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")" \
+                HY2_OBFS_PASSWORD "$n_name") || return 1
             n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
             if [[ -n "$n_domain" ]]; then
                 # ACME 真证书：不再使用逐节点自签名证书。
@@ -7754,6 +7785,7 @@ get_share_link() {
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
+    decrypt_node_secrets || return 1
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip
     ip=$(netstack_preferred_ip)
@@ -7761,15 +7793,12 @@ get_share_link() {
 
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
-        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
         get_ss_link "$ip" "${node_label}_SS"
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]] && [[ -n "${ANYTLS_PASSWORD:-}" ]]; then
         # AnyTLS 节点
-        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
         get_anytls_link "$ip" "${node_label}_AnyTLS"
     elif [[ "$proto_type" == "xhttp" ]] && [[ -n "${XHTTP_PORT:-}" ]]; then
         # XHTTP-only 节点
@@ -7791,6 +7820,7 @@ show_node_qrcodes() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     safe_load_node_config "$node_file" || return 1
+    decrypt_node_secrets || return 1
 
     local node_label="${NODE_NAME:-RV-Reality}"
     local ip
@@ -7870,6 +7900,7 @@ show_info() {
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
     # 使用安全的配置加载（防止命令注入）
     safe_load_node_config "$node_file"
+    decrypt_node_secrets || return 1
 
     local hostname
     hostname=$(hostname 2>/dev/null || echo "server")
@@ -7932,8 +7963,6 @@ show_info() {
             echo -e "  $(get_ss_link "$SERVER_IPV6" "${hostname}_SS_v6")"
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
-        HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
         if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
@@ -7970,7 +7999,6 @@ show_info() {
         fi
     elif [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" ]]; then
         # AnyTLS 节点显示
-        ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A}"
         echo -e "  ${BLUE}Password:${NC}    ${ANYTLS_PASSWORD:-N/A}"
         echo -e "  ${BLUE}Transport:${NC}   AnyTLS (sing-box)"
@@ -8731,16 +8759,7 @@ load_node_for_edit() {
     safe_load_node_config "$node_file" || return 1
 
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
-    UUID=$(decrypt_value "$UUID")
-    PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
-    SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
-    ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
-    HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
-    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
-    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
-    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
-    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
-    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+    decrypt_node_secrets
 }
 
 cmd_edit() {
@@ -13771,7 +13790,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=569528 body-sha256=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
-# build-id=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
+# body-bytes=571561 body-sha256=232114ed7cbea909fed26ec5e4e2c211c4cbf8c4f8fef940bd64a7a4f731830b
+# build-id=232114ed7cbea909fed26ec5e4e2c211c4cbf8c4f8fef940bd64a7a4f731830b
 # module-count=11
 # proxy-hub-bundle-end-v1
