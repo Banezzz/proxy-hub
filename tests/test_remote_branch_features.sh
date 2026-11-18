@@ -397,6 +397,7 @@ source /mnt/lib/20_installers_restart.sh
 source /mnt/lib/30_provision_network.sh
 source /mnt/lib/40_config_share.sh
 source /mnt/lib/50_node_commands.sh
+source /mnt/lib/60_system_tools.sh
 
 NODES_DIR=/srv/install-nodes
 SINGBOX_CERT_DIR=/srv/install-certs
@@ -575,6 +576,7 @@ source /mnt/lib/20_installers_restart.sh
 source /mnt/lib/30_provision_network.sh
 source /mnt/lib/40_config_share.sh
 source /mnt/lib/50_node_commands.sh
+source /mnt/lib/60_system_tools.sh
 
 NODES_DIR=/srv/state-nodes
 SINGBOX_CERT_DIR=/srv/state-certs

@@ -676,6 +676,7 @@ XRAY
 chmod 755 /srv/bin/xray-pq
 make_fake_xray /srv/bin/xray-old
 CHAIN_BYTES=4200
+real_cert_bytes=$(declare -f reality_target_cert_bytes)
 reality_target_cert_bytes() { printf '%s\n' "$CHAIN_BYTES"; }
 SNI=edge.example.com
 
@@ -747,8 +748,7 @@ assert_eq "1" "$rc" "rendering an ML-DSA-65 node on an unsupporting core must fa
 assert_contains "$(cat /srv/mldsa.err)" "run xray-update first" "the failure must say how to fix it"
 
 # Certificate-chain measurement.
-unset -f reality_target_cert_bytes
-source /mnt/lib/40_config_share.sh
+eval "$real_cert_bytes"
 cat >/srv/bin/openssl <<'FAKE'
 #!/bin/sh
 printf '%s\n' '-----BEGIN CERTIFICATE-----' 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=' '-----END CERTIFICATE-----' \

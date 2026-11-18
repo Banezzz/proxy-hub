@@ -5727,112 +5727,6 @@ gen_hy2_password() {
 # Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
 # 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
 
-# 校验并采用一个端口跳跃范围，写入 HY2_HOP_PORTS。
-# Usage: apply_hy2_hop_range RANGE
-apply_hy2_hop_range() {
-    local range request="${1:-}"
-    if [[ "${request,,}" == "auto" ]]; then
-        if ! request=$(gen_hy2_hop_range "${CURRENT_NODE_NAME:-}"); then
-            log_error "$(t2 "未能找到空闲的端口跳跃范围" "Could not find a free hop range")"
-            return 1
-        fi
-    fi
-    if ! range=$(validate_hop_range "$request"); then
-        log_error "$(t2 "端口跳跃范围无效，应为 起始-结束（1-65535，跨度不超过 20000）" \
-            "Invalid hop range; expected START-END (1-65535, at most 20000 ports wide)"): ${1:-}"
-        return 1
-    fi
-    if ! command -v iptables >/dev/null 2>&1; then
-        log_error "$(t2 "端口跳跃需要 iptables，请先安装" "Port hopping requires iptables; install it first")"
-        return 1
-    fi
-    if hy2_hop_range_conflicts "$range" "${CURRENT_NODE_NAME:-}"; then
-        log_error "$(t2 "端口跳跃范围与其他节点的 UDP 端口或跳跃范围冲突" \
-            "The hop range overlaps another node's UDP port or hop range"): $range"
-        return 1
-    fi
-    HY2_HOP_PORTS="$range"
-    log_info "$(t2 "已启用端口跳跃: UDP $range（云安全组需同步放行该范围）" \
-        "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
-}
-
-# 采用一个 ACME 域名：校验格式、确认至少一种挑战可用，并提示 DNS 是否指向本机。
-# 签发发生在 sing-box 启动之后，这里无法提前证明能签下来，只能把明显会失败的情况
-# 拦在前面。
-# Usage: apply_hy2_acme_domain DOMAIN [EMAIL]
-apply_hy2_acme_domain() {
-    local domain="${1,,}" email="${2:-}" resolved="" own4 own6
-    if ! validate_tls_server_name "$domain" || [[ "$domain" != *.* || "$domain" =~ ^[0-9.]+$ ]]; then
-        log_error "$(t2 "ACME 域名无效" "Invalid ACME domain"): ${1:-}"
-        return 1
-    fi
-    if [[ -n "$email" && ! "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]]; then
-        log_error "$(t2 "ACME 邮箱无效" "Invalid ACME email"): $email"
-        return 1
-    fi
-    local alpn_ok=1 http_ok=1
-    { node_tcp_port_claimed 443 || ! is_port_free 443 tcp; } && alpn_ok=0
-    { node_tcp_port_claimed 80 || ! is_port_free 80 tcp; } && http_ok=0
-    if (( alpn_ok == 0 && http_ok == 0 )); then
-        log_error "$(t2 "ACME 签发需要 80/tcp 或 443/tcp 至少一个空闲，当前都被占用" \
-            "ACME needs 80/tcp or 443/tcp to be free, and both are in use")"
-        return 1
-    fi
-    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ')
-    own4=$(get_ipv4)
-    own6=$(get_ipv6)
-    if [[ -z "$resolved" ]]; then
-        log_warn "$(t2 "域名 $domain 目前无法解析，证书签发会失败，请先添加 DNS 记录" \
-            "Domain $domain does not resolve yet; issuance will fail until its DNS record exists")"
-    elif [[ " $resolved" != *" ${own4:-none} "* && " $resolved" != *" ${own6:-none} "* ]]; then
-        log_warn "$(t2 "域名 $domain 解析到 ${resolved}，不是本机地址，证书签发可能失败" \
-            "Domain $domain resolves to ${resolved}, not this server; issuance may fail")"
-    fi
-    HY2_DOMAIN="$domain"
-    HY2_EMAIL="$email"
-    log_info "$(t2 "将为 $domain 申请 ACME 证书（sing-box 启动后自动签发与续期）" \
-        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
-}
-
-# 为当前正在安装的 Hysteria2 节点应用可选加固。
-#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
-#   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
-#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
-configure_hy2_options() {
-    HY2_OBFS_PASSWORD=""
-    HY2_HOP_PORTS=""
-    HY2_DOMAIN=""
-    HY2_EMAIL=""
-
-    if [[ -n "${hy2domain:-}" ]]; then
-        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
-    fi
-
-    if [[ -n "${hy2hop:-}" ]]; then
-        apply_hy2_hop_range "$hy2hop" || return 1
-    fi
-
-    local obfs_request="${hy2obfs:-}"
-    case "${obfs_request,,}" in
-        ""|false|0|n|no|off) ;;
-        true|1|y|yes|on)
-            HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
-            ;;
-        *)
-            if [[ ! "$obfs_request" =~ ^[a-zA-Z0-9._-]{8,128}$ ]]; then
-                log_error "$(t2 "hy2obfs 密码需为 8-128 位字母、数字或 ._-" \
-                    "hy2obfs password must be 8-128 characters of letters, digits or ._-")"
-                return 1
-            fi
-            HY2_OBFS_PASSWORD="$obfs_request"
-            ;;
-    esac
-    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
-        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
-            "Salamander obfuscation enabled (clients must use the same obfs password)")"
-    fi
-}
-
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -7653,161 +7547,6 @@ get_xhttp_link() {
     echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=${VLESS_ENCRYPTION:-none}${link_flow}&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
 }
 
-# ---- 后量子增强（可选） ----
-
-# REALITY 目标在握手中返回的证书链总字节数。ML-DSA-65 签名约 3309 字节，以证书扩展
-# 的形式附加；Xray 文档要求目标返回的证书必须长于 3500 字节，否则放不下。
-# Usage: reality_target_cert_bytes DOMAIN   -> 字节数（探测失败为 0）
-reality_target_cert_bytes() {
-    local domain="$1" family_flag
-    local -a family=()
-    family_flag=$(netstack_openssl_family)
-    [[ -n "$family_flag" ]] && family=("$family_flag")
-    timeout 5 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" \
-        -servername "$domain" -showcerts </dev/null 2>/dev/null | awk '
-            /-----BEGIN CERTIFICATE-----/ { inside = 1; next }
-            /-----END CERTIFICATE-----/ { inside = 0; next }
-            inside { chars += length($0) }
-            END { print int(chars * 3 / 4) }'
-}
-
-# 生成 ML-DSA-65 密钥对：MLDSA65_SEED 留在服务端，MLDSA65_VERIFY 发给客户端。
-gen_mldsa65_keys() {
-    local out seed verify
-    out=$("$XRAY_BIN" mldsa65 2>/dev/null | tr -d '\r') || return 1
-    seed=$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<<"$out")
-    verify=$(awk -F': *' '$1 == "Verify" { print $2; exit }' <<<"$out")
-    [[ "$seed" =~ ^[A-Za-z0-9_-]{40,}$ && "$verify" =~ ^[A-Za-z0-9_-]{1000,}$ ]] || return 1
-    MLDSA65_SEED="$seed"
-    MLDSA65_VERIFY="$verify"
-}
-
-# 生成 VLESS Encryption 的 decryption/encryption 串对。`xray vlessenc` 一次给出两种
-# 认证方式，密钥交换都是后量子安全的 mlkem768x25519plus，区别只在认证密钥：
-#   x25519  认证密钥 43 字符，链接短、二维码可扫（默认）
-#   mlkem   认证也是后量子的，但客户端串约 1.6KB，链接无法生成可扫的二维码
-# Usage: gen_vlessenc_keys x25519|mlkem
-gen_vlessenc_keys() {
-    local want="${1:-x25519}" out decryption encryption
-    out=$("$XRAY_BIN" vlessenc 2>/dev/null | tr -d '\r') || return 1
-    decryption=$(awk -v want="$want" '
-        /^Authentication: X25519/ { section = "x25519" }
-        /^Authentication: ML-KEM-768/ { section = "mlkem" }
-        section == want && /"decryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
-    encryption=$(awk -v want="$want" '
-        /^Authentication: X25519/ { section = "x25519" }
-        /^Authentication: ML-KEM-768/ { section = "mlkem" }
-        section == want && /"encryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
-    [[ "$decryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
-    [[ "$encryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
-    VLESS_DECRYPTION="$decryption"
-    VLESS_ENCRYPTION="$encryption"
-}
-
-# 布尔型环境变量：true/1/y/yes/on 视为启用。
-env_flag_enabled() {
-    case "${1,,}" in
-        true|1|y|yes|on) return 0 ;;
-    esac
-    return 1
-}
-
-# 交互式选择后量子增强，结果写入 PQ_WANT_MLDSA65 / PQ_WANT_VLESSENC。
-# 只在完全交互的安装里出现：只要调用方用 proto= 或任一后量子环境变量驱动安装，就
-# 不再追加提问，避免让既有的无人值守脚本卡在一个它们不知道的新提示上。
-prompt_pq_options() {
-    PQ_WANT_MLDSA65=""
-    PQ_WANT_VLESSENC=""
-    [[ -z "${proto:-}" && -z "${mldsa65:-}" && -z "${vlessenc:-}" ]] || return 0
-    xray_supports vlessenc || xray_supports mldsa65 || return 0
-    # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
-    # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
-    ( : >/dev/tty ) 2>/dev/null || return 0
-
-    {
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}        $(t2 "后量子增强（可选）" "Post-quantum options (optional)")${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  ${YELLOW}$(t2 "两项都要求较新的客户端；不确定客户端是否支持时请保持关闭。" \
-        "Both need a recent client; leave them off when unsure about client support.")${NC}"
-    echo ""
-    echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
-    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${GRAY}(mlkem768x25519plus)${NC}"
-    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65  ${GRAY}($(t2 "证书后量子签名" "post-quantum certificate signature"))${NC}"
-    echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
-    echo ""
-    echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
-    } >/dev/tty
-
-    local choice=""
-    read -r choice </dev/tty || choice=""
-    case "$choice" in
-        1) PQ_WANT_VLESSENC="x25519" ;;
-        2) PQ_WANT_MLDSA65="true" ;;
-        3) PQ_WANT_VLESSENC="x25519"; PQ_WANT_MLDSA65="true" ;;
-    esac
-}
-
-# 为当前正在安装的 VLESS + REALITY 节点应用可选的后量子增强。
-#   vlessenc=x25519|mlkem|true  VLESS Encryption（true 等同 x25519）
-#   mldsa65=true                REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
-# 默认全部关闭：它们都要求较新的客户端，旧客户端导入带这些参数的链接会连不上。
-# 条件不满足（核心不支持、目标证书太短）时告警并跳过，不让整次安装失败。
-configure_pq_options() {
-    MLDSA65_SEED=""
-    MLDSA65_VERIFY=""
-    VLESS_DECRYPTION=""
-    VLESS_ENCRYPTION=""
-
-    local want_mldsa65="" want_vlessenc=""
-    prompt_pq_options
-    want_mldsa65="$PQ_WANT_MLDSA65"
-    want_vlessenc="$PQ_WANT_VLESSENC"
-    env_flag_enabled "${mldsa65:-}" && want_mldsa65="true"
-    local vlessenc_request="${vlessenc:-}"
-    vlessenc_request="${vlessenc_request,,}"
-    case "$vlessenc_request" in
-        x25519|mlkem) want_vlessenc="$vlessenc_request" ;;
-        "") ;;
-        *) env_flag_enabled "$vlessenc_request" && want_vlessenc="x25519" ;;
-    esac
-
-    if [[ -n "$want_vlessenc" ]]; then
-        if ! xray_supports vlessenc; then
-            log_warn "$(t2 "当前 Xray 不支持 VLESS Encryption，已跳过（可先执行 xray-update）" \
-                "This Xray does not support VLESS Encryption; skipped (run xray-update first)")"
-        elif ! gen_vlessenc_keys "$want_vlessenc"; then
-            log_error "$(t2 "生成 VLESS Encryption 密钥失败" "Failed to generate VLESS Encryption keys")"
-            return 1
-        else
-            log_info "$(t2 "已启用 VLESS Encryption（认证方式: $want_vlessenc）" \
-                "VLESS Encryption enabled (authentication: $want_vlessenc)")"
-        fi
-    fi
-
-    [[ -n "$want_mldsa65" ]] || return 0
-    if ! xray_supports mldsa65; then
-        log_warn "$(t2 "当前 Xray 不支持 ML-DSA-65，已跳过（可先执行 xray-update）" \
-            "This Xray does not support ML-DSA-65; skipped (run xray-update first)")"
-        return 0
-    fi
-    local chain_bytes
-    chain_bytes=$(reality_target_cert_bytes "$SNI")
-    if [[ ! "$chain_bytes" =~ ^[0-9]+$ ]] || (( chain_bytes <= 3500 )); then
-        log_warn "$(t2 "目标 $SNI 返回的证书只有 ${chain_bytes:-0} 字节（需大于 3500），放不下 ML-DSA-65 签名，已跳过" \
-            "Target $SNI returned only ${chain_bytes:-0} certificate bytes (more than 3500 required); ML-DSA-65 skipped")"
-        return 0
-    fi
-    if ! gen_mldsa65_keys; then
-        log_error "$(t2 "生成 ML-DSA-65 密钥失败" "Failed to generate ML-DSA-65 keys")"
-        return 1
-    fi
-    log_info "$(t2 "已启用 REALITY ML-DSA-65（目标证书 ${chain_bytes} 字节）" \
-        "REALITY ML-DSA-65 enabled (target certificate: ${chain_bytes} bytes)")"
-}
-
 # 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
 # gen_reality_keys 直接写全局的 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，因此先保存 Vision
 # 的那一套，生成后搬到 XHTTP_* 再还原。
@@ -9583,6 +9322,277 @@ cmd_netstack() {
         netstack_apply "$mode"
         return
     done
+}
+
+# ============== 协议可选增强 ==============
+#
+# 安装节点时的可选增强项（后量子、Hysteria2 加固）集中在这里：它们默认关闭，各自对
+# 客户端或网络环境有要求。本模块在 50_node_commands.sh 之后装载，但这些函数只在
+# 运行期被 cmd_install / cmd_edit 调用，不存在 source 阶段的反向依赖。
+
+# ---- 后量子增强 ----
+
+# REALITY 目标在握手中返回的证书链总字节数。ML-DSA-65 签名约 3309 字节，以证书扩展
+# 的形式附加；Xray 文档要求目标返回的证书必须长于 3500 字节，否则放不下。
+# Usage: reality_target_cert_bytes DOMAIN   -> 字节数（探测失败为 0）
+reality_target_cert_bytes() {
+    local domain="$1" family_flag
+    local -a family=()
+    family_flag=$(netstack_openssl_family)
+    [[ -n "$family_flag" ]] && family=("$family_flag")
+    timeout 5 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" \
+        -servername "$domain" -showcerts </dev/null 2>/dev/null | awk '
+            /-----BEGIN CERTIFICATE-----/ { inside = 1; next }
+            /-----END CERTIFICATE-----/ { inside = 0; next }
+            inside { chars += length($0) }
+            END { print int(chars * 3 / 4) }'
+}
+
+# 生成 ML-DSA-65 密钥对：MLDSA65_SEED 留在服务端，MLDSA65_VERIFY 发给客户端。
+gen_mldsa65_keys() {
+    local out seed verify
+    out=$("$XRAY_BIN" mldsa65 2>/dev/null | tr -d '\r') || return 1
+    seed=$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<<"$out")
+    verify=$(awk -F': *' '$1 == "Verify" { print $2; exit }' <<<"$out")
+    [[ "$seed" =~ ^[A-Za-z0-9_-]{40,}$ && "$verify" =~ ^[A-Za-z0-9_-]{1000,}$ ]] || return 1
+    MLDSA65_SEED="$seed"
+    MLDSA65_VERIFY="$verify"
+}
+
+# 生成 VLESS Encryption 的 decryption/encryption 串对。`xray vlessenc` 一次给出两种
+# 认证方式，密钥交换都是后量子安全的 mlkem768x25519plus，区别只在认证密钥：
+#   x25519  认证密钥 43 字符，链接短、二维码可扫（默认）
+#   mlkem   认证也是后量子的，但客户端串约 1.6KB，链接无法生成可扫的二维码
+# Usage: gen_vlessenc_keys x25519|mlkem
+gen_vlessenc_keys() {
+    local want="${1:-x25519}" out decryption encryption
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null | tr -d '\r') || return 1
+    decryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"decryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    encryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"encryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    [[ "$decryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    [[ "$encryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    VLESS_DECRYPTION="$decryption"
+    VLESS_ENCRYPTION="$encryption"
+}
+
+# 布尔型环境变量：true/1/y/yes/on 视为启用。
+env_flag_enabled() {
+    case "${1,,}" in
+        true|1|y|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+# 交互式选择后量子增强，结果写入 PQ_WANT_MLDSA65 / PQ_WANT_VLESSENC。
+# 只在完全交互的安装里出现：只要调用方用 proto= 或任一后量子环境变量驱动安装，就
+# 不再追加提问，避免让既有的无人值守脚本卡在一个它们不知道的新提示上。
+prompt_pq_options() {
+    PQ_WANT_MLDSA65=""
+    PQ_WANT_VLESSENC=""
+    [[ -z "${proto:-}" && -z "${mldsa65:-}" && -z "${vlessenc:-}" ]] || return 0
+    xray_supports vlessenc || xray_supports mldsa65 || return 0
+    # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
+    # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
+    ( : >/dev/tty ) 2>/dev/null || return 0
+
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "后量子增强（可选）" "Post-quantum options (optional)")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${YELLOW}$(t2 "两项都要求较新的客户端；不确定客户端是否支持时请保持关闭。" \
+        "Both need a recent client; leave them off when unsure about client support.")${NC}"
+    echo ""
+    echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
+    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${GRAY}(mlkem768x25519plus)${NC}"
+    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65  ${GRAY}($(t2 "证书后量子签名" "post-quantum certificate signature"))${NC}"
+    echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
+    echo ""
+    echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
+    } >/dev/tty
+
+    local choice=""
+    read -r choice </dev/tty || choice=""
+    case "$choice" in
+        1) PQ_WANT_VLESSENC="x25519" ;;
+        2) PQ_WANT_MLDSA65="true" ;;
+        3) PQ_WANT_VLESSENC="x25519"; PQ_WANT_MLDSA65="true" ;;
+    esac
+}
+
+# 为当前正在安装的 VLESS + REALITY 节点应用可选的后量子增强。
+#   vlessenc=x25519|mlkem|true  VLESS Encryption（true 等同 x25519）
+#   mldsa65=true                REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
+# 默认全部关闭：它们都要求较新的客户端，旧客户端导入带这些参数的链接会连不上。
+# 条件不满足（核心不支持、目标证书太短）时告警并跳过，不让整次安装失败。
+configure_pq_options() {
+    MLDSA65_SEED=""
+    MLDSA65_VERIFY=""
+    VLESS_DECRYPTION=""
+    VLESS_ENCRYPTION=""
+
+    local want_mldsa65="" want_vlessenc=""
+    prompt_pq_options
+    want_mldsa65="$PQ_WANT_MLDSA65"
+    want_vlessenc="$PQ_WANT_VLESSENC"
+    env_flag_enabled "${mldsa65:-}" && want_mldsa65="true"
+    local vlessenc_request="${vlessenc:-}"
+    vlessenc_request="${vlessenc_request,,}"
+    case "$vlessenc_request" in
+        x25519|mlkem) want_vlessenc="$vlessenc_request" ;;
+        "") ;;
+        *) env_flag_enabled "$vlessenc_request" && want_vlessenc="x25519" ;;
+    esac
+
+    if [[ -n "$want_vlessenc" ]]; then
+        if ! xray_supports vlessenc; then
+            log_warn "$(t2 "当前 Xray 不支持 VLESS Encryption，已跳过（可先执行 xray-update）" \
+                "This Xray does not support VLESS Encryption; skipped (run xray-update first)")"
+        elif ! gen_vlessenc_keys "$want_vlessenc"; then
+            log_error "$(t2 "生成 VLESS Encryption 密钥失败" "Failed to generate VLESS Encryption keys")"
+            return 1
+        else
+            log_info "$(t2 "已启用 VLESS Encryption（认证方式: $want_vlessenc）" \
+                "VLESS Encryption enabled (authentication: $want_vlessenc)")"
+        fi
+    fi
+
+    [[ -n "$want_mldsa65" ]] || return 0
+    if ! xray_supports mldsa65; then
+        log_warn "$(t2 "当前 Xray 不支持 ML-DSA-65，已跳过（可先执行 xray-update）" \
+            "This Xray does not support ML-DSA-65; skipped (run xray-update first)")"
+        return 0
+    fi
+    local chain_bytes
+    chain_bytes=$(reality_target_cert_bytes "$SNI")
+    if [[ ! "$chain_bytes" =~ ^[0-9]+$ ]] || (( chain_bytes <= 3500 )); then
+        log_warn "$(t2 "目标 $SNI 返回的证书只有 ${chain_bytes:-0} 字节（需大于 3500），放不下 ML-DSA-65 签名，已跳过" \
+            "Target $SNI returned only ${chain_bytes:-0} certificate bytes (more than 3500 required); ML-DSA-65 skipped")"
+        return 0
+    fi
+    if ! gen_mldsa65_keys; then
+        log_error "$(t2 "生成 ML-DSA-65 密钥失败" "Failed to generate ML-DSA-65 keys")"
+        return 1
+    fi
+    log_info "$(t2 "已启用 REALITY ML-DSA-65（目标证书 ${chain_bytes} 字节）" \
+        "REALITY ML-DSA-65 enabled (target certificate: ${chain_bytes} bytes)")"
+}
+
+# ---- Hysteria2 加固 ----
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+
+# 校验并采用一个端口跳跃范围，写入 HY2_HOP_PORTS。
+# Usage: apply_hy2_hop_range RANGE
+apply_hy2_hop_range() {
+    local range request="${1:-}"
+    if [[ "${request,,}" == "auto" ]]; then
+        if ! request=$(gen_hy2_hop_range "${CURRENT_NODE_NAME:-}"); then
+            log_error "$(t2 "未能找到空闲的端口跳跃范围" "Could not find a free hop range")"
+            return 1
+        fi
+    fi
+    if ! range=$(validate_hop_range "$request"); then
+        log_error "$(t2 "端口跳跃范围无效，应为 起始-结束（1-65535，跨度不超过 20000）" \
+            "Invalid hop range; expected START-END (1-65535, at most 20000 ports wide)"): ${1:-}"
+        return 1
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "端口跳跃需要 iptables，请先安装" "Port hopping requires iptables; install it first")"
+        return 1
+    fi
+    if hy2_hop_range_conflicts "$range" "${CURRENT_NODE_NAME:-}"; then
+        log_error "$(t2 "端口跳跃范围与其他节点的 UDP 端口或跳跃范围冲突" \
+            "The hop range overlaps another node's UDP port or hop range"): $range"
+        return 1
+    fi
+    HY2_HOP_PORTS="$range"
+    log_info "$(t2 "已启用端口跳跃: UDP $range（云安全组需同步放行该范围）" \
+        "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
+}
+
+# 采用一个 ACME 域名：校验格式、确认至少一种挑战可用，并提示 DNS 是否指向本机。
+# 签发发生在 sing-box 启动之后，这里无法提前证明能签下来，只能把明显会失败的情况
+# 拦在前面。
+# Usage: apply_hy2_acme_domain DOMAIN [EMAIL]
+apply_hy2_acme_domain() {
+    local domain="${1,,}" email="${2:-}" resolved="" own4 own6
+    if ! validate_tls_server_name "$domain" || [[ "$domain" != *.* || "$domain" =~ ^[0-9.]+$ ]]; then
+        log_error "$(t2 "ACME 域名无效" "Invalid ACME domain"): ${1:-}"
+        return 1
+    fi
+    if [[ -n "$email" && ! "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]]; then
+        log_error "$(t2 "ACME 邮箱无效" "Invalid ACME email"): $email"
+        return 1
+    fi
+    local alpn_ok=1 http_ok=1
+    { node_tcp_port_claimed 443 || ! is_port_free 443 tcp; } && alpn_ok=0
+    { node_tcp_port_claimed 80 || ! is_port_free 80 tcp; } && http_ok=0
+    if (( alpn_ok == 0 && http_ok == 0 )); then
+        log_error "$(t2 "ACME 签发需要 80/tcp 或 443/tcp 至少一个空闲，当前都被占用" \
+            "ACME needs 80/tcp or 443/tcp to be free, and both are in use")"
+        return 1
+    fi
+    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ')
+    own4=$(get_ipv4)
+    own6=$(get_ipv6)
+    if [[ -z "$resolved" ]]; then
+        log_warn "$(t2 "域名 $domain 目前无法解析，证书签发会失败，请先添加 DNS 记录" \
+            "Domain $domain does not resolve yet; issuance will fail until its DNS record exists")"
+    elif [[ " $resolved" != *" ${own4:-none} "* && " $resolved" != *" ${own6:-none} "* ]]; then
+        log_warn "$(t2 "域名 $domain 解析到 ${resolved}，不是本机地址，证书签发可能失败" \
+            "Domain $domain resolves to ${resolved}, not this server; issuance may fail")"
+    fi
+    HY2_DOMAIN="$domain"
+    HY2_EMAIL="$email"
+    log_info "$(t2 "将为 $domain 申请 ACME 证书（sing-box 启动后自动签发与续期）" \
+        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
+}
+
+# 为当前正在安装的 Hysteria2 节点应用可选加固。
+#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
+#   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
+#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
+configure_hy2_options() {
+    HY2_OBFS_PASSWORD=""
+    HY2_HOP_PORTS=""
+    HY2_DOMAIN=""
+    HY2_EMAIL=""
+
+    if [[ -n "${hy2domain:-}" ]]; then
+        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
+    fi
+
+    if [[ -n "${hy2hop:-}" ]]; then
+        apply_hy2_hop_range "$hy2hop" || return 1
+    fi
+
+    local obfs_request="${hy2obfs:-}"
+    case "${obfs_request,,}" in
+        ""|false|0|n|no|off) ;;
+        true|1|y|yes|on)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+            ;;
+        *)
+            if [[ ! "$obfs_request" =~ ^[a-zA-Z0-9._-]{8,128}$ ]]; then
+                log_error "$(t2 "hy2obfs 密码需为 8-128 位字母、数字或 ._-" \
+                    "hy2obfs password must be 8-128 characters of letters, digits or ._-")"
+                return 1
+            fi
+            HY2_OBFS_PASSWORD="$obfs_request"
+            ;;
+    esac
+    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+        log_info "$(t2 "已启用 Salamander 混淆（客户端必须配置相同的混淆密码）" \
+            "Salamander obfuscation enabled (clients must use the same obfs password)")"
+    fi
 }
 
 # ============== WARP 管理 ==============
@@ -12274,7 +12284,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=489821 body-sha256=e2241be3d2b043ecf869a7fd515f18ab356e5542ae75fa87a32eb89a07805f44
-# build-id=e2241be3d2b043ecf869a7fd515f18ab356e5542ae75fa87a32eb89a07805f44
+# body-bytes=490320 body-sha256=beaaaf02de92e6b3989bc0b0aadebe74aad3ca743a8d8418cdc759363ccbf57d
+# build-id=beaaaf02de92e6b3989bc0b0aadebe74aad3ca743a8d8418cdc759363ccbf57d
 # module-count=11
 # proxy-hub-bundle-end-v1
