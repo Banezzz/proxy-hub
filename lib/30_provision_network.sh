@@ -729,6 +729,110 @@ load_latency_cache() {
     return 0
 }
 
+# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
+# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
+# 预热一次，后台子 shell 直接继承。
+SNI_TLS13_STATE=""
+sni_tls13_flag() {
+    if [[ -z "$SNI_TLS13_STATE" ]]; then
+        if openssl s_client -help 2>&1 | grep -q -- '-tls1_3'; then
+            SNI_TLS13_STATE="yes"
+        else
+            SNI_TLS13_STATE="no"
+        fi
+    fi
+    [[ "$SNI_TLS13_STATE" == "yes" ]] && printf '%s' "-tls1_3"
+    return 0
+}
+
+# ---- REALITY 目标的 ASN / CDN 评分 ----
+#
+# 延迟只说明"连得快"，不说明"像不像"。两条经验规则更重要：目标与服务器同 ASN 时，
+# 流量去向最自然；目标躲在通用 CDN 后面时，服务器等于替 CDN 做端口转发，被扫描后
+# 可能被滥用（Xray 文档对此有明确警告）。这里对延迟最低的一批候选做一次批量 ASN
+# 查询并据此重排。查询走 Team Cymru 的 whois（纯 bash /dev/tcp，无额外依赖），
+# 43 端口不通、超时或解析失败时静默退回纯延迟排序。SNI_ASN_CHECK=0 可关闭。
+SNI_CDN_ASNS=" 13335 54113 20940 16625 21342 "
+declare -gA SNI_CANDIDATE_TAG=()
+
+# Usage: sni_bulk_asn IP...   -> 每行 "IP ASN"
+sni_bulk_asn() {
+    (( $# > 0 )) || return 1
+    local raw
+    raw=$( { printf 'begin\nnoheader\n'; printf '%s\n' "$@"; printf 'end\n'; } | timeout 6 bash -c \
+        'exec 3<>/dev/tcp/whois.cymru.com/43 || exit 1; cat >&3; cat <&3' 2>/dev/null) || return 1
+    printf '%s\n' "$raw" | awk -F'|' 'NF >= 2 {
+        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
+        if ($1 ~ /^[0-9]+$/) print $2, $1
+    }'
+}
+
+# 按所选网络栈解析域名的第一个地址。
+sni_resolve_ip() {
+    local db="ahostsv4"
+    [[ "$(netstack_mode)" == "v6" ]] && db="ahostsv6"
+    getent "$db" "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+# 把延迟最低的候选重排为"同 ASN 优先、通用 CDN 靠后"，输出前 5 名。
+# Usage: rank_sni_candidates LATENCY_MAP OUT_DOMAINS OUT_LATENCIES
+rank_sni_candidates() {
+    # 局部变量统一加 _rk_ 前缀：nameref 按名字解析，调用方的数组若与这里的局部变量
+    # 同名（例如 lat），引用会悄悄落到局部变量上。
+    local -n _rank_map=$1 _rank_doms=$2 _rank_lats=$3
+    local -a _rk_rows=() _rk_ips=()
+    local _rk_lat _rk_dom _rk_ip _rk_asn _rk_server_ip="" _rk_server_asn="" _rk_class _rk_line
+    local -A _rk_ip_of=() _rk_asn_of=()
+
+    SNI_CANDIDATE_TAG=()
+    mapfile -t _rk_rows < <(for _rk_dom in "${!_rank_map[@]}"; do
+        echo "${_rank_map[$_rk_dom]} $_rk_dom"
+    done | sort -n | head -15)
+
+    if [[ "${SNI_ASN_CHECK:-1}" != "0" ]]; then
+        for _rk_line in "${_rk_rows[@]}"; do
+            _rk_dom="${_rk_line#* }"
+            _rk_ip=$(sni_resolve_ip "$_rk_dom")
+            [[ -n "$_rk_ip" ]] && { _rk_ip_of["$_rk_dom"]="$_rk_ip"; _rk_ips+=("$_rk_ip"); }
+        done
+        if [[ "$(netstack_mode)" == "v6" ]]; then _rk_server_ip=$(get_ipv6); else _rk_server_ip=$(get_ipv4); fi
+        [[ -n "$_rk_server_ip" ]] && _rk_ips+=("$_rk_server_ip")
+        while read -r _rk_ip _rk_asn; do
+            [[ -n "$_rk_ip" && -n "$_rk_asn" ]] && _rk_asn_of["$_rk_ip"]="$_rk_asn"
+        done < <(sni_bulk_asn ${_rk_ips[@]+"${_rk_ips[@]}"} || true)
+        [[ -n "$_rk_server_ip" ]] && _rk_server_asn="${_rk_asn_of[$_rk_server_ip]:-}"
+    fi
+
+    _rank_doms=()
+    _rank_lats=()
+    while read -r _rk_class _rk_lat _rk_dom; do
+        [[ -n "$_rk_dom" ]] || continue
+        _rank_doms+=("$_rk_dom")
+        _rank_lats+=("$_rk_lat")
+    done < <(for _rk_line in "${_rk_rows[@]}"; do
+        _rk_lat="${_rk_line%% *}"
+        _rk_dom="${_rk_line#* }"
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        _rk_class=1
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            _rk_class=0
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            _rk_class=2
+        fi
+        echo "$_rk_class $_rk_lat $_rk_dom"
+    done | sort -k1,1n -k2,2n | head -5)
+
+    # 标签在父 shell 里重新计算：上面的排序跑在进程替换的子 shell 中，写不回关联数组。
+    for _rk_dom in ${_rank_doms[@]+"${_rank_doms[@]}"}; do
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="$(t2 "同 ASN" "same ASN") AS$_rk_asn"
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="CDN AS$_rk_asn"
+        fi
+    done
+}
+
 # 测试单个域名延迟
 #
 # 必须按所选网络栈限定协议族：REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
@@ -736,10 +840,13 @@ load_latency_cache() {
 # 只有 A 记录的域名也判为"可用"，装出一个握手必然失败的节点。
 test_domain_latency() {
     local domain="$1"
-    local t1 t2 family_flag
+    local t1 t2 family_flag tls13_flag
     local -a family=()
     family_flag=$(netstack_openssl_family)
     [[ -n "$family_flag" ]] && family=("$family_flag")
+    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
+    tls13_flag=$(sni_tls13_flag)
+    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
     t1=$(date +%s%3N)
     if timeout 2 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
         t2=$(date +%s%3N)
@@ -765,6 +872,7 @@ test_domains_parallel() {
     local -n _latency_map=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -860,6 +968,7 @@ test_domains_parallel_verbose() {
     local -n _latency_map_v=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -978,15 +1087,10 @@ select_best_sni() {
         return
     fi
 
-    # 获取排序后的 Top 5 域名
+    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
     local top_domains=()
     local top_latencies=()
-    while IFS=' ' read -r lat dom; do
-        top_domains+=("$dom")
-        top_latencies+=("$lat")
-    done < <(for domain in "${!latency_map[@]}"; do
-        echo "${latency_map[$domain]} $domain"
-    done | sort -n | head -5)
+    rank_sni_candidates latency_map top_domains top_latencies
 
     # 让用户选择 SNI
     prompt_sni_choice top_domains top_latencies
@@ -1080,7 +1184,10 @@ prompt_sni_choice() {
             echo ""
             local i=1 idx
             for idx in "${!td[@]}"; do
-                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
+                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
+                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
+                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
+                printf "\n"
                 ((i++))
             done
             echo ""

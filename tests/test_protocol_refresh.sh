@@ -490,4 +490,89 @@ assert_contains "$(warn_discouraged_reality_target www.icloud.com 2>&1)" "discou
 assert_eq "" "$(warn_discouraged_reality_target www.tesla.com 2>&1)" "an ordinary target stays quiet"
 SCENARIO
 
+# SNI probing requires TLS 1.3 where the local openssl can ask for it, and the
+# fastest candidates are re-ranked by ASN: same ASN first, generic CDNs last.
+run_scenario sni-ranking <<'SCENARIO'
+load_modules
+real_sni_bulk_asn=$(declare -f sni_bulk_asn)
+
+# TLS 1.3 flag detection follows the local openssl, and is cached.
+cat >/srv/bin/openssl <<'FAKE'
+#!/bin/sh
+printf '%s\n' "$*" >>/srv/openssl.args
+case "$*" in
+  *"-help"*) [ -n "${FAKE_TLS13:-}" ] && echo " -tls1_3  Just use TLSv1.3" ;;
+esac
+exit 0
+FAKE
+chmod 755 /srv/bin/openssl
+PATH="/srv/bin:$PATH"
+: >/srv/openssl.args
+SNI_TLS13_STATE=""
+assert_eq "" "$(sni_tls13_flag)" "an openssl without -tls1_3 must not receive the flag"
+SNI_TLS13_STATE=""
+export FAKE_TLS13=1
+assert_eq "-tls1_3" "$(sni_tls13_flag)" "a current openssl must be asked for TLS 1.3"
+sni_tls13_flag >/dev/null
+: >/srv/openssl.args
+test_domain_latency example.com >/dev/null
+assert_eq "s_client -tls1_3 -connect example.com:443 -servername example.com" "$(cat /srv/openssl.args)" \
+    "the probe must require TLS 1.3 and reuse the cached capability"
+printf '%s\n' v6 >"$NETSTACK_FILE"
+: >/srv/openssl.args
+test_domain_latency example.com >/dev/null
+assert_eq "s_client -6 -tls1_3 -connect example.com:443 -servername example.com" "$(cat /srv/openssl.args)" \
+    "the address family and TLS 1.3 flags must combine"
+rm -f -- "$NETSTACK_FILE"
+
+# Ranking with a stubbed resolver and ASN source.
+sni_resolve_ip() {
+    case "$1" in
+        fast-cdn.example) echo 198.51.100.1 ;;
+        plain.example) echo 198.51.100.2 ;;
+        neighbour.example) echo 198.51.100.3 ;;
+        slow.example) echo 198.51.100.4 ;;
+        unresolved.example) : ;;
+    esac
+}
+get_ipv4() { echo 203.0.113.10; }
+sni_bulk_asn() {
+    printf '%s\n' "$*" >/srv/asn.query
+    printf '%s\n' "198.51.100.1 13335" "198.51.100.2 64500" "198.51.100.3 64511" \
+        "198.51.100.4 64500" "203.0.113.10 64511"
+}
+declare -A lat=( [fast-cdn.example]=10 [plain.example]=20 [neighbour.example]=90
+                 [slow.example]=120 [unresolved.example]=15 )
+doms=() lats=()
+rank_sni_candidates lat doms lats
+assert_eq "neighbour.example unresolved.example plain.example slow.example fast-cdn.example" "${doms[*]}" \
+    "same-ASN first, then by latency, generic CDN last"
+assert_eq "90 15 20 120 10" "${lats[*]}" "latencies must stay attached to their domains"
+assert_contains "${SNI_CANDIDATE_TAG[neighbour.example]}" "same ASN AS64511" "the same-ASN candidate is labelled"
+assert_eq "CDN AS13335" "${SNI_CANDIDATE_TAG[fast-cdn.example]}" "the CDN candidate is labelled"
+assert_eq "" "${SNI_CANDIDATE_TAG[plain.example]:-}" "ordinary candidates carry no label"
+assert_contains "$(cat /srv/asn.query)" "203.0.113.10" "the server address must be part of the lookup"
+
+# An unreachable ASN source degrades to plain latency order without failing.
+sni_bulk_asn() { return 1; }
+rank_sni_candidates lat doms lats
+assert_eq "fast-cdn.example unresolved.example plain.example neighbour.example slow.example" "${doms[*]}" \
+    "without ASN data the order is latency only"
+assert_eq "0" "${#SNI_CANDIDATE_TAG[@]}" "no labels without ASN data"
+
+# The check can be switched off, in which case nothing is resolved or queried.
+sni_bulk_asn() { fail_case "ASN lookup ran although SNI_ASN_CHECK=0"; }
+sni_resolve_ip() { fail_case "resolver ran although SNI_ASN_CHECK=0"; }
+SNI_ASN_CHECK=0 rank_sni_candidates lat doms lats
+assert_eq "fast-cdn.example" "${doms[0]}" "disabled ranking keeps latency order"
+
+# The whois response parser accepts the Team Cymru bulk format.
+eval "$real_sni_bulk_asn"
+timeout() { printf '%s\n' "13335   | 198.51.100.1     | CLOUDFLARENET, US" "NA      | 198.51.100.9     | NA" \
+    "64500   | 2001:db8::1      | EXAMPLE-AS"; }
+assert_eq "198.51.100.1 13335
+2001:db8::1 64500" "$(sni_bulk_asn 198.51.100.1 198.51.100.9 2001:db8::1)" "bulk whois rows must parse to 'IP ASN'"
+assert_fails "an empty lookup must fail" sni_bulk_asn
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
