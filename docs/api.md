@@ -19,8 +19,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | 类型 | 命令 |
 | --- | --- |
 | 节点 | `install`, `list`, `info`, `qr`, `status`, `health`, `remove`, `edit` |
-| 运维 | `restart`, `regenerate`/`regen`, `update-ip`, `netstack`/`ipstack`, `uninstall`, `test-sni`, `xray-update` |
-| 只读状态 | `xray-version` |
+| 运维 | `restart`, `regenerate`/`regen`, `update-ip`, `netstack`/`ipstack`, `uninstall`, `test-sni`, `xray-update`, `singbox-update` |
+| 升级 | `upgrade`/`migrate`（向导）, `upgrade apply recommended\|all\|ID,ID...` |
+| 只读状态 | `xray-version`, `singbox-version`, `upgrade check` |
 | 工具 | `tools`, `warp`, `bbr`, `swap`, `fail2ban`, `timesync`, `ports`, `logs` |
 | 调度 | `xray-restart`/`restart-schedule` |
 | 其他 | `menu`, `help`, `--help`, `-h` |
@@ -46,10 +47,109 @@ bash <(curl -Ls https://raw.githubusercontent.com/Banezzz/proxy-hub/main/proxy-h
 | `atpwd` | AnyTLS 密码 |
 | `hy2pwd` | Hysteria2 密码；8-128 位 URI 安全字符，不传时随机生成 |
 | `hy2sni` | Hysteria2 TLS SNI；不传时使用 `www.bing.com` |
+| `hy2obfs` | Hysteria2 Salamander 混淆；布尔真值生成随机密码，其他值作为密码（8-128 位字母、数字或 `._-`） |
+| `hy2hop` | Hysteria2 端口跳跃；`auto` 随机选 200 个端口，或 `起始-结束`（跨度不超过 20000，不得覆盖其他节点的 UDP 端口或跳跃范围）；需要 iptables |
+| `hy2domain` | 用 ACME 为该域名签发证书；需 80/tcp 或 443/tcp 至少一个空闲 |
+| `hy2email` | ACME 账户邮箱，可选 |
+| `vlessenc` | VLESS Encryption；布尔真值或 `x25519` 使用 X25519 认证，`mlkem` 使用 ML-KEM-768 认证 |
+| `mldsa65` | 布尔真值启用 REALITY ML-DSA-65；目标证书不超过 3500 字节或内核不支持时告警并跳过 |
+| `sids` | 附加 REALITY shortId，逗号或冒号分隔；每个为 2-16 位、偶数长度的十六进制 |
 | `ipstack` | `dual`（默认）、`v4`、`v6`；同时接受 `both`/`ipv4`/`ipv6`/`4`/`6`/`v4-only` 等写法 |
 | `restart` | `daily`, `12h`, `6h`, `weekly`, `no` 及既有布尔别名 |
 
 变量名为既有的小写 shell 环境变量，拆分不能改名或转换为只接受命令行 flag。
+
+布尔真值为 `true`/`1`/`y`/`yes`/`on`（不区分大小写）。上表中 `hy2obfs` 及其后的变量
+都是可选增强，**未设置时一律关闭**。只要调用方设置了 `proto` 或任一增强变量，安装
+流程就不会追加任何新的交互提问，因此既有的无人值守脚本得到与之前相同的节点。完全
+交互的安装（未设置 `proto`）才显示引导菜单，其中 Hysteria2 的默认选择是"Salamander
+混淆（随机密码）"。
+
+## 节点文件字段
+
+节点文件 `/root/reality_nodes/<name>.env` 每行一个 `KEY=VALUE`，只能经
+`safe_read_config_value` / `safe_load_node_config` 读取。下列字段是在原有字段之外
+新增的，**全部可选**：缺失时行为与新增之前完全一致，旧节点文件无需迁移。
+
+| 字段 | 含义 |
+| --- | --- |
+| `EXTRA_SHORT_IDS` | 附加 REALITY shortId，冒号分隔；只进服务端白名单，不进分享链接 |
+| `XHTTP_UUID`, `XHTTP_PUBLIC_KEY`, `XHTTP_PRIVATE_KEY`, `XHTTP_SHORT_ID` | `both` 节点 XHTTP inbound 的独立凭据；缺失时与 Vision 共用 |
+| `MLDSA65_SEED`, `MLDSA65_VERIFY` | REALITY ML-DSA-65 的服务端种子与客户端公钥（分享链接 `pqv`） |
+| `VLESS_DECRYPTION`, `VLESS_ENCRYPTION` | VLESS Encryption 的服务端与客户端串（分享链接 `encryption`） |
+| `HY2_OBFS_PASSWORD` | 非空即启用 Salamander 混淆 |
+| `HY2_HOP_PORTS` | 端口跳跃范围 `起始-结束` |
+| `HY2_DOMAIN`, `HY2_EMAIL` | 非空即使用 ACME 证书 |
+
+`reset_node_state` 仍是这些变量的唯一权威清单；`load_node_for_edit` 是"读入、解密、
+修改后 `save_env` 重存"流程的唯一入口，节点编辑与升级向导共用。
+
+## sing-box Release 契约
+
+| 变量 | 兼容别名 | 契约 |
+| --- | --- | --- |
+| `SINGBOX_VERSION` | `singbox_version` | 固定 release；可带 `v` 前缀；语法同 Xray 的版本校验 |
+| `SINGBOX_SHA256` | 无 | release 元数据缺少摘要时由操作者给出的期望 SHA-256；给出后同样强制比对 |
+| `SINGBOX_BACKUP_KEEP` | 无 | 脚本备份保留数；默认 `3` |
+
+`singbox-version` 只读显示本地版本、latest stable 与安全基线；远端查询失败只把该项
+标为不可用。`singbox-update` 属于写操作，沿用单实例写锁。
+
+安装与更新共用 `singbox_install_release`，顺序不可交换：
+
+1. 读取 release 元数据（`releases/latest` 或 `releases/tags/v<version>`）；
+2. 按 libc 从元数据里选归档名（musl 优先 `-musl`，不存在则回落默认归档）；
+3. 要求资产的 `digest` 为 `sha256:<64 位十六进制>`，且下载地址位于官方 release 路径；
+   不满足即失败关闭，不下载、不执行；
+4. 下载并比对 SHA-256，解包，候选 binary 必须可执行且报告 tag 对应的版本；
+5. 存在配置时候选 binary 必须通过 `check -c`；
+6. 备份旧 binary，在同目录暂存后 `rename` 替换；
+7. 原先 active 的服务重启后必须恢复 active，否则换回备份并再次重启。
+
+未指定版本时不降级：已安装版本高于 stable 时保持不变。普通节点 `install` 发现可运行
+的 sing-box 时只报告、不替换，与 Xray 的语义一致。
+
+## 升级契约
+
+`upgrade_scan` 离线、只读，产出若干"可升级项"。每项有稳定 ID、分类和两行说明：
+
+| 分类 | 含义 | 向导默认 |
+| --- | --- | --- |
+| `safe` | 只动服务端，客户端零改动 | 勾选 |
+| `relink` | 分享链接改变，客户端必须重新导入 | 不勾选，执行前二次确认 |
+| `info` | 仅告知，没有动作，不能被 `apply` 选中 | — |
+
+| ID | 分类 | 触发条件 | 动作 |
+| --- | --- | --- | --- |
+| `core.xray` | safe | 已安装 Xray 低于安全基线 v26.10.31 | `XRAY_CHANNEL=stable` 的 `xray-update` |
+| `core.singbox` | safe | 已安装 sing-box 低于安全基线 1.13.16 | `singbox_install_release update` |
+| `cfg.reality-fields` | safe | Xray 配置含 `dest` 或 `fingerprint`，且内核支持 `target`（或本次会更新内核） | 重建配置 |
+| `svc.hardening` | safe | systemd ≥ 235，服务在运行、未加固、无跳过标记 | 下发 drop-in 并验证 |
+| `geodata.cron` | safe | crontab 仍是未校验的更新命令 | 安装 helper 并替换 cron |
+| `sysctl.template` | safe | 调优文件含 `tcp_low_latency` | 按当前算法重写 |
+| `node.<name>.sni` | relink | REALITY 目标是 Apple/iCloud 系域名 | 测速并按 ASN/CDN 评分自动换域名 |
+| `node.<name>.port443` | relink | REALITY 节点不在 443，且 443/tcp 空闲、未被节点登记；每次扫描至多提供给一个节点 | 端口改为 443 并放行 |
+| `node.<name>.split` | relink | `both` 节点没有 XHTTP 独立凭据 | 生成 XHTTP 凭据 |
+| `node.<name>.vlessenc` | relink | VLESS 节点未启用 VLESS Encryption，且内核支持 | 生成 X25519 认证的密钥对 |
+| `node.<name>.hy2obfs` | relink | 自签名 Hysteria2 节点未启用混淆 | 生成随机混淆密码 |
+| `node.<name>.ss` | info | Shadowsocks 节点 | — |
+| `links.pin` | info | 存在自签名 Hysteria2 节点 | — |
+
+`upgrade_apply` 的顺序固定为"内核 → 节点与配置 → 系统项"。节点改动前把节点文件与
+两个内核的配置快照到 `/var/lib/proxy-hub/upgrade-backups/<时间>-<pid>/`（mode 0700，
+保留最近 5 份）；所有节点改动合并成一次 `cmd_regenerate`，失败时用快照恢复节点文件并
+再次重建。一项失败不终止其余无关的项；有任何一项失败时命令返回非零。
+
+- `upgrade check`：只读，不取写锁，退出码恒为 0。
+- `upgrade apply [recommended|all|ID,ID...]`：缺省为 `recommended`（全部 `safe` 项）；
+  `all` 为全部 `safe` 与 `relink` 项；显式列表中的每个 ID 必须出现在本次扫描结果里且
+  不是 `info`，否则不执行任何项并返回非零。
+- `upgrade`（无参数）：有终端时进入向导；没有终端时退化为 `upgrade check` 的输出并
+  提示无人值守命令，不提问也不修改。
+
+`/root/.proxy_hub_upgrade` 记录"已处理或已知悉"的那一批可升级项的指纹（ID 集合排序
+后的 SHA-256）。打开交互菜单时，仅当存在可升级项且指纹与记录不同才提示一次。该
+文件按不可信输入处理：非十六进制字符被剔除，符号链接不被信任，内容从不被求值。
 
 ## Xray Release 环境变量
 
@@ -191,9 +291,27 @@ Xray release 路径不要求 `pgrep`。
 | `hysteria2` | sing-box | UDP/QUIC | `PORT/udp` |
 
 AnyTLS 与 Hysteria2 聚合到同一个 `/usr/local/etc/sing-box/config.json` 和 sing-box
-service；Hysteria2 不引入独立二进制或每节点 service。Hysteria2 使用逐节点自签名
-证书，分享链接使用 `hysteria2://` 并包含 `insecure=1`。云平台安全组不属于本机
-防火墙契约，调用方仍须按上表开放外部入口。
+service；Hysteria2 不引入独立二进制或每节点 service。云平台安全组不属于本机防火墙
+契约，调用方仍须按上表开放外部入口。
+
+Hysteria2 的证书与链接：
+
+- 默认使用逐节点自签名证书（ECDSA P-256，不得改为 Ed25519），分享链接为
+  `hysteria2://...?sni=...&insecure=1&pinSHA256=<证书 DER 的 SHA-256 十六进制>`；
+  证书文件缺失时省略 `pinSHA256`。
+- 设置了 `HY2_DOMAIN` 时由 sing-box 通过 ACME 签发：sing-box ≥ 1.14 渲染为顶层
+  `certificate_providers` 加 inbound 的 `certificate_provider` 引用，更早版本渲染为
+  内联 `tls.acme`；443/tcp 被本机节点登记时禁用 TLS-ALPN-01，80/tcp 被登记时禁用
+  HTTP-01。链接只带 `sni=<域名>`。安装后额外放行未被节点占用的 `80/tcp` 与 `443/tcp`。
+- `HY2_OBFS_PASSWORD` 非空时 inbound 增加 `obfs.type=salamander` 并去掉 `masquerade`，
+  链接追加 `obfs=salamander&obfs-password=...`。
+- `HY2_HOP_PORTS` 非空时链接追加 `mport=<范围>`；NAT 规则位于专用链
+  `PROXY_HUB_HY2_HOP`，由 `/usr/local/libexec/proxy-hub-hy2-hop apply` 幂等重建，并随
+  sing-box 服务启动重新下发。
+
+REALITY 入站（Xray）：内核支持时写 `target`，否则写 `dest`，两者不同时出现；不写
+`fingerprint`；`shortIds` 为主 shortId 加 `EXTRA_SHORT_IDS`。节点带有 `MLDSA65_SEED`
+或 `VLESS_DECRYPTION` 而内核不支持对应能力时，配置生成失败而不是丢弃该字段。
 
 ## 交互输出契约
 

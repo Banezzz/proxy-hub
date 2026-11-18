@@ -59,6 +59,15 @@ open_node_firewall_ports() {
         hysteria2)
             open_firewall_port "$PORT" udp || \
                 log_warn "Could not automatically open UDP port $PORT"
+            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
+            if [[ -n "${HY2_DOMAIN:-}" ]]; then
+                local acme_port
+                for acme_port in 80 443; do
+                    node_tcp_port_claimed "$acme_port" && continue
+                    open_firewall_port "$acme_port" tcp || \
+                        log_warn "Could not automatically open TCP port $acme_port for ACME"
+                done
+            fi
             ;;
         shadowsocks)
             open_firewall_port "$PORT" both || \
@@ -178,6 +187,10 @@ cmd_install() {
     # Shadowsocks 和 VLESS 的安装流程不同
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
         # Shadowsocks 安装流程
+        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
+        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
+        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
+            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
         # 选择加密方式（或使用环境变量 ssmethod=xxx）
         if [[ -n "${ssmethod:-}" ]]; then
             SS_METHOD="$ssmethod"
@@ -215,6 +228,9 @@ cmd_install() {
             return 1
         fi
         choose_ports || return 1
+        configure_hy2_options || return 1
+        # ACME 节点的 TLS SNI 就是证书域名。
+        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
 
         UUID=""
         PUBLIC_KEY=""
@@ -233,6 +249,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             rm -f "$CACHE_FILE" 2>/dev/null
             [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
@@ -253,6 +270,7 @@ cmd_install() {
         UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
             gen_reality_keys || return 1
+            apply_extra_short_ids || return 1
         else
             PUBLIC_KEY=""
             PRIVATE_KEY=""
@@ -269,6 +287,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             select_best_sni
         fi
@@ -276,6 +295,12 @@ cmd_install() {
         gen_uuid
         choose_ports
         gen_reality_keys
+        apply_extra_short_ids || return 1
+        # both 节点的两个 inbound 各用一套凭据，互不牵连。
+        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
+            gen_xhttp_credentials || return 1
+        fi
+        configure_pq_options || return 1
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -287,8 +312,8 @@ cmd_install() {
     save_env
 
     if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
-        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
+        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
             if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
                 log_error "Failed to generate TLS certificate, rolling back..."
                 rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
@@ -306,6 +331,8 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        # 服务已通过健康门后再加固：加固失败会自行撤销，不影响这次安装的结果。
+        service_hardening_ensure "$SINGBOX_SERVICE" || true
     else
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
@@ -334,6 +361,7 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        service_hardening_ensure xray || true
     fi
 
     log_info "$(msg install_complete)"
@@ -589,19 +617,30 @@ cmd_remove() {
 }
 
 # 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
-cmd_edit() {
-    select_node || return 1
+# 把 CURRENT_NODE_NAME 指向的节点完整装入全局变量，供"修改后再 save_env"的流程使用。
+# safe_load 不含 padding；敏感值在这里解密，save_env 重存时才能正确再加密（明文配置下
+# 为 no-op）。节点编辑与升级向导共用这一份，避免两处各自维护字段清单。
+load_node_for_edit() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    safe_load_node_config "$node_file"
+    safe_load_node_config "$node_file" || return 1
 
-    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
     UUID=$(decrypt_value "$UUID")
     PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
     SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
     ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
     HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
+    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
+    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
+    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
+    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+}
+
+cmd_edit() {
+    select_node || return 1
+    load_node_for_edit || return 1
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -651,6 +690,8 @@ cmd_edit() {
                 echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
                 echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
+                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -699,6 +740,8 @@ cmd_edit() {
                 new_hy2_sni="${new_hy2_sni:-${SNI:-www.bing.com}}"
                 if validate_tls_server_name "$new_hy2_sni"; then
                     SNI="$new_hy2_sni"
+                    # ACME 节点的 SNI 即证书域名，两者一起改。
+                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
                     sni_changed=true
                     changed=true
                 else
@@ -709,11 +752,18 @@ cmd_edit() {
             vision:3|xhttp:3|both:4)
                 UUID=$(cat /proc/sys/kernel/random/uuid)
                 log_info "新 UUID: $UUID"
+                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
+                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
                 changed=true ;;
 
             # ---- Reality 密钥对 ----
             vision:4|xhttp:4|both:5|anytls_reality:5)
                 if gen_reality_keys; then
+                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
+                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
+                        local keep_xhttp_uuid="$XHTTP_UUID"
+                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
+                    fi
                     log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
                     changed=true
                 fi ;;
@@ -743,6 +793,28 @@ cmd_edit() {
                 unset hy2pwd
                 gen_hy2_password
                 changed=true ;;
+            hysteria2:4)
+                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+                    HY2_OBFS_PASSWORD=""
+                    log_warn "$(t2 "已关闭 Salamander 混淆，客户端需同步去掉混淆设置" \
+                        "Salamander obfuscation disabled; clients must drop their obfs setting")"
+                else
+                    HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+                    log_warn "$(t2 "已启用 Salamander 混淆，客户端需重新导入链接" \
+                        "Salamander obfuscation enabled; clients must re-import the link")"
+                fi
+                changed=true ;;
+
+            hysteria2:5)
+                local new_hop
+                echo -n "  $(t2 "UDP 范围（如 20000-20100，留空关闭）" "UDP range (e.g. 20000-20100, empty to disable)"): " >/dev/tty
+                read -r new_hop </dev/tty
+                if [[ -z "$new_hop" ]]; then
+                    HY2_HOP_PORTS=""
+                    changed=true
+                elif apply_hy2_hop_range "$new_hop"; then
+                    changed=true
+                fi ;;
 
             # ---- AnyTLS padding ----
             anytls:4|anytls_reality:4)
@@ -767,7 +839,7 @@ cmd_edit() {
     # 重新生成对应内核配置并重启
     if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
         # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
-        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
+        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
             rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
             gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
         fi
@@ -813,6 +885,13 @@ cmd_uninstall() {
             rm -f "$tmp_installer"
         fi
     fi
+
+    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
+    hy2_hop_remove
+    # 移除服务沙箱加固的 drop-in 与跳过标记
+    service_hardening_remove xray
+    service_hardening_remove "$SINGBOX_SERVICE"
+    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 
     # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
@@ -888,6 +967,16 @@ cmd_health() {
             all_ok=false
         fi
     fi
+
+    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
+    # 节点本身是可用的，只是应该尽快更新。
+    local gap_name gap_installed gap_baseline gap_command
+    while read -r gap_name gap_installed gap_baseline; do
+        [[ -n "$gap_name" ]] || continue
+        gap_command="xray-update"
+        [[ "$gap_name" == "sing-box" ]] && gap_command="singbox-update"
+        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
+    done < <(core_baseline_gaps)
 
     # 2. 检查节点数量
     local node_count

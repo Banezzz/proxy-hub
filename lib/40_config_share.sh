@@ -59,12 +59,16 @@ write_config() {
     # 构建 inbounds 数组
     local inbounds_json="[]"
 
+    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
+    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
+    xray_probe_capabilities
+
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 
         # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
-        local n_ss_method n_ss_password
+        local n_ss_method n_ss_password n_sid_list
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_uuid=$(safe_read_config_value "$node_file" "UUID")
@@ -76,11 +80,28 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
+        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
+        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
+        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
         n_uuid=$(decrypt_value "$n_uuid")
         n_ss_password=$(decrypt_value "$n_ss_password")
+
+        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
+        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
+        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
+        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
+        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
+        n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
+        [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
+        if [[ -z "$n_xhttp_private_key" ]]; then
+            n_xhttp_private_key="$n_private_key"
+            n_xhttp_sid_list="$n_sid_list"
+        else
+            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
+        fi
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -96,6 +117,23 @@ write_config() {
         # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
         if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
             continue
+        fi
+
+        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
+        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
+        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
+        if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
+            log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
+            return 1
+        fi
+
+        # 可选的 VLESS Encryption，同样在核心不支持时失败而不是静默退回明文 VLESS。
+        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")")
+        if [[ -n "$n_decryption" ]] && ! xray_supports vlessenc; then
+            log_error "$(t2 "节点 '$n_name' 启用了 VLESS Encryption，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses VLESS Encryption, which this Xray does not support; run xray-update first")"
+            return 1
         fi
 
         # 跳过无效节点（VLESS 需要 UUID，Shadowsocks 需要密码）
@@ -143,7 +181,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -171,7 +209,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -275,7 +313,7 @@ EOF
 write_singbox_config() {
     mkdir -p "$SINGBOX_DIR"
 
-    local inbounds_json="[]"
+    local inbounds_json="[]" providers_json="[]"
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
@@ -289,7 +327,8 @@ write_singbox_config() {
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_sni=$(safe_read_config_value "$node_file" "SNI")
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
-        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
         if [[ "$n_proto" == "hysteria2" ]]; then
             n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
         else
@@ -314,11 +353,30 @@ write_singbox_config() {
         if [[ "$n_proto" == "hysteria2" ]]; then
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
-            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
+            if [[ -n "$n_domain" ]]; then
+                # ACME 真证书：不再使用逐节点自签名证书。
+                sb_version=$(singbox_installed_version) || sb_version=""
+                [[ -n "$sb_version" ]] && version_ge "$sb_version" 1.14.0 && use_provider=1
+                node_tcp_port_claimed 443 && no_alpn=1
+                node_tcp_port_claimed 80 && no_http=1
+                if ! n_acme=$(build_hy2_acme_json "$n_name" "$n_domain" \
+                    "$(safe_read_config_value "$node_file" "HY2_EMAIL")" "$SINGBOX_DIR/acme" \
+                    "$use_provider" "$no_alpn" "$no_http"); then
+                    log_error "Failed to build ACME settings for node '$n_name'"
+                    return 1
+                fi
+                n_tls_json=$(jq -c '.tls' <<<"$n_acme")
+                providers_json=$(jq -c --argjson acme "$n_acme" \
+                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
+                n_sni="$n_domain"
+            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -362,12 +420,13 @@ write_singbox_config() {
     local config_json
     if ! config_json=$(jq -n \
         --argjson inbounds "$inbounds_json" \
+        --argjson providers "$providers_json" \
         '{
             "log": {"level": "warn", "timestamp": true},
             "inbounds": $inbounds,
             "outbounds": [{"type": "direct", "tag": "direct"}],
             "route": {"final": "direct"}
-        }' 2>&1); then
+        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
         log_error "Failed to assemble sing-box config: $config_json"
         return 1
     fi
@@ -396,6 +455,7 @@ singbox_sync() {
             service_disable "$SINGBOX_SERVICE"
         fi
         rm -f "$SINGBOX_CONF" 2>/dev/null
+        hy2_hop_sync
         return 0
     fi
 
@@ -408,6 +468,11 @@ singbox_sync() {
     fi
 
     if ! write_singbox_config; then
+        return 1
+    fi
+
+    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
+    if ! hy2_hop_sync; then
         return 1
     fi
 
@@ -451,8 +516,18 @@ save_env() {
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
     local save_hy2_password="${HY2_PASSWORD:-}"
+    local save_xhttp_uuid="${XHTTP_UUID:-}"
+    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
+    local save_mldsa65_seed="${MLDSA65_SEED:-}"
+    local save_vless_decryption="${VLESS_DECRYPTION:-}"
+    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
 
     if is_encryption_enabled; then
+        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
+        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
+        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
+        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
+        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
         # encrypt_value 对空串直接返回空串，因此无需额外判空。
         save_uuid=$(encrypt_value "$save_uuid")
         save_private_key=$(encrypt_value "$save_private_key")
@@ -472,14 +547,27 @@ SNI=${SNI:-}
 PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
 SHORT_ID=${SHORT_ID:-}
+EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
+XHTTP_UUID=$save_xhttp_uuid
+XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
+XHTTP_PRIVATE_KEY=$save_xhttp_private_key
+XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
+MLDSA65_SEED=$save_mldsa65_seed
+MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
+VLESS_DECRYPTION=$save_vless_decryption
+VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
+HY2_OBFS_PASSWORD=$save_hy2_obfs_password
+HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
+HY2_DOMAIN=${HY2_DOMAIN:-}
+HY2_EMAIL=${HY2_EMAIL:-}
 ENV
     chmod 600 "$node_file"
 
@@ -507,7 +595,14 @@ get_vision_link() {
         ip_formatted="[$ip]"
     fi
 
-    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
+    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
+}
+
+# VLESS 分享链接里的后量子参数。pqv 对应客户端的 mldsa65Verify（分享链接标准
+# XTLS/Xray-core discussion #716），值是 base64url，无需转义。
+vless_link_pq_params() {
+    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
+    return 0
 }
 
 # 生成 XHTTP 分享链接
@@ -521,10 +616,39 @@ get_xhttp_link() {
         ip_formatted="[$ip]"
     fi
 
-    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
+    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
+    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
+    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
     local encoded_path
     encoded_path=$(echo -n "$XHTTP_PATH" | sed 's|/|%2F|g')
-    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
+    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
+    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
+    if [[ -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+        link_pbk="$XHTTP_PUBLIC_KEY"
+        link_sid="${XHTTP_SHORT_ID:-}"
+    fi
+    # 启用 VLESS Encryption 时 XHTTP 也使用 Vision 流控，链接需带上 flow。
+    local link_flow=""
+    [[ -n "${VLESS_ENCRYPTION:-}" ]] && link_flow="&flow=xtls-rprx-vision"
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=${VLESS_ENCRYPTION:-none}${link_flow}&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
+}
+
+# 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
+# gen_reality_keys 直接写全局的 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，因此先保存 Vision
+# 的那一套，生成后搬到 XHTTP_* 再还原。
+gen_xhttp_credentials() {
+    local keep_public="$PUBLIC_KEY" keep_private="$PRIVATE_KEY" keep_sid="$SHORT_ID" rc=0
+    gen_reality_keys || rc=$?
+    if ((rc == 0)); then
+        XHTTP_PUBLIC_KEY="$PUBLIC_KEY"
+        XHTTP_PRIVATE_KEY="$PRIVATE_KEY"
+        XHTTP_SHORT_ID="$SHORT_ID"
+        XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    PUBLIC_KEY="$keep_public"
+    PRIVATE_KEY="$keep_private"
+    SHORT_ID="$keep_sid"
+    return "$rc"
 }
 
 # 生成 Shadowsocks 分享链接
@@ -570,17 +694,79 @@ get_anytls_link() {
     fi
 }
 
+# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
+# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
+# Usage: cert_sha256_hex CERT_PEM
+cert_sha256_hex() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    out="${out##*=}"
+    out="${out//:/}"
+    out="${out,,}"
+    [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$out"
+}
+
+# 证书公钥的 SHA-256（base64），对应 sing-box 出站的 certificate_public_key_sha256。
+# Usage: cert_pubkey_sha256_b64 CERT_PEM
+cert_pubkey_sha256_b64() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform der 2>/dev/null \
+        | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0) || return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+# 当前已加载节点的逐节点自签名证书路径。
+node_selfsigned_cert_path() {
+    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
+}
+
 # 生成 Hysteria2 分享链接。密码被限制在 URI-unreserved 字符集内。
+#
+# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
+# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
+# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
+# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
 get_hy2_link() {
     local ip="$1"
     local node_label="$2"
     local ip_formatted="$ip"
+    local pin="" query
 
     if [[ "$ip" == *:* ]]; then
         ip_formatted="[$ip]"
     fi
 
-    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
+    if [[ -n "${HY2_DOMAIN:-}" ]]; then
+        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
+        query="sni=${HY2_DOMAIN}"
+    else
+        query="sni=${SNI:-www.bing.com}&insecure=1"
+        pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
+        [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    fi
+    [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
+    [[ -n "${HY2_HOP_PORTS:-}" ]] && query+="&mport=${HY2_HOP_PORTS}"
+
+    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
+}
+
+# 在节点信息里展示自签名证书指纹，供不支持从链接导入固定值的客户端手工填写。
+show_selfsigned_cert_pins() {
+    local cert pin_hex pin_key
+    cert=$(node_selfsigned_cert_path)
+    pin_hex=$(cert_sha256_hex "$cert") || return 0
+    pin_key=$(cert_pubkey_sha256_b64 "$cert") || pin_key=""
+    echo -e "  ${BLUE}Cert SHA-256:${NC} ${pin_hex}"
+    echo -e "               ${GRAY}(Hysteria2 pinSHA256 / Xray pinnedPeerCertSha256)${NC}"
+    if [[ -n "$pin_key" ]]; then
+        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
+        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
+    fi
 }
 
 # 向后兼容的获取分享链接函数
@@ -597,6 +783,7 @@ get_share_link() {
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
@@ -662,7 +849,13 @@ show_qrcode() {
     echo -e "${GREEN}                    $(msg qr_title)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    qrencode -t ANSIUTF8 "$link"
+    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
+    if (( ${#link} > 1200 )); then
+        echo -e "  ${YELLOW}$(t2 "链接过长（${#link} 字符），不生成二维码，请复制下方链接导入" \
+            "The link is too long for a scannable QR code (${#link} characters); copy the link below instead")${NC}"
+    else
+        qrencode -t ANSIUTF8 "$link"
+    fi
     echo ""
     echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
     echo -e "${GREEN}$(msg share_link):${NC}"
@@ -671,6 +864,12 @@ show_qrcode() {
     echo ""
     echo -e "${MAGENTA}$(msg qr_tip)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
+show_extra_short_ids() {
+    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
+    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 }
 
 # 在 63 宽的标题框内居中输出（近似处理 CJK 双宽字符：显示宽度≈(字符数+字节数)/2）
@@ -755,11 +954,24 @@ show_info() {
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
+        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
+        fi
+        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
+            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
+        fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
-        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
-        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+        if [[ -n "${HY2_DOMAIN:-}" ]]; then
+            echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
+            echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"
+        else
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
+            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+            show_selfsigned_cert_pins
+        fi
         echo ""
 
         if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
@@ -788,11 +1000,13 @@ show_info() {
             echo -e "  ${BLUE}SNI:${NC}         $SNI"
             echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
             echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+            show_extra_short_ids
             echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         else
             echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
             echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}  ${GRAY}(证书 CN / cert CN)${NC}"
             echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(客户端需允许不安全连接)${NC}"
+            show_selfsigned_cert_pins
         fi
 
         # Padding scheme（base64 解码后展示）：每个节点随机生成，握手时自动下发给客户端
@@ -842,6 +1056,18 @@ show_info() {
         echo -e "  ${BLUE}SNI:${NC}         $SNI"
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+        show_extra_short_ids
+        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
+            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
+        fi
+        if [[ -n "${VLESS_ENCRYPTION:-}" ]]; then
+            echo -e "  ${BLUE}Encryption:${NC}  ${VLESS_ENCRYPTION%.*}.<key>  ${GRAY}(VLESS Encryption)${NC}"
+        fi
+        if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+            echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
+            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
+            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
+        fi
         echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 

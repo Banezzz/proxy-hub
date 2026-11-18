@@ -582,8 +582,164 @@ depend() {
     need net
     after firewall
 }
+
+start_pre() {
+    # Hysteria2 端口跳跃的 NAT 规则不持久，随服务启动重新下发（helper 不存在则跳过）。
+    [ -x /usr/local/libexec/proxy-hub-hy2-hop ] && /usr/local/libexec/proxy-hub-hy2-hop apply
+    return 0
+}
 OPENRC_SERVICE
     chmod 755 /etc/init.d/sing-box
+}
+
+# ============== Hysteria2 端口跳跃 ==============
+#
+# 服务端只监听一个 UDP 端口；端口跳跃靠 NAT 把一段 UDP 端口重定向到它。规则放在
+# 专用链 PROXY_HUB_HY2_HOP 里，每次同步先清空再重建，因此是幂等的，也不会碰用户
+# 自己的 NAT 规则。iptables 规则重启即丢，所以生成一个 helper，由 sing-box 服务在
+# 启动前调用（systemd drop-in 的 ExecStartPre / OpenRC 的 start_pre）。
+HY2_HOP_HELPER="/usr/local/libexec/proxy-hub-hy2-hop"
+HY2_HOP_DROPIN="/etc/systemd/system/sing-box.service.d/20-proxy-hub-hy2-hop.conf"
+HY2_HOP_CHAIN="PROXY_HUB_HY2_HOP"
+
+# 校验并规范化端口跳跃范围。Usage: validate_hop_range "20000-20100" -> "20000-20100"
+validate_hop_range() {
+    local range="${1:-}" start end
+    [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+    start=$((10#${BASH_REMATCH[1]}))
+    end=$((10#${BASH_REMATCH[2]}))
+    (( start >= 1 && end <= 65535 && start < end && end - start <= 20000 )) || return 1
+    printf '%s-%s' "$start" "$end"
+}
+
+# 范围是否与其他节点冲突：别的节点监听的 UDP 端口落在范围内会被一并重定向走，
+# 两个跳跃范围重叠则后一条规则永远不会命中。
+# Usage: hy2_hop_range_conflicts RANGE SELF_NODE_NAME
+hy2_hop_range_conflicts() {
+    local range="$1" self="${2:-}" start="${1%-*}" end="${1#*-}" f name proto port other
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .env)
+        [[ "$name" == "$self" ]] && continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        port=$(safe_read_config_value "$f" "PORT")
+        if [[ "$proto" == "hysteria2" || "$proto" == "shadowsocks" ]] && [[ "$port" =~ ^[0-9]+$ ]] \
+            && (( port >= start && port <= end )); then
+            return 0
+        fi
+        other=$(safe_read_config_value "$f" "HY2_HOP_PORTS")
+        if [[ "$other" =~ ^([0-9]+)-([0-9]+)$ ]] \
+            && (( BASH_REMATCH[1] <= end && BASH_REMATCH[2] >= start )); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 随机挑一段不与其他节点冲突的 200 端口范围，供"推荐配置"直接采用，用户无需自己
+# 想一个范围。随机化同时避免所有部署都落在同一段众所周知的端口上。
+# Usage: gen_hy2_hop_range [SELF_NODE_NAME]
+gen_hy2_hop_range() {
+    local self="${1:-}" attempt start range
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        start=$(shuf -i 20000-59000 -n 1) || return 1
+        range="${start}-$((start + 199))"
+        hy2_hop_range_conflicts "$range" "$self" && continue
+        printf '%s' "$range"
+        return 0
+    done
+    return 1
+}
+
+# 输出全部跳跃规则，每行 "START END LISTEN_PORT"。
+hy2_hop_rules() {
+    local f range port
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        [[ "$(safe_read_config_value "$f" "PROTOCOL_TYPE")" == "hysteria2" ]] || continue
+        range=$(validate_hop_range "$(safe_read_config_value "$f" "HY2_HOP_PORTS")") || continue
+        port=$(get_validated_port "$(safe_read_config_value "$f" "PORT")" true) || continue
+        printf '%s %s %s\n' "${range%-*}" "${range#*-}" "$port"
+    done
+}
+
+# 清除规则并移除 helper / drop-in。
+hy2_hop_remove() {
+    [[ -x "$HY2_HOP_HELPER" ]] && "$HY2_HOP_HELPER" clear >/dev/null 2>&1
+    rm -f -- "$HY2_HOP_HELPER"
+    if [[ -e "$HY2_HOP_DROPIN" ]]; then
+        rm -f -- "$HY2_HOP_DROPIN"
+        rmdir -- "$(dirname "$HY2_HOP_DROPIN")" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 让 NAT 规则与节点文件一致。没有任何跳跃范围时清理干净；有则必须成功，否则返回
+# 非零——分享链接已经声明了跳跃范围，规则没下发会让客户端跳到无人接收的端口上。
+hy2_hop_sync() {
+    local rules tmp
+    rules=$(hy2_hop_rules)
+    if [[ -z "$rules" ]]; then
+        hy2_hop_remove
+        return 0
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "Hysteria2 端口跳跃需要 iptables，请先安装" "Hysteria2 port hopping requires iptables; install it first")"
+        return 1
+    fi
+
+    mkdir -p -- "$(dirname "$HY2_HOP_HELPER")" || return 1
+    tmp=$(mktemp "${HY2_HOP_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: hy2-hop-v1
+# Redirects the UDP hop ranges of Hysteria2 nodes to their listen ports.
+CHAIN=$HY2_HOP_CHAIN
+RULES='$rules'
+status=0
+for ipt in iptables ip6tables; do
+    command -v "\$ipt" >/dev/null 2>&1 || continue
+    if [ "\$ipt" = ip6tables ] && [ ! -f /proc/net/if_inet6 ]; then continue; fi
+    "\$ipt" -t nat -D PREROUTING -j "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -F "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -X "\$CHAIN" 2>/dev/null
+    [ "\$1" = clear ] && continue
+    ok=1
+    "\$ipt" -t nat -N "\$CHAIN" || ok=0
+    if [ "\$ok" = 1 ]; then
+        printf '%s\n' "\$RULES" | while read -r start end port; do
+            [ -n "\$port" ] || continue
+            "\$ipt" -t nat -A "\$CHAIN" -p udp --dport "\$start:\$end" -j REDIRECT --to-ports "\$port" || exit 1
+        done || ok=0
+    fi
+    [ "\$ok" = 1 ] && { "\$ipt" -t nat -A PREROUTING -j "\$CHAIN" || ok=0; }
+    # IPv6 NAT 需要内核的 ip6table_nat，缺失时只影响 IPv6 的跳跃，不视为失败。
+    [ "\$ok" = 1 ] || [ "\$ipt" = ip6tables ] || status=1
+done
+exit "\$status"
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$HY2_HOP_HELPER" || { rm -f -- "$tmp"; return 1; }
+
+    if ! "$HY2_HOP_HELPER" apply; then
+        log_error "$(t2 "下发 Hysteria2 端口跳跃的 NAT 规则失败" "Failed to apply the Hysteria2 port-hopping NAT rules")"
+        return 1
+    fi
+
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        create_singbox_openrc_service
+    else
+        # "+" 让 helper 以完整权限运行，不受服务沙箱加固限制：加载 NAT 内核模块需要
+        # 的能力不在加固后的 capability 集合里。该前缀自 systemd 231 起可用，更早的
+        # 版本不认识它，也没有加固 drop-in，保持旧写法。
+        local hop_prefix="-" hop_systemd
+        hop_systemd=$(systemd_version) || hop_systemd=0
+        (( hop_systemd >= 231 )) && hop_prefix="-+"
+        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
+        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
+            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 }
 
 # musl 系统（Alpine）没有 glibc 动态链接器，无法执行链接 glibc 的二进制文件。
@@ -606,6 +762,10 @@ system_is_musl() {
 
 # 安装 sing-box（下载官方预编译二进制，按 libc 选择归档，兼容 glibc 与 musl）
 # AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
+#
+# 已有可运行的 binary 时只报告、不改动，与 Xray 的普通安装语义一致：创建节点不应
+# 悄悄升级内核。下载、SHA-256 校验、候选 binary 验证与原子替换都在
+# singbox_install_release 里，全新安装与显式的 singbox-update 走同一条路径。
 install_singbox() {
     if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
         log_info "sing-box already installed, skipping..."
@@ -613,88 +773,7 @@ install_singbox() {
     fi
 
     log_info "Installing sing-box (required for AnyTLS / Hysteria2)..."
-
-    local arch sb_arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)   sb_arch="amd64" ;;
-        aarch64|arm64)  sb_arch="arm64" ;;
-        armv7l|armv7)   sb_arch="armv7" ;;
-        i686|i386)      sb_arch="386" ;;
-        *)
-            log_error "Unsupported architecture for sing-box: $arch"
-            return 1
-            ;;
-    esac
-
-    # 获取最新版本号（安全的 API 解析）
-    local tag version
-    tag=$(fetch_github_release_tag "SagerNet/sing-box")
-    if [[ -z "$tag" ]]; then
-        log_error "Failed to get sing-box latest version"
-        return 1
-    fi
-    version="${tag#v}"
-
-    # 归档选择按 libc 而不是按发行版：sing-box >= 1.13.0 的默认 linux 归档动态
-    # 链接 glibc，在 Alpine 上会以 "cannot execute: required file not found"
-    # 失败；静态链接的 "-musl" 归档只从 1.13.0 起提供，更早的版本只有一个已经
-    # 是静态链接的默认归档，所以旧版本仍回落到默认名。
-    local -a archive_names=()
-    if system_is_musl; then
-        log_info "musl libc detected, using the statically linked sing-box build"
-        archive_names+=("sing-box-${version}-linux-${sb_arch}-musl.tar.gz")
-    fi
-    archive_names+=("sing-box-${version}-linux-${sb_arch}.tar.gz")
-
-    log_info "Installing sing-box ${tag} (${sb_arch})..."
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    local archive_name download_url downloaded=0
-    for archive_name in "${archive_names[@]}"; do
-        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${archive_name}"
-        if secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
-            downloaded=1
-            break
-        fi
-        log_warn "sing-box archive not available: $archive_name"
-    done
-    if ((downloaded == 0)); then
-        log_error "Failed to download sing-box ${tag} for ${sb_arch}"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    if ! tar -xzf "${tmp_dir}/sing-box.tar.gz" -C "$tmp_dir" 2>/dev/null; then
-        log_error "Failed to extract sing-box archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local extracted_bin
-    extracted_bin=$(find "$tmp_dir" -type f -name sing-box 2>/dev/null | head -1)
-    if [[ -z "$extracted_bin" ]]; then
-        log_error "sing-box binary not found in archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    mkdir -p "$SINGBOX_DIR" /usr/local/bin
-    install -m 755 "$extracted_bin" "$SINGBOX_BIN"
-    rm -rf "$tmp_dir"
-
-    # 安装后立刻验证可执行性：否则不兼容的二进制要到后面 config check 才暴露，
-    # 并被报成 "Generated sing-box config is invalid"，掩盖真正的原因。
-    if ! "$SINGBOX_BIN" version &>/dev/null; then
-        log_error "Installed sing-box binary cannot be executed on this system"
-        if system_is_musl; then
-            log_error "This system uses musl libc; no compatible sing-box build was found for ${tag}"
-        fi
-        rm -f "$SINGBOX_BIN"
-        return 1
-    fi
+    singbox_install_release fresh || return 1
 
     # 创建服务（systemd 或 OpenRC）
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -702,8 +781,6 @@ install_singbox() {
     else
         create_singbox_systemd_service
     fi
-
-    log_info "sing-box ${tag} installed successfully"
     return 0
 }
 
@@ -718,23 +795,65 @@ ensure_geodata() {
     install_geodata
 }
 
+# GeoIP/GeoSite 以 root 身份被 Xray 加载并决定路由，却是从第三方 release 的 latest
+# 链接取的。这里把"下载 → 校验 → 替换"收进一个独立 helper，安装时与每周 cron 共用：
+#   - 两个文件各自对照同一 release 发布的 .sha256sum，任何一个不一致就整体放弃；
+#   - 全部通过后才用 rename 替换，Xray 永远读不到写了一半的文件；
+#   - 失败时保留旧数据，不会把可用的数据库换成损坏的。
+GEODATA_HELPER="/usr/local/libexec/proxy-hub-geodata-update"
+GEODATA_CRON_MARKER="# proxy-hub-geodata"
+
+install_geodata_helper() {
+    local tmp
+    mkdir -p -- "$(dirname "$GEODATA_HELPER")" || return 1
+    tmp=$(mktemp "${GEODATA_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: geodata-update-v1
+# Downloads geoip.dat / geosite.dat, verifies them against the published
+# .sha256sum files, and replaces the live copies only when both verify.
+DIR='$XRAY_GEODATA_DIR'
+BASE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download'
+fetch() { curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL "\$1" -o "\$2"; }
+mkdir -p "\$DIR" || exit 1
+tmp=\$(mktemp -d "\$DIR/.geodata.XXXXXXXX") || exit 1
+trap 'rm -rf "\$tmp"' EXIT
+for name in geoip.dat geosite.dat; do
+    fetch "\$BASE/\$name" "\$tmp/\$name" || { echo "download failed: \$name" >&2; exit 1; }
+    fetch "\$BASE/\$name.sha256sum" "\$tmp/\$name.sha256sum" || { echo "checksum download failed: \$name" >&2; exit 1; }
+    want=\$(awk 'NR == 1 { print \$1 }' "\$tmp/\$name.sha256sum")
+    have=\$(sha256sum "\$tmp/\$name" | awk '{ print \$1 }')
+    case "\$want" in
+        ????????????????????????????????????????????????????????????????) ;;
+        *) echo "malformed checksum: \$name" >&2; exit 1 ;;
+    esac
+    [ "\$want" = "\$have" ] || { echo "checksum mismatch: \$name" >&2; exit 1; }
+done
+for name in geoip.dat geosite.dat; do
+    chmod 644 "\$tmp/\$name" && mv -f "\$tmp/\$name" "\$DIR/\$name" || exit 1
+done
+exit 0
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$GEODATA_HELPER" || { rm -f -- "$tmp"; return 1; }
+}
+
 install_geodata() {
     log_info "$(msg install_geodata)"
 
     mkdir -p "$XRAY_GEODATA_DIR"
-
-    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-
-    # 下载 geoip.dat（使用安全的 curl 选项，内联因为 execute_task 在子 shell 运行）
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
-        # 创建软链接到 /usr/local/bin (Xray 查找位置)
-        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
+    if ! install_geodata_helper; then
+        log_error "Failed to install the GeoData update helper"
+        return 1
     fi
 
-    # 下载 geosite.dat
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
+    if execute_task "'$GEODATA_HELPER'" "Downloading and verifying geoip.dat / geosite.dat"; then
+        # 创建软链接到 /usr/local/bin (Xray 查找位置)
+        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
         ln -sf "$XRAY_GEODATA_DIR/geosite.dat" /usr/local/bin/geosite.dat 2>/dev/null || true
+    else
+        log_error "$(t2 "GeoData 下载或 SHA-256 校验失败，未改动现有数据" \
+            "GeoData download or SHA-256 verification failed; existing data is untouched")"
+        return 1
     fi
 
     # 设置自动更新定时任务（每周日 4:00）
@@ -744,17 +863,23 @@ install_geodata() {
 }
 
 setup_geodata_cron() {
-    # Use secure curl options in cron job (--proto, --tlsv1.2)
-    local cron_cmd="curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
-    local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
+    local cron_job="0 4 * * 0 $GEODATA_HELPER >/dev/null 2>&1 $GEODATA_CRON_MARKER"
 
     # 检查 crontab 命令是否存在
     if ! command -v crontab &>/dev/null; then
         return 0
     fi
 
-    # 添加定时任务（先删除旧的）
-    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
+    # 添加定时任务。先删除旧条目：既包括带标记的新形式，也包括升级前那条直接把
+    # 未校验的下载结果写到数据文件上的 curl 命令。
+    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat' \
+        | grep -vF "$GEODATA_CRON_MARKER"; echo "$cron_job") | crontab - 2>/dev/null || true
+}
+
+# 现有 crontab 是否还在用升级前的未校验更新命令。
+geodata_cron_is_legacy() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -F 'v2ray-rules-dat' | grep -qvF "$GEODATA_CRON_MARKER"
 }
 
 # ============== Xray 定时重启 ==============

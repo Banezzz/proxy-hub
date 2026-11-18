@@ -1,20 +1,35 @@
-# 选择协议类型
+# 选择协议类型。每个选项下面用一两行说明它适合谁、需要什么，让不熟悉协议的用户
+# 也能直接选；回车采用推荐项。
 prompt_protocol_type() {
     {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                     选择节点协议类型${NC}"
+    echo -e "${GREEN}        $(t2 "选择节点协议类型（回车采用推荐）" "Choose a protocol (Enter for the recommended one)")${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
-    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
-    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
-    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
-    echo -e "  ${GREEN}5.${NC} AnyTLS                   ${GRAY}(sing-box, 自签名证书)${NC}"
-    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY         ${GRAY}(sing-box, 抗封锁, 推荐)${NC}"
-    echo -e "  ${GREEN}7.${NC} Hysteria2                ${GRAY}(sing-box, QUIC/UDP)${NC}"
+    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
+    menu_note "$(t2 "伪装成访问一个真实网站的 HTTPS，最稳妥的通用选择；无需域名和证书。" \
+        "Looks like HTTPS to a real website; the safest general choice. No domain or certificate needed.")"
+    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY"
+    menu_note "$(t2 "同样的伪装，流量形态更像网页请求；需要较新的客户端。" \
+        "Same disguise with traffic shaped like web requests; needs a fairly recent client.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "Vision + XHTTP 两个都装" "Vision + XHTTP together")"
+    menu_note "$(t2 "一次生成两个端口、两套独立凭据，客户端可以互为备用。" \
+        "Two ports with separate credentials, so clients have a fallback.")"
+    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022  ${GRAY}$(t2 "[仅建议中转/落地]" "[relay or landing use only]")${NC}"
+    menu_note "$(t2 "速度快但没有伪装，不建议直接跨境使用；适合放在中转链路后面。" \
+        "Fast but undisguised; not advised for crossing a censored border directly. Suited to sit behind a relay.")"
+    echo -e "  ${GREEN}5.${NC} AnyTLS"
+    menu_note "$(t2 "对抗 TLS-in-TLS 识别，自签名证书；客户端需支持 AnyTLS（sing-box / mihomo）。" \
+        "Counters TLS-in-TLS detection with a self-signed certificate; clients need AnyTLS support (sing-box / mihomo).")"
+    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY  ${YELLOW}$(t2 "[AnyTLS 客户端推荐]" "[recommended for AnyTLS clients]")${NC}"
+    menu_note "$(t2 "AnyTLS 加上 REALITY 伪装，无需证书，抗封锁能力更强。" \
+        "AnyTLS with the REALITY disguise: no certificate, stronger against blocking.")"
+    echo -e "  ${GREEN}7.${NC} Hysteria2"
+    menu_note "$(t2 "基于 UDP/QUIC，丢包或高延迟线路上明显更快；需放行 UDP，部分网络会限速 UDP。" \
+        "UDP/QUIC based, clearly faster on lossy or high-latency links; needs UDP allowed, and some networks throttle UDP.")"
     echo ""
-    echo -n "  请选择 [1-7] (默认 1): "
+    echo -n "  $(t2 "请选择" "Select") [1-7] ($(t2 "默认" "default") 1): "
     } >/dev/tty
 
     local choice
@@ -127,6 +142,11 @@ gen_hy2_password() {
     log_info "Hysteria2 密码已生成"
 }
 
+# ============== Hysteria2 加固选项 ==============
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -143,6 +163,43 @@ gen_random_free_port() {
             return 0
         fi
     done
+}
+
+# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
+# 已经分配给别的节点的端口再发一次。
+# Usage: node_tcp_port_claimed PORT
+node_tcp_port_claimed() {
+    local port="$1" f proto
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        if [[ "$proto" != "hysteria2" && "$(safe_read_config_value "$f" "PORT")" == "$port" ]]; then
+            return 0
+        fi
+        [[ "$(safe_read_config_value "$f" "XHTTP_PORT")" == "$port" ]] && return 0
+    done
+    return 1
+}
+
+# REALITY 节点的默认端口：443 空闲就用 443，否则回退到随机高位端口。
+# REALITY 伪装成对目标站点的普通 HTTPS 访问，而真实站点都在 443；Xray 自 v26.3.27
+# 起会对监听非 443 端口的 REALITY 入站打印警告。这里只改默认值，用户仍可在提示处
+# 输入任意端口，环境变量指定的端口也原样生效。
+# Usage: default_reality_port [EXCLUDE_PORT]
+default_reality_port() {
+    local exclude_port="${1:-0}"
+    if [[ "$exclude_port" == "443" ]]; then
+        # 同一个 both 节点的另一个 inbound 已经拿走 443，不是冲突，无需告警。
+        gen_random_free_port "$exclude_port"
+        return
+    fi
+    if is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
+        echo 443
+        return 0
+    fi
+    log_warn "$(t2 "443/tcp 已被占用，REALITY 默认端口回退为随机端口（非 443 端口的伪装效果较弱）" \
+        "443/tcp is taken; falling back to a random REALITY port (camouflage is weaker off 443)")"
+    gen_random_free_port "$exclude_port"
 }
 
 # 交互式选择端口
@@ -237,7 +294,11 @@ choose_ports() {
             PORT="$vlpt"
         else
             local default_at_port
-            default_at_port=$(gen_random_free_port)
+            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+                default_at_port=$(default_reality_port)
+            else
+                default_at_port=$(gen_random_free_port)
+            fi
             PORT=$(prompt_port "AnyTLS 端口" "$default_at_port")
         fi
         log_info "AnyTLS 端口: $PORT"
@@ -274,7 +335,7 @@ choose_ports() {
         else
             # 交互式选择
             local default_vision_port
-            default_vision_port=$(gen_random_free_port)
+            default_vision_port=$(default_reality_port)
             PORT=$(prompt_port "Vision 端口" "$default_vision_port")
         fi
         log_info "Vision 端口: $PORT"
@@ -290,7 +351,7 @@ choose_ports() {
         else
             # 交互式选择（排除 Vision 端口）
             local default_xhttp_port
-            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
+            default_xhttp_port=$(default_reality_port "${PORT:-0}")
             XHTTP_PORT=$(prompt_port "XHTTP 端口" "$default_xhttp_port" "${PORT:-0}")
         fi
         XHTTP_PATH="/$(openssl rand -hex 4)"
@@ -349,7 +410,9 @@ gen_reality_keys() {
         }
     ')"
 
-    SHORT_ID="$(openssl rand -hex 4)"
+    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
+    # 与主 ID 等长，无法从长度区分。
+    SHORT_ID="$(openssl rand -hex 8)"
 
     # 验证密钥
     if [[ -z "$PRIVATE_KEY" ]]; then
@@ -365,6 +428,22 @@ gen_reality_keys() {
     fi
 
     log_info "Keys generated successfully"
+}
+
+# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
+# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
+apply_extra_short_ids() {
+    local raw="${sids:-}" list
+    EXTRA_SHORT_IDS=""
+    [[ -z "$raw" ]] && return 0
+    list="${raw//,/:}"
+    list="${list// /}"
+    if ! validate_reality_short_ids "$list"; then
+        log_error "$(t2 "sids 无效：每个 shortId 需为 2-16 位、偶数长度的十六进制" "Invalid sids: each short ID must be 2-16 hex characters of even length"): $raw"
+        return 1
+    fi
+    EXTRA_SHORT_IDS="${list,,}"
+    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 }
 
 # 生成 AnyTLS 密码（32 个十六进制字符 = 128-bit，URI 安全，无需百分号编码）
@@ -425,6 +504,9 @@ gen_selfsigned_cert() {
     local cert_path="$SINGBOX_CERT_DIR/${name}.crt"
     local key_path="$SINGBOX_CERT_DIR/${name}.key"
 
+    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
+    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
+    # 证书会直接握手失败。
     openssl ecparam -genkey -name prime256v1 -out "$key_path" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" \
         -subj "/CN=${cn}" 2>/dev/null
@@ -667,6 +749,110 @@ load_latency_cache() {
     return 0
 }
 
+# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
+# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
+# 预热一次，后台子 shell 直接继承。
+SNI_TLS13_STATE=""
+sni_tls13_flag() {
+    if [[ -z "$SNI_TLS13_STATE" ]]; then
+        if openssl s_client -help 2>&1 | grep -q -- '-tls1_3'; then
+            SNI_TLS13_STATE="yes"
+        else
+            SNI_TLS13_STATE="no"
+        fi
+    fi
+    [[ "$SNI_TLS13_STATE" == "yes" ]] && printf '%s' "-tls1_3"
+    return 0
+}
+
+# ---- REALITY 目标的 ASN / CDN 评分 ----
+#
+# 延迟只说明"连得快"，不说明"像不像"。两条经验规则更重要：目标与服务器同 ASN 时，
+# 流量去向最自然；目标躲在通用 CDN 后面时，服务器等于替 CDN 做端口转发，被扫描后
+# 可能被滥用（Xray 文档对此有明确警告）。这里对延迟最低的一批候选做一次批量 ASN
+# 查询并据此重排。查询走 Team Cymru 的 whois（纯 bash /dev/tcp，无额外依赖），
+# 43 端口不通、超时或解析失败时静默退回纯延迟排序。SNI_ASN_CHECK=0 可关闭。
+SNI_CDN_ASNS=" 13335 54113 20940 16625 21342 "
+declare -gA SNI_CANDIDATE_TAG=()
+
+# Usage: sni_bulk_asn IP...   -> 每行 "IP ASN"
+sni_bulk_asn() {
+    (( $# > 0 )) || return 1
+    local raw
+    raw=$( { printf 'begin\nnoheader\n'; printf '%s\n' "$@"; printf 'end\n'; } | timeout 6 bash -c \
+        'exec 3<>/dev/tcp/whois.cymru.com/43 || exit 1; cat >&3; cat <&3' 2>/dev/null) || return 1
+    printf '%s\n' "$raw" | awk -F'|' 'NF >= 2 {
+        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
+        if ($1 ~ /^[0-9]+$/) print $2, $1
+    }'
+}
+
+# 按所选网络栈解析域名的第一个地址。
+sni_resolve_ip() {
+    local db="ahostsv4"
+    [[ "$(netstack_mode)" == "v6" ]] && db="ahostsv6"
+    getent "$db" "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+# 把延迟最低的候选重排为"同 ASN 优先、通用 CDN 靠后"，输出前 5 名。
+# Usage: rank_sni_candidates LATENCY_MAP OUT_DOMAINS OUT_LATENCIES
+rank_sni_candidates() {
+    # 局部变量统一加 _rk_ 前缀：nameref 按名字解析，调用方的数组若与这里的局部变量
+    # 同名（例如 lat），引用会悄悄落到局部变量上。
+    local -n _rank_map=$1 _rank_doms=$2 _rank_lats=$3
+    local -a _rk_rows=() _rk_ips=()
+    local _rk_lat _rk_dom _rk_ip _rk_asn _rk_server_ip="" _rk_server_asn="" _rk_class _rk_line
+    local -A _rk_ip_of=() _rk_asn_of=()
+
+    SNI_CANDIDATE_TAG=()
+    mapfile -t _rk_rows < <(for _rk_dom in "${!_rank_map[@]}"; do
+        echo "${_rank_map[$_rk_dom]} $_rk_dom"
+    done | sort -n | head -15)
+
+    if [[ "${SNI_ASN_CHECK:-1}" != "0" ]]; then
+        for _rk_line in "${_rk_rows[@]}"; do
+            _rk_dom="${_rk_line#* }"
+            _rk_ip=$(sni_resolve_ip "$_rk_dom")
+            [[ -n "$_rk_ip" ]] && { _rk_ip_of["$_rk_dom"]="$_rk_ip"; _rk_ips+=("$_rk_ip"); }
+        done
+        if [[ "$(netstack_mode)" == "v6" ]]; then _rk_server_ip=$(get_ipv6); else _rk_server_ip=$(get_ipv4); fi
+        [[ -n "$_rk_server_ip" ]] && _rk_ips+=("$_rk_server_ip")
+        while read -r _rk_ip _rk_asn; do
+            [[ -n "$_rk_ip" && -n "$_rk_asn" ]] && _rk_asn_of["$_rk_ip"]="$_rk_asn"
+        done < <(sni_bulk_asn ${_rk_ips[@]+"${_rk_ips[@]}"} || true)
+        [[ -n "$_rk_server_ip" ]] && _rk_server_asn="${_rk_asn_of[$_rk_server_ip]:-}"
+    fi
+
+    _rank_doms=()
+    _rank_lats=()
+    while read -r _rk_class _rk_lat _rk_dom; do
+        [[ -n "$_rk_dom" ]] || continue
+        _rank_doms+=("$_rk_dom")
+        _rank_lats+=("$_rk_lat")
+    done < <(for _rk_line in "${_rk_rows[@]}"; do
+        _rk_lat="${_rk_line%% *}"
+        _rk_dom="${_rk_line#* }"
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        _rk_class=1
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            _rk_class=0
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            _rk_class=2
+        fi
+        echo "$_rk_class $_rk_lat $_rk_dom"
+    done | sort -k1,1n -k2,2n | head -5)
+
+    # 标签在父 shell 里重新计算：上面的排序跑在进程替换的子 shell 中，写不回关联数组。
+    for _rk_dom in ${_rank_doms[@]+"${_rank_doms[@]}"}; do
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="$(t2 "同 ASN" "same ASN") AS$_rk_asn"
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="CDN AS$_rk_asn"
+        fi
+    done
+}
+
 # 测试单个域名延迟
 #
 # 必须按所选网络栈限定协议族：REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
@@ -674,10 +860,13 @@ load_latency_cache() {
 # 只有 A 记录的域名也判为"可用"，装出一个握手必然失败的节点。
 test_domain_latency() {
     local domain="$1"
-    local t1 t2 family_flag
+    local t1 t2 family_flag tls13_flag
     local -a family=()
     family_flag=$(netstack_openssl_family)
     [[ -n "$family_flag" ]] && family=("$family_flag")
+    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
+    tls13_flag=$(sni_tls13_flag)
+    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
     t1=$(date +%s%3N)
     if timeout 2 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
         t2=$(date +%s%3N)
@@ -703,6 +892,7 @@ test_domains_parallel() {
     local -n _latency_map=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -798,6 +988,7 @@ test_domains_parallel_verbose() {
     local -n _latency_map_v=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -916,15 +1107,10 @@ select_best_sni() {
         return
     fi
 
-    # 获取排序后的 Top 5 域名
+    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
     local top_domains=()
     local top_latencies=()
-    while IFS=' ' read -r lat dom; do
-        top_domains+=("$dom")
-        top_latencies+=("$lat")
-    done < <(for domain in "${!latency_map[@]}"; do
-        echo "${latency_map[$domain]} $domain"
-    done | sort -n | head -5)
+    rank_sni_candidates latency_map top_domains top_latencies
 
     # 让用户选择 SNI
     prompt_sni_choice top_domains top_latencies
@@ -1018,7 +1204,10 @@ prompt_sni_choice() {
             echo ""
             local i=1 idx
             for idx in "${!td[@]}"; do
-                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
+                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
+                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
+                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
+                printf "\n"
                 ((i++))
             done
             echo ""
@@ -1093,6 +1282,15 @@ prompt_sni_choice() {
     done
 }
 
+# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
+# 自己的理由（例如目标与服务器同 ASN）。
+# Usage: warn_discouraged_reality_target DOMAIN
+warn_discouraged_reality_target() {
+    reality_target_discouraged "${1:-}" || return 0
+    log_warn "$(t2 "不建议用 Apple / iCloud 系域名作 REALITY 目标（Xray 自 v26.3.27 起对此告警），建议改选其他域名" \
+        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
+}
+
 # 提示用户输入自定义 SNI
 prompt_custom_sni() {
     {
@@ -1114,6 +1312,7 @@ prompt_custom_sni() {
         if [[ "$custom_sni" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
+            warn_discouraged_reality_target "$SNI"
 
             # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
             local custom_family_flag

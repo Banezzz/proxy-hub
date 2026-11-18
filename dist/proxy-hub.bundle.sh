@@ -413,12 +413,14 @@ safe_read_config_value() {
 # save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
 reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
-    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
+    XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
+    MLDSA65_SEED="" MLDSA65_VERIFY="" VLESS_DECRYPTION="" VLESS_ENCRYPTION=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -449,9 +451,18 @@ safe_load_node_config() {
     PUBLIC_KEY=$(safe_read_config_value "$file" "PUBLIC_KEY")
     PRIVATE_KEY=$(safe_read_config_value "$file" "PRIVATE_KEY")
     SHORT_ID=$(safe_read_config_value "$file" "SHORT_ID")
+    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
+    XHTTP_UUID=$(safe_read_config_value "$file" "XHTTP_UUID")
+    XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
+    XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
+    XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
+    MLDSA65_SEED=$(safe_read_config_value "$file" "MLDSA65_SEED")
+    MLDSA65_VERIFY=$(safe_read_config_value "$file" "MLDSA65_VERIFY")
+    VLESS_DECRYPTION=$(safe_read_config_value "$file" "VLESS_DECRYPTION")
+    VLESS_ENCRYPTION=$(safe_read_config_value "$file" "VLESS_ENCRYPTION")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -459,6 +470,10 @@ safe_load_node_config() {
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
+    HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
+    HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
+    HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
+    HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
 
     return 0
 }
@@ -601,8 +616,129 @@ netstack_openssl_family() {
     esac
 }
 
+# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
+# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
+# Usage: t2 "中文" "English"
+t2() {
+    if [[ "${CURRENT_LANG:-zh}" == "en" ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ---- 交互终端读写 ----
+#
+# 新增的引导式菜单统一经过这三个函数与用户对话，而不是各自写死 /dev/tty：
+#   tty_available  当前能否提问（没有控制终端时返回非零，调用方按默认值处理）
+#   tty_print      把一段界面输出到终端（从 stdin 读入内容）
+#   tty_read VAR   读一行输入到变量
+# PROXY_HUB_TTY_FD / PROXY_HUB_TTY_OUT 是测试用的接缝：分别指定读取答案的文件描述符
+# 和界面输出的文件，使菜单逻辑可以在没有终端的测试沙箱里被完整驱动。
+tty_available() {
+    [[ -n "${PROXY_HUB_TTY_FD:-}" ]] || ( : >/dev/tty ) 2>/dev/null
+}
+
+tty_print() {
+    cat >>"${PROXY_HUB_TTY_OUT:-/dev/tty}"
+}
+
+tty_read() {
+    local __tty_line=""
+    if [[ -n "${PROXY_HUB_TTY_FD:-}" ]]; then
+        IFS= read -r -u "$PROXY_HUB_TTY_FD" __tty_line || __tty_line=""
+    else
+        IFS= read -r __tty_line </dev/tty || __tty_line=""
+    fi
+    printf -v "$1" '%s' "$__tty_line"
+}
+
+# 菜单项下方的说明文字：缩进、灰色，每个参数一行。
+# Usage: menu_note "第一行" ["第二行"...]
+menu_note() {
+    local line
+    for line in "$@"; do
+        echo -e "     ${GRAY}${line}${NC}"
+    done
+}
+
+# ============== 内核能力探测 ==============
+#
+# 普通 `install` 发现健康的既有 Xray 时只报告版本、不升级，因此渲染配置时不能假设
+# binary 认识新字段：旧 binary 会在 `xray -test` 阶段拒绝配置，把一次装节点变成安装
+# 失败。这里用 `xray help` 列出的子命令判断能力，而不是比较版本号——子命令是否存在
+# 是 binary 自己的陈述，不依赖我们对发布历史的记忆。
+#   mldsa65  -> REALITY ML-DSA-65 签名；该命令晚于 `target` 别名出现，因此同时用来
+#               判定 `realitySettings.target` 可用
+#   vlessenc -> VLESS Encryption（mlkem768x25519plus）
+# binary 不存在或无法执行时所有能力都按"不支持"处理，产物退回旧写法。
+XRAY_CAPS=""
+XRAY_CAPS_KEY=""
+
+xray_probe_capabilities() {
+    local key="" out="" caps="probed"
+    if [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]]; then
+        key=$(stat -c '%i:%s:%Y' "$XRAY_BIN" 2>/dev/null) || key=""
+    fi
+    if [[ -n "$XRAY_CAPS" && "$key" == "$XRAY_CAPS_KEY" ]]; then
+        return 0
+    fi
+    if [[ -n "$key" ]]; then
+        out=$(timeout 10 "$XRAY_BIN" help 2>/dev/null </dev/null) || out=""
+        [[ "$out" =~ (^|[[:space:]])mldsa65([[:space:]]|$) ]] && caps+=" mldsa65 target"
+        [[ "$out" =~ (^|[[:space:]])vlessenc([[:space:]]|$) ]] && caps+=" vlessenc"
+    fi
+    XRAY_CAPS="$caps"
+    XRAY_CAPS_KEY="$key"
+}
+
+# Usage: xray_supports mldsa65|vlessenc|target
+xray_supports() {
+    xray_probe_capabilities
+    [[ " $XRAY_CAPS " == *" $1 "* ]]
+}
+
+# REALITY 伪装目标的字段名。`dest` 是旧名，新版核心以 `target` 为正式名并保留别名。
+xray_reality_target_key() {
+    if xray_supports target; then
+        printf '%s' target
+    else
+        printf '%s' dest
+    fi
+}
+
+# REALITY shortId 列表以冒号连接（节点文件的安全字符集不含逗号）。每个 ID 必须是
+# 偶数个十六进制字符、最多 16 个；空串表示"客户端可以不填 shortId"，只允许单独出现。
+# Usage: validate_reality_short_ids "id1:id2"
+validate_reality_short_ids() {
+    local list="${1:-}" id
+    local -a ids=()
+    [[ -z "$list" ]] && return 0
+    [[ "$list" != :* && "$list" != *: && "$list" != *::* ]] || return 1
+    IFS=':' read -r -a ids <<<"$list"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9a-fA-F]{2,16}$ ]] || return 1
+        (( ${#id} % 2 == 0 )) || return 1
+    done
+}
+
+# 主 shortId 与附加 shortId 合并成 builder 接受的冒号列表。主 ID 用于分享链接，附加
+# ID 只进入服务端白名单，便于给不同客户端发放可单独吊销的 ID。
+# Usage: reality_short_id_list PRIMARY [EXTRA_LIST]
+reality_short_id_list() {
+    local primary="${1:-}" extra="${2:-}"
+    if [[ -n "$primary" && -n "$extra" ]]; then
+        printf '%s:%s' "$primary" "$extra"
+    else
+        printf '%s' "${primary}${extra}"
+    fi
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
-# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED] [DECRYPTION]
+#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
+#   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
+#   DECRYPTION 非空时启用 VLESS Encryption（`xray vlessenc` 生成的 decryption 串）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -610,6 +746,8 @@ build_vision_inbound() {
     local sni="$4"
     local private_key="$5"
     local short_id="$6"
+    local mldsa65_seed="${7:-}"
+    local decryption="${8:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -623,6 +761,9 @@ build_vision_inbound() {
         --arg short_id "$short_id" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -630,26 +771,27 @@ build_vision_inbound() {
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "tcp",
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build XHTTP inbound JSON using jq (prevents injection)
-# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED] [DECRYPTION]
+#   启用 VLESS Encryption 后 flow 改为 xtls-rprx-vision：Vision 流控原本只能用在
+#   TCP + TLS/REALITY 上，VLESS Encryption 解除了对底层传输的限制。
 build_xhttp_inbound() {
     local name="$1"
     local port="$2"
@@ -658,6 +800,8 @@ build_xhttp_inbound() {
     local private_key="$5"
     local short_id="$6"
     local xhttp_path="$7"
+    local mldsa65_seed="${8:-}"
+    local decryption="${9:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -672,14 +816,17 @@ build_xhttp_inbound() {
         --arg path "$xhttp_path" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": $uuid, "flow": ""}],
-                "decryption": "none"
+                "clients": [{"id": $uuid, "flow": (if $decryption == "" then "" else "xtls-rprx-vision" end)}],
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "xhttp",
@@ -687,15 +834,14 @@ build_xhttp_inbound() {
                 "xhttpSettings": {"path": $path},
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build Shadowsocks inbound JSON using jq (prevents injection)
@@ -764,7 +910,7 @@ build_anytls_inbound() {
                     "enabled": true,
                     "handshake": {"server": $sni, "server_port": 443},
                     "private_key": $priv,
-                    "short_id": [$sid]
+                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
                 }
             }') || return 1
     else
@@ -821,8 +967,96 @@ validate_tls_server_name() {
     done
 }
 
+# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
+}
+
+# 已安装的 sing-box 版本号（如 1.14.4）；无法读取时返回非零。
+singbox_installed_version() {
+    local out
+    [[ -x "$SINGBOX_BIN" ]] || return 1
+    out=$(timeout 10 "$SINGBOX_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ sing-box[[:space:]]+version[[:space:]]+([0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# systemd 主版本号（如 252）；不是 systemd 或读不出时返回非零。
+systemd_version() {
+    local line
+    line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$line" =~ ^systemd[[:space:]]+([0-9]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# ---- 内核安全基线 ----
+#
+# 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
+# 基线是"低于它就应该更新"的最低版本，由健康检查和升级向导共用：
+#   Xray     v26.10.31  默认关闭 MPTCP（规避 Linux 内核 IPv4 MPTCP 监听的远程漏洞）；
+#                       v26.10.21 起还移除了内置根证书中的问题证书
+#   sing-box 1.13.16    AnyTLS 默认不再上传客户端元数据
+XRAY_BASELINE_VERSION="26.10.31"
+SINGBOX_BASELINE_VERSION="1.13.16"
+
+# 已安装的 Xray 版本号（如 26.11.9）；无法读取时返回非零。
+xray_installed_version_plain() {
+    local out
+    [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]] || return 1
+    out=$(timeout 10 "$XRAY_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ [Xx]ray[[:space:]]+v?([0-9]+(\.[0-9]+){1,3}) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# 列出低于安全基线的内核，每行 "NAME INSTALLED BASELINE"。只看确实装着的内核；
+# 读不出版本的不算（那是另一类问题，由各自的 release 命令处理）。
+core_baseline_gaps() {
+    local installed
+    if installed=$(xray_installed_version_plain) && ! version_ge "$installed" "$XRAY_BASELINE_VERSION"; then
+        printf 'xray %s %s\n' "$installed" "$XRAY_BASELINE_VERSION"
+    fi
+    if installed=$(singbox_installed_version) && ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+        printf 'sing-box %s %s\n' "$installed" "$SINGBOX_BASELINE_VERSION"
+    fi
+    return 0
+}
+
+# Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
+# inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
+# 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。
+# TLS-ALPN-01 需要 443/tcp，HTTP-01 需要 80/tcp；端口已被本机节点占用的那种挑战
+# 直接关掉，避免证书签发去和 REALITY 入站抢端口。
+# Usage: build_hy2_acme_json NODE_NAME DOMAIN EMAIL DATA_DIR USE_PROVIDER(0|1) NO_ALPN(0|1) NO_HTTP(0|1)
+build_hy2_acme_json() {
+    local name="$1" domain="$2" email="$3" data_dir="$4" use_provider="$5" no_alpn="$6" no_http="$7"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    validate_tls_server_name "$domain" || return 1
+    [[ -z "$email" || "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]] || return 1
+    jq -n \
+        --arg tag "acme-${name}" \
+        --arg domain "$domain" \
+        --arg email "$email" \
+        --arg data_dir "$data_dir" \
+        --argjson use_provider "$use_provider" \
+        --argjson no_alpn "$no_alpn" \
+        --argjson no_http "$no_http" \
+        '({"domain": [$domain], "data_directory": $data_dir}
+            | if $email != "" then . + {"email": $email} else . end
+            | if $no_alpn == 1 then . + {"disable_tls_alpn_challenge": true} else . end
+            | if $no_http == 1 then . + {"disable_http_challenge": true} else . end) as $acme
+        | if $use_provider == 1 then
+            {"tls": {"enabled": true, "server_name": $domain, "certificate_provider": $tag},
+             "provider": ({"type": "acme", "tag": $tag} + $acme)}
+          else
+            {"tls": {"enabled": true, "server_name": $domain, "acme": $acme}, "provider": null}
+          end'
+}
+
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
+#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
+#   伪装站点随之失去意义，因此同时去掉 masquerade。
+#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -830,12 +1064,16 @@ build_hysteria2_inbound() {
     local sni="$4"
     local cert="$5"
     local key="$6"
+    local obfs_password="${7:-}"
+    local tls_json="${8:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
-    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
+    [[ -n "$tls_json" ]] || tls_json=null
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
         --arg tag "${name}_hysteria2" \
@@ -846,24 +1084,28 @@ build_hysteria2_inbound() {
         --arg cert "$cert" \
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
+        --arg obfs_password "$obfs_password" \
+        --argjson tls_override "$tls_json" \
         '{
             "type": "hysteria2",
             "tag": $tag,
             "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
-            "tls": {
+            "tls": ($tls_override // {
                 "enabled": true,
                 "server_name": $sni,
                 "certificate_path": $cert,
                 "key_path": $key
-            },
+            }),
             "masquerade": {
                 "type": "proxy",
                 "url": "https://www.bing.com",
                 "rewrite_host": true
             }
-        }'
+        } | if $obfs_password != "" then
+                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
+            else . end'
 }
 
 # Optional encryption for sensitive config values
@@ -957,7 +1199,18 @@ CURRENT_LANG="${CURRENT_LANG:-}"
 # Spinner 动画帧
 SPINNER_FRAMES=('|' '/' '-' '\')
 
-# SNI 域名列表（完整列表，用于延迟测试）
+# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
+# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
+# Usage: reality_target_discouraged DOMAIN
+reality_target_discouraged() {
+    local domain="${1,,}"
+    case "$domain" in
+        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 0 ;;
+    esac
+    return 1
+}
+
+# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
 SNI_LIST=(
     "amd.com"
     "aws.com"
@@ -974,15 +1227,11 @@ SNI_LIST=(
     "www.sony.com"
     "rum.hlx.page"
     "www.bing.com"
-    "xp.apple.com"
     "www.wowt.com"
-    "www.apple.com"
     "www.intel.com"
     "www.tesla.com"
     "www.xilinx.com"
     "www.oracle.com"
-    "www.icloud.com"
-    "apps.apple.com"
     "c.marsflag.com"
     "www.nvidia.com"
     "snap.licdn.com"
@@ -992,7 +1241,6 @@ SNI_LIST=(
     "s.go-mpulse.net"
     "tags.tiqcdn.com"
     "cdn.bizible.com"
-    "ocsp2.apple.com"
     "cdn.userway.org"
     "download.amd.com"
     "d1.awsstatic.com"
@@ -1000,14 +1248,12 @@ SNI_LIST=(
     "mscom.demdex.net"
     "a0.awsstatic.com"
     "go.microsoft.com"
-    "apps.mzstatic.com"
     "sisu.xboxlive.com"
     "www.microsoft.com"
     "s.mp.marsflag.com"
     "images.nvidia.com"
     "vs.aws.amazon.com"
     "c.s-microsoft.com"
-    "statici.icloud.com"
     "beacon.gtv-pub.com"
     "ts4.tc.mm.bing.net"
     "ts3.tc.mm.bing.net"
@@ -1026,14 +1272,12 @@ SNI_LIST=(
     "assets.adobedtm.com"
     "lpcdn.lpsnmedia.net"
     "res-1.cdn.office.net"
-    "is1-ssl.mzstatic.com"
     "electronics.sony.com"
     "intelcorp.scene7.com"
     "acctcdn.msftauth.net"
     "cdnssl.clicktale.net"
     "catalog.gamepass.com"
     "consent.trustarc.com"
-    "gsp-ssl.ls.apple.com"
     "munchkin.marketo.net"
     "s.company-target.com"
     "cdn77.api.userway.org"
@@ -1044,20 +1288,15 @@ SNI_LIST=(
     "api.company-target.com"
     "devblogs.microsoft.com"
     "s7mbrstream.scene7.com"
-    "fpinit.itunes.apple.com"
     "digitalassets.tesla.com"
     "d.impactradius-event.com"
     "downloadmirror.intel.com"
-    "iosapps.itunes.apple.com"
-    "se-edge.itunes.apple.com"
     "publisher.liveperson.net"
     "tag-logger.demandbase.com"
     "services.digitaleast.mobi"
-    "configuration.ls.apple.com"
     "gray-wowt-prod.gtv-cdn.com"
     "visualstudio.microsoft.com"
     "prod.log.shortbread.aws.dev"
-    "amp-api-edge.apps.apple.com"
     "store-images.s-microsoft.com"
     "cdn-dynmedia-1.microsoft.com"
     "github.gallerycdn.vsassets.io"
@@ -1070,7 +1309,6 @@ SNI_LIST=(
     "ms-python.gallerycdn.vsassets.io"
     "gray-config-prod.api.arc-cdn.net"
     "i7158c100-ds-aksb-a.akamaihd.net"
-    "downloaddispatch.itunes.apple.com"
     "res.public.onecdn.static.microsoft"
     "gray.video-player.arcpublishing.com"
     "gray-config-prod.api.cdn.arcpublishing.com"
@@ -4662,8 +4900,164 @@ depend() {
     need net
     after firewall
 }
+
+start_pre() {
+    # Hysteria2 端口跳跃的 NAT 规则不持久，随服务启动重新下发（helper 不存在则跳过）。
+    [ -x /usr/local/libexec/proxy-hub-hy2-hop ] && /usr/local/libexec/proxy-hub-hy2-hop apply
+    return 0
+}
 OPENRC_SERVICE
     chmod 755 /etc/init.d/sing-box
+}
+
+# ============== Hysteria2 端口跳跃 ==============
+#
+# 服务端只监听一个 UDP 端口；端口跳跃靠 NAT 把一段 UDP 端口重定向到它。规则放在
+# 专用链 PROXY_HUB_HY2_HOP 里，每次同步先清空再重建，因此是幂等的，也不会碰用户
+# 自己的 NAT 规则。iptables 规则重启即丢，所以生成一个 helper，由 sing-box 服务在
+# 启动前调用（systemd drop-in 的 ExecStartPre / OpenRC 的 start_pre）。
+HY2_HOP_HELPER="/usr/local/libexec/proxy-hub-hy2-hop"
+HY2_HOP_DROPIN="/etc/systemd/system/sing-box.service.d/20-proxy-hub-hy2-hop.conf"
+HY2_HOP_CHAIN="PROXY_HUB_HY2_HOP"
+
+# 校验并规范化端口跳跃范围。Usage: validate_hop_range "20000-20100" -> "20000-20100"
+validate_hop_range() {
+    local range="${1:-}" start end
+    [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+    start=$((10#${BASH_REMATCH[1]}))
+    end=$((10#${BASH_REMATCH[2]}))
+    (( start >= 1 && end <= 65535 && start < end && end - start <= 20000 )) || return 1
+    printf '%s-%s' "$start" "$end"
+}
+
+# 范围是否与其他节点冲突：别的节点监听的 UDP 端口落在范围内会被一并重定向走，
+# 两个跳跃范围重叠则后一条规则永远不会命中。
+# Usage: hy2_hop_range_conflicts RANGE SELF_NODE_NAME
+hy2_hop_range_conflicts() {
+    local range="$1" self="${2:-}" start="${1%-*}" end="${1#*-}" f name proto port other
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .env)
+        [[ "$name" == "$self" ]] && continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        port=$(safe_read_config_value "$f" "PORT")
+        if [[ "$proto" == "hysteria2" || "$proto" == "shadowsocks" ]] && [[ "$port" =~ ^[0-9]+$ ]] \
+            && (( port >= start && port <= end )); then
+            return 0
+        fi
+        other=$(safe_read_config_value "$f" "HY2_HOP_PORTS")
+        if [[ "$other" =~ ^([0-9]+)-([0-9]+)$ ]] \
+            && (( BASH_REMATCH[1] <= end && BASH_REMATCH[2] >= start )); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 随机挑一段不与其他节点冲突的 200 端口范围，供"推荐配置"直接采用，用户无需自己
+# 想一个范围。随机化同时避免所有部署都落在同一段众所周知的端口上。
+# Usage: gen_hy2_hop_range [SELF_NODE_NAME]
+gen_hy2_hop_range() {
+    local self="${1:-}" attempt start range
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        start=$(shuf -i 20000-59000 -n 1) || return 1
+        range="${start}-$((start + 199))"
+        hy2_hop_range_conflicts "$range" "$self" && continue
+        printf '%s' "$range"
+        return 0
+    done
+    return 1
+}
+
+# 输出全部跳跃规则，每行 "START END LISTEN_PORT"。
+hy2_hop_rules() {
+    local f range port
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        [[ "$(safe_read_config_value "$f" "PROTOCOL_TYPE")" == "hysteria2" ]] || continue
+        range=$(validate_hop_range "$(safe_read_config_value "$f" "HY2_HOP_PORTS")") || continue
+        port=$(get_validated_port "$(safe_read_config_value "$f" "PORT")" true) || continue
+        printf '%s %s %s\n' "${range%-*}" "${range#*-}" "$port"
+    done
+}
+
+# 清除规则并移除 helper / drop-in。
+hy2_hop_remove() {
+    [[ -x "$HY2_HOP_HELPER" ]] && "$HY2_HOP_HELPER" clear >/dev/null 2>&1
+    rm -f -- "$HY2_HOP_HELPER"
+    if [[ -e "$HY2_HOP_DROPIN" ]]; then
+        rm -f -- "$HY2_HOP_DROPIN"
+        rmdir -- "$(dirname "$HY2_HOP_DROPIN")" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 让 NAT 规则与节点文件一致。没有任何跳跃范围时清理干净；有则必须成功，否则返回
+# 非零——分享链接已经声明了跳跃范围，规则没下发会让客户端跳到无人接收的端口上。
+hy2_hop_sync() {
+    local rules tmp
+    rules=$(hy2_hop_rules)
+    if [[ -z "$rules" ]]; then
+        hy2_hop_remove
+        return 0
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "Hysteria2 端口跳跃需要 iptables，请先安装" "Hysteria2 port hopping requires iptables; install it first")"
+        return 1
+    fi
+
+    mkdir -p -- "$(dirname "$HY2_HOP_HELPER")" || return 1
+    tmp=$(mktemp "${HY2_HOP_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: hy2-hop-v1
+# Redirects the UDP hop ranges of Hysteria2 nodes to their listen ports.
+CHAIN=$HY2_HOP_CHAIN
+RULES='$rules'
+status=0
+for ipt in iptables ip6tables; do
+    command -v "\$ipt" >/dev/null 2>&1 || continue
+    if [ "\$ipt" = ip6tables ] && [ ! -f /proc/net/if_inet6 ]; then continue; fi
+    "\$ipt" -t nat -D PREROUTING -j "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -F "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -X "\$CHAIN" 2>/dev/null
+    [ "\$1" = clear ] && continue
+    ok=1
+    "\$ipt" -t nat -N "\$CHAIN" || ok=0
+    if [ "\$ok" = 1 ]; then
+        printf '%s\n' "\$RULES" | while read -r start end port; do
+            [ -n "\$port" ] || continue
+            "\$ipt" -t nat -A "\$CHAIN" -p udp --dport "\$start:\$end" -j REDIRECT --to-ports "\$port" || exit 1
+        done || ok=0
+    fi
+    [ "\$ok" = 1 ] && { "\$ipt" -t nat -A PREROUTING -j "\$CHAIN" || ok=0; }
+    # IPv6 NAT 需要内核的 ip6table_nat，缺失时只影响 IPv6 的跳跃，不视为失败。
+    [ "\$ok" = 1 ] || [ "\$ipt" = ip6tables ] || status=1
+done
+exit "\$status"
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$HY2_HOP_HELPER" || { rm -f -- "$tmp"; return 1; }
+
+    if ! "$HY2_HOP_HELPER" apply; then
+        log_error "$(t2 "下发 Hysteria2 端口跳跃的 NAT 规则失败" "Failed to apply the Hysteria2 port-hopping NAT rules")"
+        return 1
+    fi
+
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        create_singbox_openrc_service
+    else
+        # "+" 让 helper 以完整权限运行，不受服务沙箱加固限制：加载 NAT 内核模块需要
+        # 的能力不在加固后的 capability 集合里。该前缀自 systemd 231 起可用，更早的
+        # 版本不认识它，也没有加固 drop-in，保持旧写法。
+        local hop_prefix="-" hop_systemd
+        hop_systemd=$(systemd_version) || hop_systemd=0
+        (( hop_systemd >= 231 )) && hop_prefix="-+"
+        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
+        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
+            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 }
 
 # musl 系统（Alpine）没有 glibc 动态链接器，无法执行链接 glibc 的二进制文件。
@@ -4686,6 +5080,10 @@ system_is_musl() {
 
 # 安装 sing-box（下载官方预编译二进制，按 libc 选择归档，兼容 glibc 与 musl）
 # AnyTLS 协议需要 sing-box >= 1.12.0；同一内核也承载 Hysteria2。
+#
+# 已有可运行的 binary 时只报告、不改动，与 Xray 的普通安装语义一致：创建节点不应
+# 悄悄升级内核。下载、SHA-256 校验、候选 binary 验证与原子替换都在
+# singbox_install_release 里，全新安装与显式的 singbox-update 走同一条路径。
 install_singbox() {
     if [[ -f "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version &>/dev/null; then
         log_info "sing-box already installed, skipping..."
@@ -4693,88 +5091,7 @@ install_singbox() {
     fi
 
     log_info "Installing sing-box (required for AnyTLS / Hysteria2)..."
-
-    local arch sb_arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)   sb_arch="amd64" ;;
-        aarch64|arm64)  sb_arch="arm64" ;;
-        armv7l|armv7)   sb_arch="armv7" ;;
-        i686|i386)      sb_arch="386" ;;
-        *)
-            log_error "Unsupported architecture for sing-box: $arch"
-            return 1
-            ;;
-    esac
-
-    # 获取最新版本号（安全的 API 解析）
-    local tag version
-    tag=$(fetch_github_release_tag "SagerNet/sing-box")
-    if [[ -z "$tag" ]]; then
-        log_error "Failed to get sing-box latest version"
-        return 1
-    fi
-    version="${tag#v}"
-
-    # 归档选择按 libc 而不是按发行版：sing-box >= 1.13.0 的默认 linux 归档动态
-    # 链接 glibc，在 Alpine 上会以 "cannot execute: required file not found"
-    # 失败；静态链接的 "-musl" 归档只从 1.13.0 起提供，更早的版本只有一个已经
-    # 是静态链接的默认归档，所以旧版本仍回落到默认名。
-    local -a archive_names=()
-    if system_is_musl; then
-        log_info "musl libc detected, using the statically linked sing-box build"
-        archive_names+=("sing-box-${version}-linux-${sb_arch}-musl.tar.gz")
-    fi
-    archive_names+=("sing-box-${version}-linux-${sb_arch}.tar.gz")
-
-    log_info "Installing sing-box ${tag} (${sb_arch})..."
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    local archive_name download_url downloaded=0
-    for archive_name in "${archive_names[@]}"; do
-        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${archive_name}"
-        if secure_curl "$download_url" -o "${tmp_dir}/sing-box.tar.gz"; then
-            downloaded=1
-            break
-        fi
-        log_warn "sing-box archive not available: $archive_name"
-    done
-    if ((downloaded == 0)); then
-        log_error "Failed to download sing-box ${tag} for ${sb_arch}"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    if ! tar -xzf "${tmp_dir}/sing-box.tar.gz" -C "$tmp_dir" 2>/dev/null; then
-        log_error "Failed to extract sing-box archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local extracted_bin
-    extracted_bin=$(find "$tmp_dir" -type f -name sing-box 2>/dev/null | head -1)
-    if [[ -z "$extracted_bin" ]]; then
-        log_error "sing-box binary not found in archive"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    mkdir -p "$SINGBOX_DIR" /usr/local/bin
-    install -m 755 "$extracted_bin" "$SINGBOX_BIN"
-    rm -rf "$tmp_dir"
-
-    # 安装后立刻验证可执行性：否则不兼容的二进制要到后面 config check 才暴露，
-    # 并被报成 "Generated sing-box config is invalid"，掩盖真正的原因。
-    if ! "$SINGBOX_BIN" version &>/dev/null; then
-        log_error "Installed sing-box binary cannot be executed on this system"
-        if system_is_musl; then
-            log_error "This system uses musl libc; no compatible sing-box build was found for ${tag}"
-        fi
-        rm -f "$SINGBOX_BIN"
-        return 1
-    fi
+    singbox_install_release fresh || return 1
 
     # 创建服务（systemd 或 OpenRC）
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -4782,8 +5099,6 @@ install_singbox() {
     else
         create_singbox_systemd_service
     fi
-
-    log_info "sing-box ${tag} installed successfully"
     return 0
 }
 
@@ -4798,23 +5113,65 @@ ensure_geodata() {
     install_geodata
 }
 
+# GeoIP/GeoSite 以 root 身份被 Xray 加载并决定路由，却是从第三方 release 的 latest
+# 链接取的。这里把"下载 → 校验 → 替换"收进一个独立 helper，安装时与每周 cron 共用：
+#   - 两个文件各自对照同一 release 发布的 .sha256sum，任何一个不一致就整体放弃；
+#   - 全部通过后才用 rename 替换，Xray 永远读不到写了一半的文件；
+#   - 失败时保留旧数据，不会把可用的数据库换成损坏的。
+GEODATA_HELPER="/usr/local/libexec/proxy-hub-geodata-update"
+GEODATA_CRON_MARKER="# proxy-hub-geodata"
+
+install_geodata_helper() {
+    local tmp
+    mkdir -p -- "$(dirname "$GEODATA_HELPER")" || return 1
+    tmp=$(mktemp "${GEODATA_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: geodata-update-v1
+# Downloads geoip.dat / geosite.dat, verifies them against the published
+# .sha256sum files, and replaces the live copies only when both verify.
+DIR='$XRAY_GEODATA_DIR'
+BASE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download'
+fetch() { curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL "\$1" -o "\$2"; }
+mkdir -p "\$DIR" || exit 1
+tmp=\$(mktemp -d "\$DIR/.geodata.XXXXXXXX") || exit 1
+trap 'rm -rf "\$tmp"' EXIT
+for name in geoip.dat geosite.dat; do
+    fetch "\$BASE/\$name" "\$tmp/\$name" || { echo "download failed: \$name" >&2; exit 1; }
+    fetch "\$BASE/\$name.sha256sum" "\$tmp/\$name.sha256sum" || { echo "checksum download failed: \$name" >&2; exit 1; }
+    want=\$(awk 'NR == 1 { print \$1 }' "\$tmp/\$name.sha256sum")
+    have=\$(sha256sum "\$tmp/\$name" | awk '{ print \$1 }')
+    case "\$want" in
+        ????????????????????????????????????????????????????????????????) ;;
+        *) echo "malformed checksum: \$name" >&2; exit 1 ;;
+    esac
+    [ "\$want" = "\$have" ] || { echo "checksum mismatch: \$name" >&2; exit 1; }
+done
+for name in geoip.dat geosite.dat; do
+    chmod 644 "\$tmp/\$name" && mv -f "\$tmp/\$name" "\$DIR/\$name" || exit 1
+done
+exit 0
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$GEODATA_HELPER" || { rm -f -- "$tmp"; return 1; }
+}
+
 install_geodata() {
     log_info "$(msg install_geodata)"
 
     mkdir -p "$XRAY_GEODATA_DIR"
-
-    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-
-    # 下载 geoip.dat（使用安全的 curl 选项，内联因为 execute_task 在子 shell 运行）
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
-        # 创建软链接到 /usr/local/bin (Xray 查找位置)
-        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
+    if ! install_geodata_helper; then
+        log_error "Failed to install the GeoData update helper"
+        return 1
     fi
 
-    # 下载 geosite.dat
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
+    if execute_task "'$GEODATA_HELPER'" "Downloading and verifying geoip.dat / geosite.dat"; then
+        # 创建软链接到 /usr/local/bin (Xray 查找位置)
+        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
         ln -sf "$XRAY_GEODATA_DIR/geosite.dat" /usr/local/bin/geosite.dat 2>/dev/null || true
+    else
+        log_error "$(t2 "GeoData 下载或 SHA-256 校验失败，未改动现有数据" \
+            "GeoData download or SHA-256 verification failed; existing data is untouched")"
+        return 1
     fi
 
     # 设置自动更新定时任务（每周日 4:00）
@@ -4824,17 +5181,23 @@ install_geodata() {
 }
 
 setup_geodata_cron() {
-    # Use secure curl options in cron job (--proto, --tlsv1.2)
-    local cron_cmd="curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
-    local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
+    local cron_job="0 4 * * 0 $GEODATA_HELPER >/dev/null 2>&1 $GEODATA_CRON_MARKER"
 
     # 检查 crontab 命令是否存在
     if ! command -v crontab &>/dev/null; then
         return 0
     fi
 
-    # 添加定时任务（先删除旧的）
-    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
+    # 添加定时任务。先删除旧条目：既包括带标记的新形式，也包括升级前那条直接把
+    # 未校验的下载结果写到数据文件上的 curl 命令。
+    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat' \
+        | grep -vF "$GEODATA_CRON_MARKER"; echo "$cron_job") | crontab - 2>/dev/null || true
+}
+
+# 现有 crontab 是否还在用升级前的未校验更新命令。
+geodata_cron_is_legacy() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -F 'v2ray-rules-dat' | grep -qvF "$GEODATA_CRON_MARKER"
 }
 
 # ============== Xray 定时重启 ==============
@@ -5280,23 +5643,38 @@ SS_METHODS_LEGACY=(
     "aes-256-gcm"
 )
 
-# 选择协议类型
+# 选择协议类型。每个选项下面用一两行说明它适合谁、需要什么，让不熟悉协议的用户
+# 也能直接选；回车采用推荐项。
 prompt_protocol_type() {
     {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                     选择节点协议类型${NC}"
+    echo -e "${GREEN}        $(t2 "选择节点协议类型（回车采用推荐）" "Choose a protocol (Enter for the recommended one)")${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
-    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
-    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
-    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
-    echo -e "  ${GREEN}5.${NC} AnyTLS                   ${GRAY}(sing-box, 自签名证书)${NC}"
-    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY         ${GRAY}(sing-box, 抗封锁, 推荐)${NC}"
-    echo -e "  ${GREEN}7.${NC} Hysteria2                ${GRAY}(sing-box, QUIC/UDP)${NC}"
+    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
+    menu_note "$(t2 "伪装成访问一个真实网站的 HTTPS，最稳妥的通用选择；无需域名和证书。" \
+        "Looks like HTTPS to a real website; the safest general choice. No domain or certificate needed.")"
+    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY"
+    menu_note "$(t2 "同样的伪装，流量形态更像网页请求；需要较新的客户端。" \
+        "Same disguise with traffic shaped like web requests; needs a fairly recent client.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "Vision + XHTTP 两个都装" "Vision + XHTTP together")"
+    menu_note "$(t2 "一次生成两个端口、两套独立凭据，客户端可以互为备用。" \
+        "Two ports with separate credentials, so clients have a fallback.")"
+    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022  ${GRAY}$(t2 "[仅建议中转/落地]" "[relay or landing use only]")${NC}"
+    menu_note "$(t2 "速度快但没有伪装，不建议直接跨境使用；适合放在中转链路后面。" \
+        "Fast but undisguised; not advised for crossing a censored border directly. Suited to sit behind a relay.")"
+    echo -e "  ${GREEN}5.${NC} AnyTLS"
+    menu_note "$(t2 "对抗 TLS-in-TLS 识别，自签名证书；客户端需支持 AnyTLS（sing-box / mihomo）。" \
+        "Counters TLS-in-TLS detection with a self-signed certificate; clients need AnyTLS support (sing-box / mihomo).")"
+    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY  ${YELLOW}$(t2 "[AnyTLS 客户端推荐]" "[recommended for AnyTLS clients]")${NC}"
+    menu_note "$(t2 "AnyTLS 加上 REALITY 伪装，无需证书，抗封锁能力更强。" \
+        "AnyTLS with the REALITY disguise: no certificate, stronger against blocking.")"
+    echo -e "  ${GREEN}7.${NC} Hysteria2"
+    menu_note "$(t2 "基于 UDP/QUIC，丢包或高延迟线路上明显更快；需放行 UDP，部分网络会限速 UDP。" \
+        "UDP/QUIC based, clearly faster on lossy or high-latency links; needs UDP allowed, and some networks throttle UDP.")"
     echo ""
-    echo -n "  请选择 [1-7] (默认 1): "
+    echo -n "  $(t2 "请选择" "Select") [1-7] ($(t2 "默认" "default") 1): "
     } >/dev/tty
 
     local choice
@@ -5409,6 +5787,11 @@ gen_hy2_password() {
     log_info "Hysteria2 密码已生成"
 }
 
+# ============== Hysteria2 加固选项 ==============
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
+
 gen_uuid() {
     UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
@@ -5425,6 +5808,43 @@ gen_random_free_port() {
             return 0
         fi
     done
+}
+
+# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
+# 已经分配给别的节点的端口再发一次。
+# Usage: node_tcp_port_claimed PORT
+node_tcp_port_claimed() {
+    local port="$1" f proto
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        if [[ "$proto" != "hysteria2" && "$(safe_read_config_value "$f" "PORT")" == "$port" ]]; then
+            return 0
+        fi
+        [[ "$(safe_read_config_value "$f" "XHTTP_PORT")" == "$port" ]] && return 0
+    done
+    return 1
+}
+
+# REALITY 节点的默认端口：443 空闲就用 443，否则回退到随机高位端口。
+# REALITY 伪装成对目标站点的普通 HTTPS 访问，而真实站点都在 443；Xray 自 v26.3.27
+# 起会对监听非 443 端口的 REALITY 入站打印警告。这里只改默认值，用户仍可在提示处
+# 输入任意端口，环境变量指定的端口也原样生效。
+# Usage: default_reality_port [EXCLUDE_PORT]
+default_reality_port() {
+    local exclude_port="${1:-0}"
+    if [[ "$exclude_port" == "443" ]]; then
+        # 同一个 both 节点的另一个 inbound 已经拿走 443，不是冲突，无需告警。
+        gen_random_free_port "$exclude_port"
+        return
+    fi
+    if is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
+        echo 443
+        return 0
+    fi
+    log_warn "$(t2 "443/tcp 已被占用，REALITY 默认端口回退为随机端口（非 443 端口的伪装效果较弱）" \
+        "443/tcp is taken; falling back to a random REALITY port (camouflage is weaker off 443)")"
+    gen_random_free_port "$exclude_port"
 }
 
 # 交互式选择端口
@@ -5519,7 +5939,11 @@ choose_ports() {
             PORT="$vlpt"
         else
             local default_at_port
-            default_at_port=$(gen_random_free_port)
+            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+                default_at_port=$(default_reality_port)
+            else
+                default_at_port=$(gen_random_free_port)
+            fi
             PORT=$(prompt_port "AnyTLS 端口" "$default_at_port")
         fi
         log_info "AnyTLS 端口: $PORT"
@@ -5556,7 +5980,7 @@ choose_ports() {
         else
             # 交互式选择
             local default_vision_port
-            default_vision_port=$(gen_random_free_port)
+            default_vision_port=$(default_reality_port)
             PORT=$(prompt_port "Vision 端口" "$default_vision_port")
         fi
         log_info "Vision 端口: $PORT"
@@ -5572,7 +5996,7 @@ choose_ports() {
         else
             # 交互式选择（排除 Vision 端口）
             local default_xhttp_port
-            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
+            default_xhttp_port=$(default_reality_port "${PORT:-0}")
             XHTTP_PORT=$(prompt_port "XHTTP 端口" "$default_xhttp_port" "${PORT:-0}")
         fi
         XHTTP_PATH="/$(openssl rand -hex 4)"
@@ -5631,7 +6055,9 @@ gen_reality_keys() {
         }
     ')"
 
-    SHORT_ID="$(openssl rand -hex 4)"
+    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
+    # 与主 ID 等长，无法从长度区分。
+    SHORT_ID="$(openssl rand -hex 8)"
 
     # 验证密钥
     if [[ -z "$PRIVATE_KEY" ]]; then
@@ -5647,6 +6073,22 @@ gen_reality_keys() {
     fi
 
     log_info "Keys generated successfully"
+}
+
+# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
+# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
+apply_extra_short_ids() {
+    local raw="${sids:-}" list
+    EXTRA_SHORT_IDS=""
+    [[ -z "$raw" ]] && return 0
+    list="${raw//,/:}"
+    list="${list// /}"
+    if ! validate_reality_short_ids "$list"; then
+        log_error "$(t2 "sids 无效：每个 shortId 需为 2-16 位、偶数长度的十六进制" "Invalid sids: each short ID must be 2-16 hex characters of even length"): $raw"
+        return 1
+    fi
+    EXTRA_SHORT_IDS="${list,,}"
+    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 }
 
 # 生成 AnyTLS 密码（32 个十六进制字符 = 128-bit，URI 安全，无需百分号编码）
@@ -5707,6 +6149,9 @@ gen_selfsigned_cert() {
     local cert_path="$SINGBOX_CERT_DIR/${name}.crt"
     local key_path="$SINGBOX_CERT_DIR/${name}.key"
 
+    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
+    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
+    # 证书会直接握手失败。
     openssl ecparam -genkey -name prime256v1 -out "$key_path" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" \
         -subj "/CN=${cn}" 2>/dev/null
@@ -5949,6 +6394,110 @@ load_latency_cache() {
     return 0
 }
 
+# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
+# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
+# 预热一次，后台子 shell 直接继承。
+SNI_TLS13_STATE=""
+sni_tls13_flag() {
+    if [[ -z "$SNI_TLS13_STATE" ]]; then
+        if openssl s_client -help 2>&1 | grep -q -- '-tls1_3'; then
+            SNI_TLS13_STATE="yes"
+        else
+            SNI_TLS13_STATE="no"
+        fi
+    fi
+    [[ "$SNI_TLS13_STATE" == "yes" ]] && printf '%s' "-tls1_3"
+    return 0
+}
+
+# ---- REALITY 目标的 ASN / CDN 评分 ----
+#
+# 延迟只说明"连得快"，不说明"像不像"。两条经验规则更重要：目标与服务器同 ASN 时，
+# 流量去向最自然；目标躲在通用 CDN 后面时，服务器等于替 CDN 做端口转发，被扫描后
+# 可能被滥用（Xray 文档对此有明确警告）。这里对延迟最低的一批候选做一次批量 ASN
+# 查询并据此重排。查询走 Team Cymru 的 whois（纯 bash /dev/tcp，无额外依赖），
+# 43 端口不通、超时或解析失败时静默退回纯延迟排序。SNI_ASN_CHECK=0 可关闭。
+SNI_CDN_ASNS=" 13335 54113 20940 16625 21342 "
+declare -gA SNI_CANDIDATE_TAG=()
+
+# Usage: sni_bulk_asn IP...   -> 每行 "IP ASN"
+sni_bulk_asn() {
+    (( $# > 0 )) || return 1
+    local raw
+    raw=$( { printf 'begin\nnoheader\n'; printf '%s\n' "$@"; printf 'end\n'; } | timeout 6 bash -c \
+        'exec 3<>/dev/tcp/whois.cymru.com/43 || exit 1; cat >&3; cat <&3' 2>/dev/null) || return 1
+    printf '%s\n' "$raw" | awk -F'|' 'NF >= 2 {
+        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
+        if ($1 ~ /^[0-9]+$/) print $2, $1
+    }'
+}
+
+# 按所选网络栈解析域名的第一个地址。
+sni_resolve_ip() {
+    local db="ahostsv4"
+    [[ "$(netstack_mode)" == "v6" ]] && db="ahostsv6"
+    getent "$db" "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+# 把延迟最低的候选重排为"同 ASN 优先、通用 CDN 靠后"，输出前 5 名。
+# Usage: rank_sni_candidates LATENCY_MAP OUT_DOMAINS OUT_LATENCIES
+rank_sni_candidates() {
+    # 局部变量统一加 _rk_ 前缀：nameref 按名字解析，调用方的数组若与这里的局部变量
+    # 同名（例如 lat），引用会悄悄落到局部变量上。
+    local -n _rank_map=$1 _rank_doms=$2 _rank_lats=$3
+    local -a _rk_rows=() _rk_ips=()
+    local _rk_lat _rk_dom _rk_ip _rk_asn _rk_server_ip="" _rk_server_asn="" _rk_class _rk_line
+    local -A _rk_ip_of=() _rk_asn_of=()
+
+    SNI_CANDIDATE_TAG=()
+    mapfile -t _rk_rows < <(for _rk_dom in "${!_rank_map[@]}"; do
+        echo "${_rank_map[$_rk_dom]} $_rk_dom"
+    done | sort -n | head -15)
+
+    if [[ "${SNI_ASN_CHECK:-1}" != "0" ]]; then
+        for _rk_line in "${_rk_rows[@]}"; do
+            _rk_dom="${_rk_line#* }"
+            _rk_ip=$(sni_resolve_ip "$_rk_dom")
+            [[ -n "$_rk_ip" ]] && { _rk_ip_of["$_rk_dom"]="$_rk_ip"; _rk_ips+=("$_rk_ip"); }
+        done
+        if [[ "$(netstack_mode)" == "v6" ]]; then _rk_server_ip=$(get_ipv6); else _rk_server_ip=$(get_ipv4); fi
+        [[ -n "$_rk_server_ip" ]] && _rk_ips+=("$_rk_server_ip")
+        while read -r _rk_ip _rk_asn; do
+            [[ -n "$_rk_ip" && -n "$_rk_asn" ]] && _rk_asn_of["$_rk_ip"]="$_rk_asn"
+        done < <(sni_bulk_asn ${_rk_ips[@]+"${_rk_ips[@]}"} || true)
+        [[ -n "$_rk_server_ip" ]] && _rk_server_asn="${_rk_asn_of[$_rk_server_ip]:-}"
+    fi
+
+    _rank_doms=()
+    _rank_lats=()
+    while read -r _rk_class _rk_lat _rk_dom; do
+        [[ -n "$_rk_dom" ]] || continue
+        _rank_doms+=("$_rk_dom")
+        _rank_lats+=("$_rk_lat")
+    done < <(for _rk_line in "${_rk_rows[@]}"; do
+        _rk_lat="${_rk_line%% *}"
+        _rk_dom="${_rk_line#* }"
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        _rk_class=1
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            _rk_class=0
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            _rk_class=2
+        fi
+        echo "$_rk_class $_rk_lat $_rk_dom"
+    done | sort -k1,1n -k2,2n | head -5)
+
+    # 标签在父 shell 里重新计算：上面的排序跑在进程替换的子 shell 中，写不回关联数组。
+    for _rk_dom in ${_rank_doms[@]+"${_rank_doms[@]}"}; do
+        _rk_asn="${_rk_asn_of[${_rk_ip_of[$_rk_dom]:-none}]:-}"
+        if [[ -n "$_rk_asn" && "$_rk_asn" == "$_rk_server_asn" ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="$(t2 "同 ASN" "same ASN") AS$_rk_asn"
+        elif [[ -n "$_rk_asn" && "$SNI_CDN_ASNS" == *" $_rk_asn "* ]]; then
+            SNI_CANDIDATE_TAG["$_rk_dom"]="CDN AS$_rk_asn"
+        fi
+    done
+}
+
 # 测试单个域名延迟
 #
 # 必须按所选网络栈限定协议族：REALITY 的 dest 握手由服务器自己发起，v6 Only 主机
@@ -5956,10 +6505,13 @@ load_latency_cache() {
 # 只有 A 记录的域名也判为"可用"，装出一个握手必然失败的节点。
 test_domain_latency() {
     local domain="$1"
-    local t1 t2 family_flag
+    local t1 t2 family_flag tls13_flag
     local -a family=()
     family_flag=$(netstack_openssl_family)
     [[ -n "$family_flag" ]] && family=("$family_flag")
+    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
+    tls13_flag=$(sni_tls13_flag)
+    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
     t1=$(date +%s%3N)
     if timeout 2 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" -servername "$domain" </dev/null &>/dev/null; then
         t2=$(date +%s%3N)
@@ -5985,6 +6537,7 @@ test_domains_parallel() {
     local -n _latency_map=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -6080,6 +6633,7 @@ test_domains_parallel_verbose() {
     local -n _latency_map_v=$1
     local total=${#SNI_LIST[@]}
     local max_jobs=30
+    sni_tls13_flag >/dev/null
     local result_dir
     result_dir=$(mktemp -d)
 
@@ -6198,15 +6752,10 @@ select_best_sni() {
         return
     fi
 
-    # 获取排序后的 Top 5 域名
+    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
     local top_domains=()
     local top_latencies=()
-    while IFS=' ' read -r lat dom; do
-        top_domains+=("$dom")
-        top_latencies+=("$lat")
-    done < <(for domain in "${!latency_map[@]}"; do
-        echo "${latency_map[$domain]} $domain"
-    done | sort -n | head -5)
+    rank_sni_candidates latency_map top_domains top_latencies
 
     # 让用户选择 SNI
     prompt_sni_choice top_domains top_latencies
@@ -6300,7 +6849,10 @@ prompt_sni_choice() {
             echo ""
             local i=1 idx
             for idx in "${!td[@]}"; do
-                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
+                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
+                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
+                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
+                printf "\n"
                 ((i++))
             done
             echo ""
@@ -6375,6 +6927,15 @@ prompt_sni_choice() {
     done
 }
 
+# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
+# 自己的理由（例如目标与服务器同 ASN）。
+# Usage: warn_discouraged_reality_target DOMAIN
+warn_discouraged_reality_target() {
+    reality_target_discouraged "${1:-}" || return 0
+    log_warn "$(t2 "不建议用 Apple / iCloud 系域名作 REALITY 目标（Xray 自 v26.3.27 起对此告警），建议改选其他域名" \
+        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
+}
+
 # 提示用户输入自定义 SNI
 prompt_custom_sni() {
     {
@@ -6396,6 +6957,7 @@ prompt_custom_sni() {
         if [[ "$custom_sni" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
+            warn_discouraged_reality_target "$SNI"
 
             # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
             local custom_family_flag
@@ -6476,12 +7038,16 @@ write_config() {
     # 构建 inbounds 数组
     local inbounds_json="[]"
 
+    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
+    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
+    xray_probe_capabilities
+
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
 
         # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
-        local n_ss_method n_ss_password
+        local n_ss_method n_ss_password n_sid_list
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_uuid=$(safe_read_config_value "$node_file" "UUID")
@@ -6493,11 +7059,28 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
+        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
+        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
+        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
         n_uuid=$(decrypt_value "$n_uuid")
         n_ss_password=$(decrypt_value "$n_ss_password")
+
+        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
+        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
+        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
+        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
+        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
+        n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
+        [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
+        if [[ -z "$n_xhttp_private_key" ]]; then
+            n_xhttp_private_key="$n_private_key"
+            n_xhttp_sid_list="$n_sid_list"
+        else
+            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
+        fi
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -6513,6 +7096,23 @@ write_config() {
         # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
         if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
             continue
+        fi
+
+        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
+        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
+        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
+        if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
+            log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
+            return 1
+        fi
+
+        # 可选的 VLESS Encryption，同样在核心不支持时失败而不是静默退回明文 VLESS。
+        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")")
+        if [[ -n "$n_decryption" ]] && ! xray_supports vlessenc; then
+            log_error "$(t2 "节点 '$n_name' 启用了 VLESS Encryption，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses VLESS Encryption, which this Xray does not support; run xray-update first")"
+            return 1
         fi
 
         # 跳过无效节点（VLESS 需要 UUID，Shadowsocks 需要密码）
@@ -6560,7 +7160,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -6588,7 +7188,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -6692,7 +7292,7 @@ EOF
 write_singbox_config() {
     mkdir -p "$SINGBOX_DIR"
 
-    local inbounds_json="[]"
+    local inbounds_json="[]" providers_json="[]"
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
@@ -6706,7 +7306,8 @@ write_singbox_config() {
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_sni=$(safe_read_config_value "$node_file" "SNI")
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
-        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
         if [[ "$n_proto" == "hysteria2" ]]; then
             n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
         else
@@ -6731,11 +7332,30 @@ write_singbox_config() {
         if [[ "$n_proto" == "hysteria2" ]]; then
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
-            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
+            if [[ -n "$n_domain" ]]; then
+                # ACME 真证书：不再使用逐节点自签名证书。
+                sb_version=$(singbox_installed_version) || sb_version=""
+                [[ -n "$sb_version" ]] && version_ge "$sb_version" 1.14.0 && use_provider=1
+                node_tcp_port_claimed 443 && no_alpn=1
+                node_tcp_port_claimed 80 && no_http=1
+                if ! n_acme=$(build_hy2_acme_json "$n_name" "$n_domain" \
+                    "$(safe_read_config_value "$node_file" "HY2_EMAIL")" "$SINGBOX_DIR/acme" \
+                    "$use_provider" "$no_alpn" "$no_http"); then
+                    log_error "Failed to build ACME settings for node '$n_name'"
+                    return 1
+                fi
+                n_tls_json=$(jq -c '.tls' <<<"$n_acme")
+                providers_json=$(jq -c --argjson acme "$n_acme" \
+                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
+                n_sni="$n_domain"
+            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -6779,12 +7399,13 @@ write_singbox_config() {
     local config_json
     if ! config_json=$(jq -n \
         --argjson inbounds "$inbounds_json" \
+        --argjson providers "$providers_json" \
         '{
             "log": {"level": "warn", "timestamp": true},
             "inbounds": $inbounds,
             "outbounds": [{"type": "direct", "tag": "direct"}],
             "route": {"final": "direct"}
-        }' 2>&1); then
+        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
         log_error "Failed to assemble sing-box config: $config_json"
         return 1
     fi
@@ -6813,6 +7434,7 @@ singbox_sync() {
             service_disable "$SINGBOX_SERVICE"
         fi
         rm -f "$SINGBOX_CONF" 2>/dev/null
+        hy2_hop_sync
         return 0
     fi
 
@@ -6825,6 +7447,11 @@ singbox_sync() {
     fi
 
     if ! write_singbox_config; then
+        return 1
+    fi
+
+    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
+    if ! hy2_hop_sync; then
         return 1
     fi
 
@@ -6868,8 +7495,18 @@ save_env() {
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
     local save_hy2_password="${HY2_PASSWORD:-}"
+    local save_xhttp_uuid="${XHTTP_UUID:-}"
+    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
+    local save_mldsa65_seed="${MLDSA65_SEED:-}"
+    local save_vless_decryption="${VLESS_DECRYPTION:-}"
+    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
 
     if is_encryption_enabled; then
+        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
+        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
+        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
+        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
+        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
         # encrypt_value 对空串直接返回空串，因此无需额外判空。
         save_uuid=$(encrypt_value "$save_uuid")
         save_private_key=$(encrypt_value "$save_private_key")
@@ -6889,14 +7526,27 @@ SNI=${SNI:-}
 PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
 SHORT_ID=${SHORT_ID:-}
+EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
+XHTTP_UUID=$save_xhttp_uuid
+XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
+XHTTP_PRIVATE_KEY=$save_xhttp_private_key
+XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
+MLDSA65_SEED=$save_mldsa65_seed
+MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
+VLESS_DECRYPTION=$save_vless_decryption
+VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
+HY2_OBFS_PASSWORD=$save_hy2_obfs_password
+HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
+HY2_DOMAIN=${HY2_DOMAIN:-}
+HY2_EMAIL=${HY2_EMAIL:-}
 ENV
     chmod 600 "$node_file"
 
@@ -6924,7 +7574,14 @@ get_vision_link() {
         ip_formatted="[$ip]"
     fi
 
-    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
+    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
+}
+
+# VLESS 分享链接里的后量子参数。pqv 对应客户端的 mldsa65Verify（分享链接标准
+# XTLS/Xray-core discussion #716），值是 base64url，无需转义。
+vless_link_pq_params() {
+    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
+    return 0
 }
 
 # 生成 XHTTP 分享链接
@@ -6938,10 +7595,39 @@ get_xhttp_link() {
         ip_formatted="[$ip]"
     fi
 
-    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
+    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
+    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
+    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
     local encoded_path
     encoded_path=$(echo -n "$XHTTP_PATH" | sed 's|/|%2F|g')
-    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
+    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
+    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
+    if [[ -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+        link_pbk="$XHTTP_PUBLIC_KEY"
+        link_sid="${XHTTP_SHORT_ID:-}"
+    fi
+    # 启用 VLESS Encryption 时 XHTTP 也使用 Vision 流控，链接需带上 flow。
+    local link_flow=""
+    [[ -n "${VLESS_ENCRYPTION:-}" ]] && link_flow="&flow=xtls-rprx-vision"
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=${VLESS_ENCRYPTION:-none}${link_flow}&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
+}
+
+# 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
+# gen_reality_keys 直接写全局的 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，因此先保存 Vision
+# 的那一套，生成后搬到 XHTTP_* 再还原。
+gen_xhttp_credentials() {
+    local keep_public="$PUBLIC_KEY" keep_private="$PRIVATE_KEY" keep_sid="$SHORT_ID" rc=0
+    gen_reality_keys || rc=$?
+    if ((rc == 0)); then
+        XHTTP_PUBLIC_KEY="$PUBLIC_KEY"
+        XHTTP_PRIVATE_KEY="$PRIVATE_KEY"
+        XHTTP_SHORT_ID="$SHORT_ID"
+        XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    PUBLIC_KEY="$keep_public"
+    PRIVATE_KEY="$keep_private"
+    SHORT_ID="$keep_sid"
+    return "$rc"
 }
 
 # 生成 Shadowsocks 分享链接
@@ -6987,17 +7673,79 @@ get_anytls_link() {
     fi
 }
 
+# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
+# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
+# Usage: cert_sha256_hex CERT_PEM
+cert_sha256_hex() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    out="${out##*=}"
+    out="${out//:/}"
+    out="${out,,}"
+    [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$out"
+}
+
+# 证书公钥的 SHA-256（base64），对应 sing-box 出站的 certificate_public_key_sha256。
+# Usage: cert_pubkey_sha256_b64 CERT_PEM
+cert_pubkey_sha256_b64() {
+    local cert="$1" out
+    [[ -s "$cert" ]] || return 1
+    out=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform der 2>/dev/null \
+        | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0) || return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+# 当前已加载节点的逐节点自签名证书路径。
+node_selfsigned_cert_path() {
+    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
+}
+
 # 生成 Hysteria2 分享链接。密码被限制在 URI-unreserved 字符集内。
+#
+# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
+# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
+# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
+# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
 get_hy2_link() {
     local ip="$1"
     local node_label="$2"
     local ip_formatted="$ip"
+    local pin="" query
 
     if [[ "$ip" == *:* ]]; then
         ip_formatted="[$ip]"
     fi
 
-    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
+    if [[ -n "${HY2_DOMAIN:-}" ]]; then
+        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
+        query="sni=${HY2_DOMAIN}"
+    else
+        query="sni=${SNI:-www.bing.com}&insecure=1"
+        pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
+        [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    fi
+    [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
+    [[ -n "${HY2_HOP_PORTS:-}" ]] && query+="&mport=${HY2_HOP_PORTS}"
+
+    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
+}
+
+# 在节点信息里展示自签名证书指纹，供不支持从链接导入固定值的客户端手工填写。
+show_selfsigned_cert_pins() {
+    local cert pin_hex pin_key
+    cert=$(node_selfsigned_cert_path)
+    pin_hex=$(cert_sha256_hex "$cert") || return 0
+    pin_key=$(cert_pubkey_sha256_b64 "$cert") || pin_key=""
+    echo -e "  ${BLUE}Cert SHA-256:${NC} ${pin_hex}"
+    echo -e "               ${GRAY}(Hysteria2 pinSHA256 / Xray pinnedPeerCertSha256)${NC}"
+    if [[ -n "$pin_key" ]]; then
+        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
+        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
+    fi
 }
 
 # 向后兼容的获取分享链接函数
@@ -7014,6 +7762,7 @@ get_share_link() {
     # 根据协议类型返回对应的链接
     if [[ "$proto_type" == "hysteria2" ]] && [[ -n "${HY2_PASSWORD:-}" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         get_hy2_link "$ip" "${node_label}_Hysteria2"
     elif [[ "$proto_type" == "shadowsocks" ]] && [[ -n "${SS_PASSWORD:-}" ]]; then
         # Shadowsocks 节点
@@ -7079,7 +7828,13 @@ show_qrcode() {
     echo -e "${GREEN}                    $(msg qr_title)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    qrencode -t ANSIUTF8 "$link"
+    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
+    if (( ${#link} > 1200 )); then
+        echo -e "  ${YELLOW}$(t2 "链接过长（${#link} 字符），不生成二维码，请复制下方链接导入" \
+            "The link is too long for a scannable QR code (${#link} characters); copy the link below instead")${NC}"
+    else
+        qrencode -t ANSIUTF8 "$link"
+    fi
     echo ""
     echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
     echo -e "${GREEN}$(msg share_link):${NC}"
@@ -7088,6 +7843,12 @@ show_qrcode() {
     echo ""
     echo -e "${MAGENTA}$(msg qr_tip)${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
+show_extra_short_ids() {
+    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
+    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 }
 
 # 在 63 宽的标题框内居中输出（近似处理 CJK 双宽字符：显示宽度≈(字符数+字节数)/2）
@@ -7172,11 +7933,24 @@ show_info() {
         fi
     elif [[ "$proto_type" == "hysteria2" ]]; then
         HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
         echo -e "  ${BLUE}Port:${NC}        ${PORT:-N/A} (UDP/QUIC)"
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
+        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
+        fi
+        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
+            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
+        fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
-        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
-        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+        if [[ -n "${HY2_DOMAIN:-}" ]]; then
+            echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
+            echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"
+        else
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
+            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+            show_selfsigned_cert_pins
+        fi
         echo ""
 
         if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
@@ -7205,11 +7979,13 @@ show_info() {
             echo -e "  ${BLUE}SNI:${NC}         $SNI"
             echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
             echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+            show_extra_short_ids
             echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         else
             echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
             echo -e "  ${BLUE}SNI:${NC}         ${SNI:-N/A}  ${GRAY}(证书 CN / cert CN)${NC}"
             echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(客户端需允许不安全连接)${NC}"
+            show_selfsigned_cert_pins
         fi
 
         # Padding scheme（base64 解码后展示）：每个节点随机生成，握手时自动下发给客户端
@@ -7259,6 +8035,18 @@ show_info() {
         echo -e "  ${BLUE}SNI:${NC}         $SNI"
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+        show_extra_short_ids
+        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
+            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
+        fi
+        if [[ -n "${VLESS_ENCRYPTION:-}" ]]; then
+            echo -e "  ${BLUE}Encryption:${NC}  ${VLESS_ENCRYPTION%.*}.<key>  ${GRAY}(VLESS Encryption)${NC}"
+        fi
+        if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+            echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
+            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
+            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
+        fi
         echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 
@@ -7376,6 +8164,15 @@ open_node_firewall_ports() {
         hysteria2)
             open_firewall_port "$PORT" udp || \
                 log_warn "Could not automatically open UDP port $PORT"
+            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
+            if [[ -n "${HY2_DOMAIN:-}" ]]; then
+                local acme_port
+                for acme_port in 80 443; do
+                    node_tcp_port_claimed "$acme_port" && continue
+                    open_firewall_port "$acme_port" tcp || \
+                        log_warn "Could not automatically open TCP port $acme_port for ACME"
+                done
+            fi
             ;;
         shadowsocks)
             open_firewall_port "$PORT" both || \
@@ -7495,6 +8292,10 @@ cmd_install() {
     # Shadowsocks 和 VLESS 的安装流程不同
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
         # Shadowsocks 安装流程
+        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
+        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
+        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
+            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
         # 选择加密方式（或使用环境变量 ssmethod=xxx）
         if [[ -n "${ssmethod:-}" ]]; then
             SS_METHOD="$ssmethod"
@@ -7532,6 +8333,9 @@ cmd_install() {
             return 1
         fi
         choose_ports || return 1
+        configure_hy2_options || return 1
+        # ACME 节点的 TLS SNI 就是证书域名。
+        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
 
         UUID=""
         PUBLIC_KEY=""
@@ -7550,6 +8354,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             rm -f "$CACHE_FILE" 2>/dev/null
             [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
@@ -7570,6 +8375,7 @@ cmd_install() {
         UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
             gen_reality_keys || return 1
+            apply_extra_short_ids || return 1
         else
             PUBLIC_KEY=""
             PRIVATE_KEY=""
@@ -7586,6 +8392,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             select_best_sni
         fi
@@ -7593,6 +8400,12 @@ cmd_install() {
         gen_uuid
         choose_ports
         gen_reality_keys
+        apply_extra_short_ids || return 1
+        # both 节点的两个 inbound 各用一套凭据，互不牵连。
+        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
+            gen_xhttp_credentials || return 1
+        fi
+        configure_pq_options || return 1
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -7604,8 +8417,8 @@ cmd_install() {
     save_env
 
     if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
-        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
+        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
             if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
                 log_error "Failed to generate TLS certificate, rolling back..."
                 rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
@@ -7623,6 +8436,8 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        # 服务已通过健康门后再加固：加固失败会自行撤销，不影响这次安装的结果。
+        service_hardening_ensure "$SINGBOX_SERVICE" || true
     else
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
@@ -7651,6 +8466,7 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        service_hardening_ensure xray || true
     fi
 
     log_info "$(msg install_complete)"
@@ -7906,19 +8722,30 @@ cmd_remove() {
 }
 
 # 编辑已有节点的参数（端口 / SNI / 密码 / 密钥 / padding 等）
-cmd_edit() {
-    select_node || return 1
+# 把 CURRENT_NODE_NAME 指向的节点完整装入全局变量，供"修改后再 save_env"的流程使用。
+# safe_load 不含 padding；敏感值在这里解密，save_env 重存时才能正确再加密（明文配置下
+# 为 no-op）。节点编辑与升级向导共用这一份，避免两处各自维护字段清单。
+load_node_for_edit() {
     local node_file
     node_file=$(get_node_file "$CURRENT_NODE_NAME")
-    safe_load_node_config "$node_file"
+    safe_load_node_config "$node_file" || return 1
 
-    # safe_load 不含 padding；并解密敏感值，便于重存时正确再加密（明文配置下为 no-op）
     ANYTLS_PADDING_B64=$(safe_read_config_value "$node_file" "ANYTLS_PADDING_B64")
     UUID=$(decrypt_value "$UUID")
     PRIVATE_KEY=$(decrypt_value "$PRIVATE_KEY")
     SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
     ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
     HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
+    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
+    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
+    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
+    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
+}
+
+cmd_edit() {
+    select_node || return 1
+    load_node_for_edit || return 1
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -7968,6 +8795,8 @@ cmd_edit() {
                 echo -e "  ${GREEN}1.${NC} 修改 UDP 端口 / UDP Port    ${GRAY}(${PORT})${NC}"
                 echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
+                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
+                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -8016,6 +8845,8 @@ cmd_edit() {
                 new_hy2_sni="${new_hy2_sni:-${SNI:-www.bing.com}}"
                 if validate_tls_server_name "$new_hy2_sni"; then
                     SNI="$new_hy2_sni"
+                    # ACME 节点的 SNI 即证书域名，两者一起改。
+                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
                     sni_changed=true
                     changed=true
                 else
@@ -8026,11 +8857,18 @@ cmd_edit() {
             vision:3|xhttp:3|both:4)
                 UUID=$(cat /proc/sys/kernel/random/uuid)
                 log_info "新 UUID: $UUID"
+                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
+                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
                 changed=true ;;
 
             # ---- Reality 密钥对 ----
             vision:4|xhttp:4|both:5|anytls_reality:5)
                 if gen_reality_keys; then
+                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
+                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
+                        local keep_xhttp_uuid="$XHTTP_UUID"
+                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
+                    fi
                     log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
                     changed=true
                 fi ;;
@@ -8060,6 +8898,28 @@ cmd_edit() {
                 unset hy2pwd
                 gen_hy2_password
                 changed=true ;;
+            hysteria2:4)
+                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+                    HY2_OBFS_PASSWORD=""
+                    log_warn "$(t2 "已关闭 Salamander 混淆，客户端需同步去掉混淆设置" \
+                        "Salamander obfuscation disabled; clients must drop their obfs setting")"
+                else
+                    HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+                    log_warn "$(t2 "已启用 Salamander 混淆，客户端需重新导入链接" \
+                        "Salamander obfuscation enabled; clients must re-import the link")"
+                fi
+                changed=true ;;
+
+            hysteria2:5)
+                local new_hop
+                echo -n "  $(t2 "UDP 范围（如 20000-20100，留空关闭）" "UDP range (e.g. 20000-20100, empty to disable)"): " >/dev/tty
+                read -r new_hop </dev/tty
+                if [[ -z "$new_hop" ]]; then
+                    HY2_HOP_PORTS=""
+                    changed=true
+                elif apply_hy2_hop_range "$new_hop"; then
+                    changed=true
+                fi ;;
 
             # ---- AnyTLS padding ----
             anytls:4|anytls_reality:4)
@@ -8084,7 +8944,7 @@ cmd_edit() {
     # 重新生成对应内核配置并重启
     if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
         # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
-        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
+        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
             rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
             gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
         fi
@@ -8130,6 +8990,13 @@ cmd_uninstall() {
             rm -f "$tmp_installer"
         fi
     fi
+
+    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
+    hy2_hop_remove
+    # 移除服务沙箱加固的 drop-in 与跳过标记
+    service_hardening_remove xray
+    service_hardening_remove "$SINGBOX_SERVICE"
+    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 
     # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
@@ -8205,6 +9072,16 @@ cmd_health() {
             all_ok=false
         fi
     fi
+
+    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
+    # 节点本身是可用的，只是应该尽快更新。
+    local gap_name gap_installed gap_baseline gap_command
+    while read -r gap_name gap_installed gap_baseline; do
+        [[ -n "$gap_name" ]] || continue
+        gap_command="xray-update"
+        [[ "$gap_name" == "sing-box" ]] && gap_command="singbox-update"
+        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
+    done < <(core_baseline_gaps)
 
     # 2. 检查节点数量
     local node_count
@@ -8539,6 +9416,668 @@ cmd_netstack() {
     done
 }
 
+# ============== 协议可选增强 ==============
+#
+# 安装节点时的可选增强项（后量子、Hysteria2 加固）集中在这里：它们默认关闭，各自对
+# 客户端或网络环境有要求。本模块在 50_node_commands.sh 之后装载，但这些函数只在
+# 运行期被 cmd_install / cmd_edit 调用，不存在 source 阶段的反向依赖。
+
+# ---- 后量子增强 ----
+
+# REALITY 目标在握手中返回的证书链总字节数。ML-DSA-65 签名约 3309 字节，以证书扩展
+# 的形式附加；Xray 文档要求目标返回的证书必须长于 3500 字节，否则放不下。
+# Usage: reality_target_cert_bytes DOMAIN   -> 字节数（探测失败为 0）
+reality_target_cert_bytes() {
+    local domain="$1" family_flag
+    local -a family=()
+    family_flag=$(netstack_openssl_family)
+    [[ -n "$family_flag" ]] && family=("$family_flag")
+    timeout 5 openssl s_client ${family[@]+"${family[@]}"} -connect "${domain}:443" \
+        -servername "$domain" -showcerts </dev/null 2>/dev/null | awk '
+            /-----BEGIN CERTIFICATE-----/ { inside = 1; next }
+            /-----END CERTIFICATE-----/ { inside = 0; next }
+            inside { chars += length($0) }
+            END { print int(chars * 3 / 4) }'
+}
+
+# 生成 ML-DSA-65 密钥对：MLDSA65_SEED 留在服务端，MLDSA65_VERIFY 发给客户端。
+gen_mldsa65_keys() {
+    local out seed verify
+    out=$("$XRAY_BIN" mldsa65 2>/dev/null | tr -d '\r') || return 1
+    seed=$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<<"$out")
+    verify=$(awk -F': *' '$1 == "Verify" { print $2; exit }' <<<"$out")
+    [[ "$seed" =~ ^[A-Za-z0-9_-]{40,}$ && "$verify" =~ ^[A-Za-z0-9_-]{1000,}$ ]] || return 1
+    MLDSA65_SEED="$seed"
+    MLDSA65_VERIFY="$verify"
+}
+
+# 生成 VLESS Encryption 的 decryption/encryption 串对。`xray vlessenc` 一次给出两种
+# 认证方式，密钥交换都是后量子安全的 mlkem768x25519plus，区别只在认证密钥：
+#   x25519  认证密钥 43 字符，链接短、二维码可扫（默认）
+#   mlkem   认证也是后量子的，但客户端串约 1.6KB，链接无法生成可扫的二维码
+# Usage: gen_vlessenc_keys x25519|mlkem
+gen_vlessenc_keys() {
+    local want="${1:-x25519}" out decryption encryption
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null | tr -d '\r') || return 1
+    decryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"decryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    encryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"encryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    [[ "$decryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    [[ "$encryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    VLESS_DECRYPTION="$decryption"
+    VLESS_ENCRYPTION="$encryption"
+}
+
+# 布尔型环境变量：true/1/y/yes/on 视为启用。
+env_flag_enabled() {
+    case "${1,,}" in
+        true|1|y|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+# 交互式选择后量子增强，结果写入 PQ_WANT_MLDSA65 / PQ_WANT_VLESSENC。
+# 只在完全交互的安装里出现：只要调用方用 proto= 或任一后量子环境变量驱动安装，就
+# 不再追加提问，避免让既有的无人值守脚本卡在一个它们不知道的新提示上。
+prompt_pq_options() {
+    PQ_WANT_MLDSA65=""
+    PQ_WANT_VLESSENC=""
+    [[ -z "${proto:-}" && -z "${mldsa65:-}" && -z "${vlessenc:-}" ]] || return 0
+    xray_supports vlessenc || xray_supports mldsa65 || return 0
+    # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
+    # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
+    tty_available || return 0
+
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "后量子增强（可选，回车跳过）" "Post-quantum options (optional, Enter to skip)")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    menu_note "$(t2 "作用：防止今天被录下的流量在将来被量子计算机解密或伪造。" \
+        "Purpose: keep traffic recorded today from being decrypted or forged by a future quantum computer.")" \
+        "$(t2 "密钥全部自动生成，无需填写；代价是客户端必须足够新。" \
+        "All keys are generated for you; the cost is that clients must be recent enough.")"
+    echo ""
+    echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
+    menu_note "$(t2 "兼容所有客户端。不确定客户端版本时选这个。" \
+        "Works with every client. Pick this when unsure about client versions.")"
+    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${YELLOW}$(t2 "[新客户端推荐]" "[recommended for recent clients]")${NC}"
+    menu_note "$(t2 "给 VLESS 加一层后量子密钥交换，链接仍然很短、可以扫码。" \
+        "Adds a post-quantum key exchange to VLESS; the link stays short and scannable.")" \
+        "$(t2 "要求客户端内核为 Xray 25.9 或更新。" "Requires a client core of Xray 25.9 or newer.")"
+    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65"
+    menu_note "$(t2 "给 REALITY 证书加后量子签名，防止服务器被冒充。" \
+        "Adds a post-quantum signature to the REALITY certificate so the server cannot be impersonated.")" \
+        "$(t2 "链接会变成约 3KB，无法生成二维码，只能复制粘贴导入。" \
+        "The link grows to about 3 kB: no QR code, copy and paste only.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
+    echo ""
+    echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
+    } | tty_print
+
+    local choice=""
+    tty_read choice
+    case "$choice" in
+        1) PQ_WANT_VLESSENC="x25519" ;;
+        2) PQ_WANT_MLDSA65="true" ;;
+        3) PQ_WANT_VLESSENC="x25519"; PQ_WANT_MLDSA65="true" ;;
+    esac
+}
+
+# 为当前正在安装的 VLESS + REALITY 节点应用可选的后量子增强。
+#   vlessenc=x25519|mlkem|true  VLESS Encryption（true 等同 x25519）
+#   mldsa65=true                REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
+# 默认全部关闭：它们都要求较新的客户端，旧客户端导入带这些参数的链接会连不上。
+# 条件不满足（核心不支持、目标证书太短）时告警并跳过，不让整次安装失败。
+configure_pq_options() {
+    MLDSA65_SEED=""
+    MLDSA65_VERIFY=""
+    VLESS_DECRYPTION=""
+    VLESS_ENCRYPTION=""
+
+    local want_mldsa65="" want_vlessenc=""
+    prompt_pq_options
+    want_mldsa65="$PQ_WANT_MLDSA65"
+    want_vlessenc="$PQ_WANT_VLESSENC"
+    env_flag_enabled "${mldsa65:-}" && want_mldsa65="true"
+    local vlessenc_request="${vlessenc:-}"
+    vlessenc_request="${vlessenc_request,,}"
+    case "$vlessenc_request" in
+        x25519|mlkem) want_vlessenc="$vlessenc_request" ;;
+        "") ;;
+        *) env_flag_enabled "$vlessenc_request" && want_vlessenc="x25519" ;;
+    esac
+
+    if [[ -n "$want_vlessenc" ]]; then
+        if ! xray_supports vlessenc; then
+            log_warn "$(t2 "当前 Xray 不支持 VLESS Encryption，已跳过（可先执行 xray-update）" \
+                "This Xray does not support VLESS Encryption; skipped (run xray-update first)")"
+        elif ! gen_vlessenc_keys "$want_vlessenc"; then
+            log_error "$(t2 "生成 VLESS Encryption 密钥失败" "Failed to generate VLESS Encryption keys")"
+            return 1
+        else
+            log_info "$(t2 "已启用 VLESS Encryption（认证方式: $want_vlessenc）" \
+                "VLESS Encryption enabled (authentication: $want_vlessenc)")"
+        fi
+    fi
+
+    [[ -n "$want_mldsa65" ]] || return 0
+    if ! xray_supports mldsa65; then
+        log_warn "$(t2 "当前 Xray 不支持 ML-DSA-65，已跳过（可先执行 xray-update）" \
+            "This Xray does not support ML-DSA-65; skipped (run xray-update first)")"
+        return 0
+    fi
+    local chain_bytes
+    chain_bytes=$(reality_target_cert_bytes "$SNI")
+    if [[ ! "$chain_bytes" =~ ^[0-9]+$ ]] || (( chain_bytes <= 3500 )); then
+        log_warn "$(t2 "目标 $SNI 返回的证书只有 ${chain_bytes:-0} 字节（需大于 3500），放不下 ML-DSA-65 签名，已跳过" \
+            "Target $SNI returned only ${chain_bytes:-0} certificate bytes (more than 3500 required); ML-DSA-65 skipped")"
+        return 0
+    fi
+    if ! gen_mldsa65_keys; then
+        log_error "$(t2 "生成 ML-DSA-65 密钥失败" "Failed to generate ML-DSA-65 keys")"
+        return 1
+    fi
+    log_info "$(t2 "已启用 REALITY ML-DSA-65（目标证书 ${chain_bytes} 字节）" \
+        "REALITY ML-DSA-65 enabled (target certificate: ${chain_bytes} bytes)")"
+}
+
+# ---- Hysteria2 加固 ----
+#
+# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
+
+# 校验并采用一个端口跳跃范围，写入 HY2_HOP_PORTS。
+# Usage: apply_hy2_hop_range RANGE
+apply_hy2_hop_range() {
+    local range request="${1:-}"
+    if [[ "${request,,}" == "auto" ]]; then
+        if ! request=$(gen_hy2_hop_range "${CURRENT_NODE_NAME:-}"); then
+            log_error "$(t2 "未能找到空闲的端口跳跃范围" "Could not find a free hop range")"
+            return 1
+        fi
+    fi
+    if ! range=$(validate_hop_range "$request"); then
+        log_error "$(t2 "端口跳跃范围无效，应为 起始-结束（1-65535，跨度不超过 20000）" \
+            "Invalid hop range; expected START-END (1-65535, at most 20000 ports wide)"): ${1:-}"
+        return 1
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "端口跳跃需要 iptables，请先安装" "Port hopping requires iptables; install it first")"
+        return 1
+    fi
+    if hy2_hop_range_conflicts "$range" "${CURRENT_NODE_NAME:-}"; then
+        log_error "$(t2 "端口跳跃范围与其他节点的 UDP 端口或跳跃范围冲突" \
+            "The hop range overlaps another node's UDP port or hop range"): $range"
+        return 1
+    fi
+    HY2_HOP_PORTS="$range"
+    log_info "$(t2 "已启用端口跳跃: UDP $range（云安全组需同步放行该范围）" \
+        "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
+}
+
+# 采用一个 ACME 域名：校验格式、确认至少一种挑战可用，并提示 DNS 是否指向本机。
+# 签发发生在 sing-box 启动之后，这里无法提前证明能签下来，只能把明显会失败的情况
+# 拦在前面。
+# Usage: apply_hy2_acme_domain DOMAIN [EMAIL]
+apply_hy2_acme_domain() {
+    local domain="${1,,}" email="${2:-}" resolved="" own4 own6
+    if ! validate_tls_server_name "$domain" || [[ "$domain" != *.* || "$domain" =~ ^[0-9.]+$ ]]; then
+        log_error "$(t2 "ACME 域名无效" "Invalid ACME domain"): ${1:-}"
+        return 1
+    fi
+    if [[ -n "$email" && ! "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]]; then
+        log_error "$(t2 "ACME 邮箱无效" "Invalid ACME email"): $email"
+        return 1
+    fi
+    local alpn_ok=1 http_ok=1
+    { node_tcp_port_claimed 443 || ! is_port_free 443 tcp; } && alpn_ok=0
+    { node_tcp_port_claimed 80 || ! is_port_free 80 tcp; } && http_ok=0
+    if (( alpn_ok == 0 && http_ok == 0 )); then
+        log_error "$(t2 "ACME 签发需要 80/tcp 或 443/tcp 至少一个空闲，当前都被占用" \
+            "ACME needs 80/tcp or 443/tcp to be free, and both are in use")"
+        return 1
+    fi
+    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ')
+    own4=$(get_ipv4)
+    own6=$(get_ipv6)
+    if [[ -z "$resolved" ]]; then
+        log_warn "$(t2 "域名 $domain 目前无法解析，证书签发会失败，请先添加 DNS 记录" \
+            "Domain $domain does not resolve yet; issuance will fail until its DNS record exists")"
+    elif [[ " $resolved" != *" ${own4:-none} "* && " $resolved" != *" ${own6:-none} "* ]]; then
+        log_warn "$(t2 "域名 $domain 解析到 ${resolved}，不是本机地址，证书签发可能失败" \
+            "Domain $domain resolves to ${resolved}, not this server; issuance may fail")"
+    fi
+    HY2_DOMAIN="$domain"
+    HY2_EMAIL="$email"
+    log_info "$(t2 "将为 $domain 申请 ACME 证书（sing-box 启动后自动签发与续期）" \
+        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
+}
+
+# 引导式选择 Hysteria2 加固方案，结果写入 HY2_REQ_OBFS / HY2_REQ_HOP /
+# HY2_REQ_DOMAIN / HY2_REQ_EMAIL（取值与同名环境变量相同）。
+#
+# 设计目标是让用户不需要理解每个参数：前两个方案的全部参数都随机生成，回车即采用
+# 推荐方案；每个方案下面写明它做什么、需要用户额外做什么。只有"自定义"才逐项提问，
+# 且每一问都有可以直接回车的默认值。
+prompt_hy2_hardening() {
+    local choice="" answer="" hop_hint=""
+    HY2_REQ_OBFS="" HY2_REQ_HOP="" HY2_REQ_DOMAIN="" HY2_REQ_EMAIL=""
+    command -v iptables >/dev/null 2>&1 || \
+        hop_hint="  ${RED}$(t2 "(本机没有 iptables，暂不可用)" "(unavailable: iptables is not installed)")${NC}"
+
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "Hysteria2 加固方案（回车采用推荐）" "Hysteria2 hardening (Enter for the recommended preset)")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    menu_note "$(t2 "Hysteria2 默认是明文特征的 QUIC + 自签名证书，握手很容易被认出来。" \
+        "By default Hysteria2 is recognisable QUIC with a self-signed certificate.")" \
+        "$(t2 "下面的方案会自动生成随机参数，装完直接导入链接即可使用。" \
+        "The presets below generate random parameters; import the link afterwards and you are done.")"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} $(t2 "Salamander 混淆" "Salamander obfuscation")  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
+    menu_note "$(t2 "随机生成混淆密码，把流量打乱成看不出协议的数据。" \
+        "Generates a random password and scrambles the traffic so the protocol is not recognisable.")" \
+        "$(t2 "主流 Hysteria2 客户端都支持，密码已包含在分享链接里。" \
+        "Supported by mainstream Hysteria2 clients; the password travels in the share link.")"
+    echo -e "  ${GREEN}2.${NC} $(t2 "混淆 + 端口跳跃" "Obfuscation + port hopping")${hop_hint}"
+    menu_note "$(t2 "在方案 1 之上，随机挑一段 200 个 UDP 端口轮换，对抗针对单个端口的限速或封锁。" \
+        "On top of preset 1, rotates across a random range of 200 UDP ports against per-port throttling or blocking.")" \
+        "$(t2 "需要你到云厂商安全组放行这段 UDP 端口（安装后会显示），否则会间歇断流。" \
+        "You must allow that UDP range in the cloud firewall (shown after install), or connections will stall.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "不加固" "No hardening")"
+    menu_note "$(t2 "保持最简形态，兼容最老的客户端；被识别的风险最高。" \
+        "Plain Hysteria2 for the oldest clients; the easiest to recognise.")"
+    echo -e "  ${GREEN}4.${NC} $(t2 "自定义" "Custom")"
+    menu_note "$(t2 "逐项选择：混淆密码、跳跃范围、用自己的域名申请真证书（ACME）。" \
+        "Choose each item: obfs password, hop range, and a real certificate (ACME) for your own domain.")"
+    echo ""
+    echo -n "  $(t2 "请选择" "Select") [1-4] ($(t2 "默认" "default") 1): "
+    } | tty_print
+    tty_read choice
+
+    case "$choice" in
+        2)
+            HY2_REQ_OBFS="true"
+            if [[ -z "$hop_hint" ]]; then
+                HY2_REQ_HOP="auto"
+            else
+                log_warn "$(t2 "没有 iptables，已改用方案 1（仅混淆）" "iptables is missing; using preset 1 (obfuscation only)")"
+            fi
+            ;;
+        3) ;;
+        4)
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "Salamander 混淆密码" "Salamander obfs password")${NC}"
+            menu_note "$(t2 "回车 = 随机生成（推荐）；输入 n = 不启用；也可以自己输入 8 位以上的密码。" \
+                "Enter = random (recommended); n = off; or type your own password of 8+ characters.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            case "${answer,,}" in
+                "") HY2_REQ_OBFS="true" ;;
+                n|no) HY2_REQ_OBFS="" ;;
+                *) HY2_REQ_OBFS="$answer" ;;
+            esac
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "端口跳跃范围" "Port hopping range")${NC}${hop_hint}"
+            menu_note "$(t2 "回车 = 不启用；输入 a = 随机挑一段（推荐）；或输入 起始-结束，例如 20000-20200。" \
+                "Enter = off; a = pick a random range (recommended); or START-END such as 20000-20200.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            case "${answer,,}" in
+                "") HY2_REQ_HOP="" ;;
+                a|auto) HY2_REQ_HOP="auto" ;;
+                *) HY2_REQ_HOP="$answer" ;;
+            esac
+            {
+            echo ""
+            echo -e "  ${BLUE}$(t2 "ACME 证书域名" "ACME certificate domain")${NC}"
+            menu_note "$(t2 "回车 = 用自签名证书（无需域名）。" "Enter = keep the self-signed certificate (no domain needed).")" \
+                "$(t2 "有域名且已解析到本机时填在这里，客户端就不再需要 insecure；需要 80 或 443/tcp 空闲。" \
+                "If you own a domain that already points here, type it: clients no longer need insecure. Needs 80 or 443/tcp free.")"
+            echo -n "  > "
+            } | tty_print
+            tty_read answer
+            HY2_REQ_DOMAIN="$answer"
+            ;;
+        *) HY2_REQ_OBFS="true" ;;
+    esac
+}
+
+# 为当前正在安装的 Hysteria2 节点应用可选加固。
+#   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
+#   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
+#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
+#
+# 两条入口：完全交互的安装走引导菜单（默认采用推荐方案）；只要调用方用 proto= 或
+# 任一 hy2* 变量驱动安装，就只按环境变量执行、不追加提问，默认全部关闭——既有的
+# 无人值守脚本因此得到与升级前完全相同的节点。
+configure_hy2_options() {
+    HY2_OBFS_PASSWORD=""
+    HY2_HOP_PORTS=""
+    HY2_DOMAIN=""
+    HY2_EMAIL=""
+
+    HY2_REQ_OBFS="${hy2obfs:-}"
+    HY2_REQ_HOP="${hy2hop:-}"
+    HY2_REQ_DOMAIN="${hy2domain:-}"
+    HY2_REQ_EMAIL="${hy2email:-}"
+    if [[ -z "${proto:-}${hy2obfs:-}${hy2hop:-}${hy2domain:-}" ]] && tty_available; then
+        prompt_hy2_hardening
+    fi
+
+    if [[ -n "$HY2_REQ_DOMAIN" ]]; then
+        apply_hy2_acme_domain "$HY2_REQ_DOMAIN" "$HY2_REQ_EMAIL" || return 1
+    fi
+
+    if [[ -n "$HY2_REQ_HOP" ]]; then
+        apply_hy2_hop_range "$HY2_REQ_HOP" || return 1
+    fi
+
+    local obfs_request="$HY2_REQ_OBFS"
+    case "${obfs_request,,}" in
+        ""|false|0|n|no|off) ;;
+        true|1|y|yes|on)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16)
+            ;;
+        *)
+            if [[ ! "$obfs_request" =~ ^[a-zA-Z0-9._-]{8,128}$ ]]; then
+                log_error "$(t2 "hy2obfs 密码需为 8-128 位字母、数字或 ._-" \
+                    "hy2obfs password must be 8-128 characters of letters, digits or ._-")"
+                return 1
+            fi
+            HY2_OBFS_PASSWORD="$obfs_request"
+            ;;
+    esac
+    if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
+        log_info "$(t2 "已启用 Salamander 混淆（密码已写入分享链接，客户端导入即可）" \
+            "Salamander obfuscation enabled (the password is in the share link; just import it)")"
+    fi
+}
+
+# ============== sing-box Release 管理 ==============
+#
+# 目标与 Xray 的 release 管理一致：没有通过官方 SHA-256 的归档不会被执行，替换失败
+# 能回到旧 binary。实现刻意比 Xray 的事务轻：sing-box 只是一个由本脚本独占管理的
+# binary，这里用"同目录暂存 + rename 原子替换 + 带版本号的备份"覆盖下载损坏、候选
+# 不可执行、新版本拒绝现有配置、替换后服务起不来这四类失败。
+#
+# SHA-256 来自 GitHub release API 中每个资产的 digest 字段（"sha256:<hex>"）。
+# 该字段缺失或格式不符时失败关闭；确需安装这样的 release 时，由操作者用
+# SINGBOX_SHA256=<hex> 明确给出期望值，脚本仍然按它校验。
+SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases"
+SINGBOX_MAX_ARCHIVE_BYTES=$((300 * 1024 * 1024))
+
+# 请求的固定版本（SINGBOX_VERSION / singbox_version，可带 v 前缀）；未指定输出空串。
+singbox_requested_version() {
+    local raw="${SINGBOX_VERSION:-${singbox_version:-}}"
+    [[ -z "$raw" ]] && return 0
+    raw="${raw#v}"
+    [[ "$raw" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]] || return 1
+    printf '%s' "$raw"
+}
+
+map_singbox_arch() {
+    case "${1:-$(uname -m)}" in
+        x86_64|amd64)   printf '%s' amd64 ;;
+        aarch64|arm64)  printf '%s' arm64 ;;
+        armv7l|armv7)   printf '%s' armv7 ;;
+        i686|i386)      printf '%s' 386 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 取 release 元数据（JSON）。Usage: singbox_release_json [VERSION]（缺省为 latest stable）
+singbox_release_json() {
+    local version="${1:-}" url="$SINGBOX_RELEASE_API/latest"
+    [[ -n "$version" ]] && url="$SINGBOX_RELEASE_API/tags/v${version}"
+    secure_curl "$url" 2>/dev/null
+}
+
+# 从 release JSON 里选出本机应使用的归档，输出一行 "NAME URL SHA256"。
+# musl 主机优先 "-musl" 静态归档；没有它的旧 release 回落到默认归档（1.13 之前的
+# 默认归档本身是静态链接的）。
+# Usage: singbox_select_asset RELEASE_JSON VERSION ARCH
+singbox_select_asset() {
+    local json="$1" version="$2" arch="$3" name row digest
+    local -a names=()
+    system_is_musl && names+=("sing-box-${version}-linux-${arch}-musl.tar.gz")
+    names+=("sing-box-${version}-linux-${arch}.tar.gz")
+    for name in "${names[@]}"; do
+        row=$(jq -r --arg name "$name" \
+            '.assets[]? | select(.name == $name) | "\(.browser_download_url) \(.digest // "")"' \
+            <<<"$json" 2>/dev/null | head -n 1)
+        [[ -n "$row" ]] || continue
+        digest="${row#* }"
+        [[ "${row%% *}" == https://github.com/SagerNet/sing-box/releases/download/* ]] || return 1
+        if [[ -n "${SINGBOX_SHA256:-}" ]]; then
+            digest="sha256:${SINGBOX_SHA256,,}"
+        fi
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            log_error "$(t2 "release 元数据没有 $name 的 SHA-256，拒绝安装未校验的归档（可用 SINGBOX_SHA256=<hex> 明确指定）" \
+                "The release metadata has no SHA-256 for $name; refusing an unverified archive (set SINGBOX_SHA256=<hex> to supply one)")"
+            return 1
+        fi
+        printf '%s %s %s\n' "$name" "${row%% *}" "${digest#sha256:}"
+        return 0
+    done
+    log_error "No sing-box archive for linux-${arch} in release v${version}"
+    return 1
+}
+
+# 下载、校验并解出候选 binary，输出其路径。
+# Usage: singbox_fetch_candidate WORK_DIR NAME URL SHA256 VERSION
+singbox_fetch_candidate() {
+    local work="$1" name="$2" url="$3" expected="$4" version="$5" archive actual size candidate reported
+    archive="$work/$name"
+    if ! secure_curl "$url" -o "$archive"; then
+        log_error "Failed to download $name"
+        return 1
+    fi
+    size=$(stat -c '%s' "$archive" 2>/dev/null) || return 1
+    (( size > 0 && size <= SINGBOX_MAX_ARCHIVE_BYTES )) || { log_error "Unexpected archive size: $size"; return 1; }
+    actual=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "$(t2 "sing-box 归档 SHA-256 不匹配，已丢弃" "sing-box archive SHA-256 mismatch; discarded") (expected $expected, got ${actual:-none})"
+        return 1
+    fi
+    mkdir -p -- "$work/unpacked" || return 1
+    if ! tar -xzf "$archive" -C "$work/unpacked" --no-same-owner 2>/dev/null; then
+        log_error "Failed to extract sing-box archive"
+        return 1
+    fi
+    candidate=$(find "$work/unpacked" -type f -name sing-box 2>/dev/null | head -n 1)
+    if [[ -z "$candidate" ]]; then
+        log_error "sing-box binary not found in archive"
+        return 1
+    fi
+    chmod 755 "$candidate" || return 1
+    # 立刻验证可执行性与版本：不兼容的 binary（例如 musl 主机拿到 glibc 构建）要在
+    # 这里失败，而不是等到 config check 才被报成"配置无效"。
+    if ! reported=$(timeout 20 "$candidate" version 2>/dev/null </dev/null); then
+        log_error "Installed sing-box binary cannot be executed on this system"
+        system_is_musl && log_error "This system uses musl libc; no compatible sing-box build was found for v${version}"
+        return 1
+    fi
+    if [[ ! "$reported" =~ sing-box[[:space:]]+version[[:space:]]+${version//./\\.}([[:space:]]|$) ]]; then
+        log_error "Downloaded sing-box does not report version $version"
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}
+
+# 只保留最近 SINGBOX_BACKUP_KEEP（默认 3）份脚本创建的备份。
+singbox_prune_backups() {
+    local keep="${SINGBOX_BACKUP_KEEP:-3}" backup index=0
+    [[ "$keep" =~ ^[0-9]{1,3}$ ]] || keep=3
+    while IFS= read -r backup; do
+        index=$((index + 1))
+        (( index > keep )) && rm -f -- "$backup"
+    done < <(ls -1t -- "${SINGBOX_BIN}".bak-v*-[0-9]*-[0-9]* 2>/dev/null)
+    return 0
+}
+
+# 安装或更新 sing-box。
+# Usage: singbox_install_release fresh|update
+#   fresh   全新安装（install_singbox 调用）；不重启服务
+#   update  替换已有 binary：新 binary 必须接受现有配置；原先在运行则重启并确认 active，
+#           任一步失败都恢复旧 binary 与原服务状态
+singbox_install_release() {
+    local intent="${1:-update}" version arch json asset name url digest work candidate
+    local old_version="" backup="" stage was_active=0 rc=0
+
+    if ! version=$(singbox_requested_version); then
+        log_error "Invalid SINGBOX_VERSION: ${SINGBOX_VERSION:-${singbox_version:-}}"
+        return 1
+    fi
+    arch=$(map_singbox_arch) || { log_error "Unsupported architecture for sing-box: $(uname -m)"; return 1; }
+    json=$(singbox_release_json "$version") || json=""
+    if [[ -z "$version" ]]; then
+        version=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null)
+        version="${version#v}"
+    fi
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?$ ]]; then
+        log_error "Failed to get sing-box release metadata"
+        return 1
+    fi
+
+    old_version=$(singbox_installed_version) || old_version=""
+    if [[ "$intent" == "update" && -n "$old_version" && "$old_version" == "$version" \
+        && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]]; then
+        log_info "$(t2 "sing-box 已是最新版本" "sing-box is already up to date"): v$version"
+        return 0
+    fi
+    if [[ "$intent" == "update" && -n "$old_version" && -z "${SINGBOX_VERSION:-${singbox_version:-}}" ]] \
+        && ! version_ge "$version" "$old_version"; then
+        log_warn "$(t2 "已安装的 sing-box 比 stable 更新，不自动降级" "Installed sing-box is newer than stable; refusing an automatic downgrade"): v$old_version > v$version"
+        return 0
+    fi
+
+    asset=$(singbox_select_asset "$json" "$version" "$arch") || return 1
+    read -r name url digest <<<"$asset"
+    system_is_musl && [[ "$name" == *-musl.tar.gz ]] && \
+        log_info "musl libc detected, using the statically linked sing-box build"
+    log_info "Installing sing-box v${version} (${arch})..."
+
+    work=$(mktemp -d) || return 1
+    candidate=$(singbox_fetch_candidate "$work" "$name" "$url" "$digest" "$version") || { rm -rf -- "$work"; return 1; }
+
+    # 新 binary 必须接受现有配置，否则替换后服务必然起不来。
+    if [[ -s "$SINGBOX_CONF" ]] && ! "$candidate" check -c "$SINGBOX_CONF" >/dev/null 2>&1; then
+        log_error "$(t2 "新版 sing-box 不接受现有配置，已取消更新（现有 binary 未改动）" \
+            "The new sing-box rejects the current config; update cancelled (existing binary untouched)")"
+        rm -rf -- "$work"
+        return 1
+    fi
+
+    mkdir -p "$SINGBOX_DIR" "$(dirname "$SINGBOX_BIN")" || { rm -rf -- "$work"; return 1; }
+    stage=$(mktemp "$(dirname "$SINGBOX_BIN")/.sing-box.new.XXXXXXXX") || { rm -rf -- "$work"; return 1; }
+    if ! cp -- "$candidate" "$stage" || ! chmod 755 "$stage"; then
+        rm -rf -- "$work" "$stage"
+        return 1
+    fi
+    rm -rf -- "$work"
+
+    if [[ -f "$SINGBOX_BIN" ]]; then
+        backup="${SINGBOX_BIN}.bak-v${old_version:-unknown}-$(date +%Y%m%d-%H%M%S)"
+        cp -p -- "$SINGBOX_BIN" "$backup" || { rm -f -- "$stage"; return 1; }
+        service_is_active "$SINGBOX_SERVICE" && was_active=1
+    fi
+    # rename 在同一目录内是原子的：任何时刻该路径上要么是旧 binary，要么是新 binary。
+    mv -f -- "$stage" "$SINGBOX_BIN" || { rm -f -- "$stage"; return 1; }
+
+    if (( was_active == 1 )); then
+        service_restart "$SINGBOX_SERVICE" || rc=1
+        sleep 1
+        service_is_active "$SINGBOX_SERVICE" || rc=1
+        if (( rc != 0 )); then
+            log_error "$(t2 "新版 sing-box 启动失败，正在恢复旧版本" "The new sing-box failed to start; restoring the previous version")"
+            cp -p -- "$backup" "${SINGBOX_BIN}.restore" && mv -f -- "${SINGBOX_BIN}.restore" "$SINGBOX_BIN"
+            service_restart "$SINGBOX_SERVICE" || true
+            return 1
+        fi
+    fi
+
+    singbox_prune_backups
+    log_info "sing-box v${version} installed successfully"
+    return 0
+}
+
+# 只读显示 sing-box 的本地版本、latest stable 与安全基线。远端查询失败只把该项标为
+# 不可用，本地结果照常显示。
+cmd_singbox_version() {
+    local installed latest="" json relation=""
+    installed=$(singbox_installed_version) || installed=""
+    json=$(singbox_release_json "") || json=""
+    latest=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null) || latest=""
+    latest="${latest#v}"
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     sing-box $(t2 "版本" "version")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  $(t2 "已安装" "Installed"):      ${YELLOW}${installed:+v}${installed:-$(t2 "未安装" "Not installed")}${NC}"
+    echo -e "  Latest stable:  ${YELLOW}${latest:+v}${latest:-$(t2 "查询失败" "unavailable")}${NC}"
+    echo -e "  $(t2 "安全基线" "Security baseline"): v${SINGBOX_BASELINE_VERSION}"
+    if [[ -n "$installed" ]]; then
+        if ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+            relation="${RED}$(t2 "低于安全基线，建议立即更新" "below the security baseline; update now")${NC}"
+        elif [[ -n "$latest" ]] && ! version_ge "$installed" "$latest"; then
+            relation="${YELLOW}$(t2 "有新版本可用" "an update is available")${NC}"
+        elif [[ -n "$latest" ]]; then
+            relation="${GREEN}$(t2 "已是最新" "up to date")${NC}"
+        fi
+        [[ -n "$relation" ]] && echo -e "  $(t2 "状态" "Status"):        $relation"
+    fi
+    echo ""
+}
+
+# 更新 sing-box 到 latest stable，或 SINGBOX_VERSION 指定的版本。
+cmd_singbox_update() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        log_error "$(t2 "sing-box 尚未安装；添加 AnyTLS 或 Hysteria2 节点时会自动安装" \
+            "sing-box is not installed; it is installed automatically with the first AnyTLS or Hysteria2 node")"
+        return 1
+    fi
+    singbox_install_release update
+}
+
+# 工具菜单入口：先显示状态，再确认是否更新。
+cmd_singbox_release_menu() {
+    local answer=""
+    cmd_singbox_version
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        read -rp "$(msg menu_press_enter)"
+        return 0
+    fi
+    menu_note "$(t2 "更新会校验官方 SHA-256，并先用新版本检查现有配置；启动失败自动回滚旧版本。" \
+        "An update verifies the official SHA-256 and checks the current config with the new version; a failed start rolls back.")"
+    echo ""
+    echo -n "  $(t2 "更新到 latest stable?" "Update to the latest stable?") [y/N]: "
+    read -r answer
+    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+        cmd_singbox_update || true
+    fi
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
 # ============== WARP 管理 ==============
 
 cmd_warp() {
@@ -8592,22 +10131,59 @@ cmd_warp() {
     done
 }
 
+# WARP 由第三方脚本（fscarmen/warp）安装，它以 root 运行并会自行下载二进制。
+# 我们无法替它做完整性背书，能做的是让这次执行可审计、可固定：
+#   - 下载到 mktemp 创建的私有文件，而不是可预测的 /tmp 路径；
+#   - 执行前显示脚本的 SHA-256，并说明即将发生什么；
+#   - WARP_SCRIPT_REF 可把来源固定到某个 commit / tag（默认 main）；
+#   - 设置了 WARP_SCRIPT_SHA256 时强制比对，不一致即拒绝执行，且不再询问。
+# Usage: warp_run_script ARG   （ARG 透传给脚本：c 安装 / u 卸载）
+warp_run_script() {
+    local action="$1" ref="${WARP_SCRIPT_REF:-main}" expected="${WARP_SCRIPT_SHA256:-}" tmp actual answer="" rc=0
+    if [[ ! "$ref" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+        log_error "Invalid WARP_SCRIPT_REF: $ref"
+        return 1
+    fi
+    tmp=$(mktemp) || return 1
+    if ! secure_curl "https://gitlab.com/fscarmen/warp/-/raw/${ref}/menu.sh" -o "$tmp" 2>/dev/null; then
+        log_error "Failed to download WARP installer"
+        rm -f -- "$tmp"
+        return 1
+    fi
+    actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$expected" ]]; then
+        if [[ "${expected,,}" != "$actual" ]]; then
+            log_error "$(t2 "WARP 脚本的 SHA-256 与 WARP_SCRIPT_SHA256 不一致，已拒绝执行" \
+                "The WARP script does not match WARP_SCRIPT_SHA256; refusing to run it") ($actual)"
+            rm -f -- "$tmp"
+            return 1
+        fi
+    else
+        echo -e "  ${YELLOW}$(t2 "即将以 root 执行第三方脚本 fscarmen/warp（来源 ref: $ref）" \
+            "About to run the third-party script fscarmen/warp as root (ref: $ref)")${NC}"
+        echo -e "  SHA-256: $actual"
+        menu_note "$(t2 "该脚本不由本项目维护。需要固定版本时，可设置 WARP_SCRIPT_REF 与 WARP_SCRIPT_SHA256。" \
+            "This script is not maintained by this project. Set WARP_SCRIPT_REF and WARP_SCRIPT_SHA256 to pin it.")"
+        echo -n "  $(t2 "继续?" "Continue?") [Y/n]: "
+        read -r answer || answer="n"
+        if [[ "$answer" == "n" || "$answer" == "N" ]]; then
+            log_info "Cancelled"
+            rm -f -- "$tmp"
+            return 1
+        fi
+    fi
+    bash "$tmp" "$action" || rc=$?
+    rm -f -- "$tmp"
+    return "$rc"
+}
+
 warp_install() {
     echo ""
     log_info "Installing WARP (Socks5 mode)..."
-    # Security: Download to temp file with secure options
-    local tmp_warp="/tmp/warp-menu-$$.sh"
-    if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
-        bash "$tmp_warp" c
-        rm -f "$tmp_warp"
-        if check_warp_running; then
-            log_info "WARP installed successfully"
-            write_config
-            service_restart xray
-        fi
-    else
-        log_error "Failed to download WARP installer"
-        rm -f "$tmp_warp"
+    if warp_run_script c && check_warp_running; then
+        log_info "WARP installed successfully"
+        write_config
+        service_restart xray
     fi
     echo ""
     read -rp "$(msg menu_press_enter)"
@@ -8618,15 +10194,9 @@ warp_uninstall() {
     log_info "Uninstalling WARP..."
     if command -v warp &>/dev/null; then
         warp u
-    elif [[ -f menu.sh ]]; then
-        bash menu.sh u
     else
-        # Security: Download to temp file with secure options
-        local tmp_warp="/tmp/warp-menu-$$.sh"
-        if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
-            bash "$tmp_warp" u
-            rm -f "$tmp_warp"
-        fi
+        # 不再执行当前目录下碰巧存在的 menu.sh：工作目录里的文件不是可信来源。
+        warp_run_script u || true
     fi
     rm -f /root/.warp_netflix /root/.warp_ai
     write_config
@@ -8646,8 +10216,13 @@ warp_toggle_netflix() {
         rm -f /root/.warp_netflix
         log_info "Netflix routing disabled"
     else
-        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库
-        ensure_geodata
+        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库。数据库没有通过校验时
+        # 不启用规则：引用一个不存在的 geosite 会让 Xray 配置校验失败。
+        if ! ensure_geodata; then
+            echo ""
+            read -rp "$(msg menu_press_enter)"
+            return
+        fi
         touch /root/.warp_netflix
         log_info "Netflix routing enabled"
     fi
@@ -8668,7 +10243,11 @@ warp_toggle_ai() {
         log_info "AI services routing disabled"
     else
         # 分流规则使用 geosite:openai/anthropic，需要 GeoSite 数据库
-        ensure_geodata
+        if ! ensure_geodata; then
+            echo ""
+            read -rp "$(msg menu_press_enter)"
+            return
+        fi
         touch /root/.warp_ai
         log_info "AI services routing enabled"
     fi
@@ -8702,9 +10281,15 @@ cmd_bbr() {
         echo -e "  Congestion Control: $bbr_status"
         echo -e "  Queue Discipline: ${YELLOW}$qdisc_status${NC}"
         echo ""
-        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ"
+        echo -e "  ${GREEN}1.${NC} Enable BBR + FQ  ${YELLOW}$(t2 "[推荐]" "[recommended]")${NC}"
+        menu_note "$(t2 "换用 BBR 拥塞控制，丢包线路上吞吐更稳；对绝大多数 VPS 都是正收益。" \
+            "Switches to BBR congestion control: steadier throughput on lossy links, a net win on most VPSes.")"
         echo -e "  ${GREEN}2.${NC} Disable BBR (use CUBIC)"
-        echo -e "  ${GREEN}3.${NC} Apply TCP optimization"
+        menu_note "$(t2 "恢复系统默认算法；仅在 BBR 表现异常时使用。" \
+            "Back to the system default; only when BBR misbehaves.")"
+        echo -e "  ${GREEN}3.${NC} Apply TCP/UDP optimization"
+        menu_note "$(t2 "放大收发缓冲区（对高带宽线路和 Hysteria2 有帮助），不改变上面的算法选择。" \
+            "Raises socket buffers (helps high-bandwidth links and Hysteria2) without changing the algorithm above.")"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
@@ -8747,25 +10332,49 @@ EOF
     read -rp "$(msg menu_press_enter)"
 }
 
+# 网络调优模板。保留当前的拥塞控制与队列规则，只调缓冲区与几个通用开关：
+#   - 缓冲区上限 32MB：高带宽长距离链路上 TCP 窗口与 QUIC（Hysteria2）收发都受它限制；
+#   - udp_rmem_min / udp_wmem_min：给每个 UDP socket 一个不至于在突发时丢包的下限；
+#   - 不再写 tcp_low_latency：它自内核 4.14 起是空操作，写了只会让人误以为有效。
+# Usage: sysctl_tuning_content CONGESTION_CONTROL QDISC
+SYSCTL_TUNING_FILE="/etc/sysctl.d/99-bbr.conf"
+sysctl_tuning_content() {
+    printf '%s\n' \
+        "# proxy-hub-managed: sysctl-tuning-v2" \
+        "net.core.default_qdisc = ${2:-fq}" \
+        "net.ipv4.tcp_congestion_control = ${1:-bbr}" \
+        "net.core.rmem_max = 33554432" \
+        "net.core.wmem_max = 33554432" \
+        "net.ipv4.tcp_rmem = 4096 87380 33554432" \
+        "net.ipv4.tcp_wmem = 4096 65536 33554432" \
+        "net.ipv4.udp_rmem_min = 16384" \
+        "net.ipv4.udp_wmem_min = 16384" \
+        "net.ipv4.tcp_slow_start_after_idle = 0" \
+        "net.ipv4.tcp_mtu_probing = 1"
+}
+
+# 调优文件是否是旧模板写的（含已失效的 tcp_low_latency）。
+sysctl_tuning_is_legacy() {
+    [[ -f "$SYSCTL_TUNING_FILE" ]] && grep -q '^net\.ipv4\.tcp_low_latency' "$SYSCTL_TUNING_FILE" 2>/dev/null
+}
+
+# 按当前的拥塞控制与队列规则重写调优文件并立即生效。
+sysctl_tuning_apply() {
+    local cc qd
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cc=""
+    qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || qd=""
+    sysctl_tuning_content "$cc" "$qd" >"$SYSCTL_TUNING_FILE" || return 1
+    sysctl --system >/dev/null 2>&1 || true
+}
+
 bbr_optimize() {
     echo ""
-    log_info "Applying TCP optimization..."
-    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    local qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-
-    cat > /etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc = $qd
-net.ipv4.tcp_congestion_control = $cc
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-EOF
-    sysctl --system >/dev/null 2>&1
-    log_info "TCP optimization applied"
+    log_info "Applying TCP/UDP optimization..."
+    if sysctl_tuning_apply; then
+        log_info "TCP/UDP optimization applied"
+    else
+        log_error "Failed to write $SYSCTL_TUNING_FILE"
+    fi
     echo ""
     read -rp "$(msg menu_press_enter)"
 }
@@ -10275,6 +11884,124 @@ is_container_env() {
     esac
 }
 
+# ============== 服务沙箱加固 ==============
+#
+# Xray 与 sing-box 以 root 运行，却只需要绑定端口和操作网络。加固通过 systemd drop-in
+# 收窄它们的权限，而不改动服务定义本身：Xray 的 unit 由带 managed marker 的原子发布
+# 逻辑管理，往里加指令会破坏那套"是否为脚本管理内容"的判定；drop-in 可以独立增删。
+#
+# 两条约束决定了实现：
+#   1. 需要挂载命名空间的指令（ProtectSystem / PrivateTmp 等）在 LXC、OpenVZ 这类
+#      容器里常常直接以 226/NAMESPACE 失败，而便宜的 VPS 很多就是容器。所以容器里
+#      只下发不依赖命名空间的核心集合。
+#   2. 即使这样也无法穷举所有宿主环境，所以加固必须可验证、可自动撤销：只对已经
+#      在运行的服务下发，重启后确认仍然 active，否则删除 drop-in、再次重启恢复原状，
+#      并记下跳过标记，不在每次装节点时重复尝试。
+SYSTEMD_DROPIN_ROOT="/etc/systemd/system"
+SERVICE_HARDENING_STATE_DIR="/etc/proxy-hub"
+SERVICE_HARDENING_MIN_SYSTEMD=235
+
+service_hardening_dropin() {
+    printf '%s/%s.service.d/10-proxy-hub-hardening.conf' "$SYSTEMD_DROPIN_ROOT" "$1"
+}
+
+service_hardening_skip_marker() {
+    printf '%s/hardening-%s.skip' "$SERVICE_HARDENING_STATE_DIR" "$1"
+}
+
+# 本机是否适用加固：仅 systemd，且版本足够新。
+service_hardening_applicable() {
+    local version
+    [[ "${INIT_SYSTEM:-}" != "openrc" ]] || return 1
+    version=$(systemd_version) || return 1
+    (( version >= SERVICE_HARDENING_MIN_SYSTEMD ))
+}
+
+# 是否运行在容器内。探测工具缺失时按"是"处理：宁可少加几条指令，也不让服务起不来。
+service_hardening_in_container() {
+    command -v systemd-detect-virt >/dev/null 2>&1 || return 0
+    systemd-detect-virt --container --quiet 2>/dev/null
+}
+
+# 输出某个服务的 drop-in 内容。
+service_hardening_render() {
+    local svc="$1"
+    cat <<'CORE'
+# proxy-hub-managed: hardening-v1
+[Service]
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+CORE
+    service_hardening_in_container && return 0
+    cat <<'NAMESPACED'
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+NAMESPACED
+    # ProtectSystem=full 把 /usr 变成只读，而 sing-box 的 ACME 数据目录在
+    # /usr/local/etc/sing-box 下，必须显式放行（"-" 表示目录不存在时忽略）。
+    [[ "$svc" == "$SINGBOX_SERVICE" ]] && printf 'ReadWritePaths=-%s\n' "$SINGBOX_DIR"
+    return 0
+}
+
+service_hardening_is_applied() {
+    [[ -f "$(service_hardening_dropin "$1")" ]]
+}
+
+service_hardening_remove() {
+    local dropin
+    dropin=$(service_hardening_dropin "$1")
+    [[ -e "$dropin" ]] || return 0
+    rm -f -- "$dropin"
+    rmdir -- "$(dirname "$dropin")" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# 为一个正在运行的服务下发加固并验证。
+# Usage: service_hardening_ensure SERVICE [force]
+# 返回: 0 已加固（或本来就已加固）；1 不适用 / 服务未运行 / 曾经失败已跳过；
+#       2 下发后服务起不来，已自动撤销并恢复
+service_hardening_ensure() {
+    local svc="$1" force="${2:-}" dropin tmp marker
+    service_hardening_applicable || return 1
+    dropin=$(service_hardening_dropin "$svc")
+    marker=$(service_hardening_skip_marker "$svc")
+    [[ -f "$dropin" ]] && return 0
+    [[ -e "$marker" && "$force" != "force" ]] && return 1
+    service_is_active "$svc" || return 1
+
+    mkdir -p -- "$(dirname "$dropin")" || return 1
+    tmp=$(mktemp "${dropin}.XXXXXXXX") || return 1
+    service_hardening_render "$svc" >"$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$dropin" || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    systemctl daemon-reload 2>/dev/null || true
+
+    if service_restart "$svc" >/dev/null 2>&1 && sleep 1 && service_is_active "$svc"; then
+        rm -f -- "$marker"
+        log_info "$(t2 "已为 $svc 启用服务沙箱加固" "Service sandbox hardening enabled for $svc")"
+        return 0
+    fi
+
+    # 这台机器上的 systemd/内核不接受这组指令：撤销并恢复，服务可用性优先。
+    service_hardening_remove "$svc"
+    service_restart "$svc" >/dev/null 2>&1 || true
+    mkdir -p -- "$SERVICE_HARDENING_STATE_DIR" 2>/dev/null && : >"$marker"
+    log_warn "$(t2 "$svc 在沙箱加固下无法启动，已自动撤销加固并恢复服务（常见于容器型 VPS）" \
+        "$svc could not start under sandbox hardening; it was reverted and the service restored (common on container VPSes)")"
+    return 2
+}
+
 # 检查系统是否有修改时钟的权限 (CAP_SYS_TIME)
 check_time_capability() {
     # 方法1: 尝试无害的 adjtimex 查询
@@ -10758,6 +12485,784 @@ prompt_timesync_for_ss2022() {
     esac
 }
 
+# ============== 协议 / 内核升级向导 ==============
+#
+# 用旧版本脚本装过节点的机器，升级脚本之后节点文件和运行中的内核仍然是旧的：普通
+# 安装从不替换健康的既有内核，也不会回头改已有节点。这里提供一条显式的迁移路径。
+#
+# 整个流程分三步，对应三组函数：
+#   upgrade_scan     离线扫描（不联网、不改任何东西），列出可升级项；
+#   upgrade_apply    执行选中的项，节点改动先快照、失败整体回滚；
+#   cmd_upgrade      向导界面与 CLI 入口。
+#
+# 每个可升级项属于三类之一，界面按类别分组，默认勾选也按类别决定：
+#   safe    只动服务端，客户端零改动 —— 推荐，默认勾选；
+#   relink  会改变分享链接，客户端必须重新导入 —— 可选，默认不勾选；
+#   info    只是告知，没有可执行的动作。
+#
+# 项的 ID 是稳定标识：core.xray / core.singbox / cfg.reality-fields /
+# svc.hardening / geodata.cron / sysctl.template / links.pin，以及
+# node.<节点名>.<sni|port443|split|vlessenc|hy2obfs|ss>。
+UPGRADE_STATE_FILE="/root/.proxy_hub_upgrade"
+UPGRADE_BACKUP_ROOT="/var/lib/proxy-hub/upgrade-backups"
+declare -ga UPG_IDS=() UPG_CLASS=() UPG_TITLE=() UPG_NOTE=() UPG_COST=() UPG_SEL=()
+
+# Usage: upgrade_add ID CLASS TITLE NOTE COST
+upgrade_add() {
+    UPG_IDS+=("$1")
+    UPG_CLASS+=("$2")
+    UPG_TITLE+=("$3")
+    UPG_NOTE+=("$4")
+    UPG_COST+=("$5")
+    # 默认勾选：只有"客户端零改动"的推荐项。
+    if [[ "$2" == "safe" ]]; then UPG_SEL+=(1); else UPG_SEL+=(0); fi
+}
+
+upgrade_has() {
+    local id
+    for id in ${UPG_IDS[@]+"${UPG_IDS[@]}"}; do
+        [[ "$id" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# 节点的协议类型，含旧节点没有 PROTOCOL_TYPE 时按端口推断的兼容规则。
+upgrade_node_protocol() {
+    local file="$1" proto
+    proto=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
+    if [[ -z "$proto" ]]; then
+        if [[ -n "$(safe_read_config_value "$file" "PORT")" && -n "$(safe_read_config_value "$file" "XHTTP_PORT")" ]]; then
+            proto="both"
+        elif [[ -n "$(safe_read_config_value "$file" "XHTTP_PORT")" ]]; then
+            proto="xhttp"
+        else
+            proto="vision"
+        fi
+    fi
+    printf '%s' "$proto"
+}
+
+# 离线扫描，结果写入 UPG_* 数组。不联网、不修改任何文件或服务。
+upgrade_scan() {
+    UPG_IDS=() UPG_CLASS=() UPG_TITLE=() UPG_NOTE=() UPG_COST=() UPG_SEL=()
+    local name installed baseline
+
+    # ---- 内核低于安全基线 ----
+    while read -r name installed baseline; do
+        case "$name" in
+            xray)
+                upgrade_add core.xray safe \
+                    "$(t2 "更新 Xray：v$installed → 最新稳定版" "Update Xray: v$installed → latest stable")" \
+                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本默认关闭 MPTCP（规避 Linux 内核漏洞）并移除了有问题的根证书。" \
+                        "Below the security baseline v$baseline: later releases turn MPTCP off by default (a Linux kernel flaw) and drop compromised root certificates.")" \
+                    "$(t2 "自动校验官方 SHA-256，先用新版本检查现有配置，启动失败自动回滚。服务会重启一次（几秒）。" \
+                        "Verifies the official SHA-256, checks the current config with the new version, and rolls back if it fails to start. One restart of a few seconds.")"
+                ;;
+            sing-box)
+                upgrade_add core.singbox safe \
+                    "$(t2 "更新 sing-box：v$installed → 最新稳定版" "Update sing-box: v$installed → latest stable")" \
+                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本里 AnyTLS 默认不再上传客户端信息。" \
+                        "Below the security baseline v$baseline: later releases stop AnyTLS from uploading client metadata by default.")" \
+                    "$(t2 "自动校验官方 SHA-256，先用新版本检查现有配置，启动失败自动回滚。服务会重启一次（几秒）。" \
+                        "Verifies the official SHA-256, checks the current config with the new version, and rolls back if it fails to start. One restart of a few seconds.")"
+                ;;
+        esac
+    done < <(core_baseline_gaps)
+
+    # ---- Xray 配置仍在用旧字段 ----
+    if [[ -s "$XRAY_CONF" ]] && jq -e '[.inbounds[]?.streamSettings.realitySettings // empty
+            | select(has("dest") or has("fingerprint"))] | length > 0' "$XRAY_CONF" >/dev/null 2>&1; then
+        if xray_supports target || upgrade_has core.xray; then
+            upgrade_add cfg.reality-fields safe \
+                "$(t2 "重新生成 Xray 配置（改用新版字段写法）" "Regenerate the Xray config with current field names")" \
+                "$(t2 "现有配置还在用旧字段 dest 和一个服务端无效的 fingerprint；新版核心以 target 为正式写法。" \
+                    "The config still uses the legacy dest field and a fingerprint that servers ignore; current cores use target.")" \
+                "$(t2 "只改服务端配置文件，节点参数与分享链接完全不变。Xray 会重启一次。" \
+                    "Only the server config changes; node parameters and share links stay the same. Xray restarts once.")"
+        fi
+    fi
+
+    # ---- 服务沙箱加固 ----
+    if service_hardening_applicable; then
+        local svc pending=""
+        for svc in xray "$SINGBOX_SERVICE"; do
+            if service_is_active "$svc" && ! service_hardening_is_applied "$svc" \
+                && [[ ! -e "$(service_hardening_skip_marker "$svc")" ]]; then
+                pending+="${pending:+ / }$svc"
+            fi
+        done
+        if [[ -n "$pending" ]]; then
+            upgrade_add svc.hardening safe \
+                "$(t2 "为服务启用沙箱加固：$pending" "Enable sandbox hardening for: $pending")" \
+                "$(t2 "代理内核以 root 运行却只需要网络权限；加固后即使内核出现漏洞，能造成的破坏也小得多。" \
+                    "The cores run as root but only need the network; hardening limits what a compromised core could do.")" \
+                "$(t2 "服务重启一次；如果在这台机器上加固后起不来，会自动撤销并恢复原状。" \
+                    "One restart; if the service cannot start hardened on this machine, it is reverted automatically.")"
+        fi
+    fi
+
+    # ---- GeoData 定时更新未校验 ----
+    if geodata_cron_is_legacy; then
+        upgrade_add geodata.cron safe \
+            "$(t2 "把 GeoIP/GeoSite 的定时更新换成带校验的版本" "Switch the scheduled GeoIP/GeoSite update to the verified one")" \
+            "$(t2 "现在的定时任务把下载结果直接覆盖到数据文件上，下载中断或被篡改都会让路由数据损坏。" \
+                "The current job writes downloads straight over the live files, so an interrupted or tampered download corrupts routing data.")" \
+            "$(t2 "只替换定时任务；现有数据文件不动，下次更新开始校验 SHA-256。" \
+                "Only the cron job changes; existing data is untouched and the next update verifies SHA-256.")"
+    fi
+
+    # ---- sysctl 调优模板过时 ----
+    if sysctl_tuning_is_legacy; then
+        upgrade_add sysctl.template safe \
+            "$(t2 "刷新网络调优参数" "Refresh the network tuning parameters")" \
+            "$(t2 "现有调优文件含一个内核早已忽略的参数，缓冲区上限也偏小。" \
+                "The tuning file sets a key the kernel has long ignored and uses a low buffer ceiling.")" \
+            "$(t2 "保留你当前的拥塞控制算法，立即生效，无需重启。" \
+                "Keeps your current congestion control, takes effect immediately, no restart.")"
+    fi
+
+    # ---- 逐节点 ----
+    local file node proto sni main_port port443_offered=0 pinned_nodes=""
+    for file in "$NODES_DIR"/*.env; do
+        [[ -f "$file" ]] || continue
+        node=$(basename "$file" .env)
+        proto=$(upgrade_node_protocol "$file")
+        sni=$(safe_read_config_value "$file" "SNI")
+        case "$proto" in
+            vision|xhttp|both|anytls_reality)
+                if reality_target_discouraged "$sni"; then
+                    upgrade_add "node.$node.sni" relink \
+                        "$(t2 "节点 $node：更换 REALITY 伪装域名（当前 $sni）" "Node $node: replace the REALITY target (now $sni)")" \
+                        "$(t2 "Apple / iCloud 域名被太多节点借用，已成为被重点关照的特征，新版 Xray 也会对此告警。" \
+                            "Apple / iCloud domains are borrowed by so many nodes that they draw attention; current Xray warns about them.")" \
+                        "$(t2 "自动测速并选出新的域名，无需你填写。客户端需要重新导入这个节点的链接。" \
+                            "A new domain is picked by the latency test for you. Clients must re-import this node's link.")"
+                fi
+                main_port=$(safe_read_config_value "$file" "PORT")
+                [[ "$proto" == "xhttp" ]] && main_port=$(safe_read_config_value "$file" "XHTTP_PORT")
+                if [[ -n "$main_port" && "$main_port" != "443" ]] && (( port443_offered == 0 )) \
+                    && is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
+                    port443_offered=1
+                    upgrade_add "node.$node.port443" relink \
+                        "$(t2 "节点 $node：把端口从 $main_port 改到 443" "Node $node: move the port from $main_port to 443")" \
+                        "$(t2 "REALITY 伪装成访问真实网站，而真实网站都在 443；用其他端口时伪装效果打折。" \
+                            "REALITY poses as a visit to a real website, and real websites answer on 443; another port weakens the disguise.")" \
+                        "$(t2 "需在云安全组放行 443/tcp。客户端需要重新导入这个节点的链接。" \
+                            "Allow 443/tcp in the cloud firewall. Clients must re-import this node's link.")"
+                fi
+                if [[ "$proto" == "both" && -z "$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")" ]]; then
+                    upgrade_add "node.$node.split" relink \
+                        "$(t2 "节点 $node：给 XHTTP 生成独立凭据" "Node $node: give XHTTP its own credentials")" \
+                        "$(t2 "Vision 和 XHTTP 现在共用同一套 UUID 和密钥，其中一个暴露，另一个也跟着暴露。" \
+                            "Vision and XHTTP share one UUID and key pair today, so exposing one exposes the other.")" \
+                        "$(t2 "新凭据自动生成。只有 XHTTP 的链接会变，Vision 链接不受影响。" \
+                            "New credentials are generated for you. Only the XHTTP link changes; the Vision link keeps working.")"
+                fi
+                if [[ "$proto" != "anytls_reality" && -z "$(safe_read_config_value "$file" "VLESS_DECRYPTION")" ]] \
+                    && xray_supports vlessenc; then
+                    upgrade_add "node.$node.vlessenc" relink \
+                        "$(t2 "节点 $node：启用 VLESS Encryption（后量子加密）" "Node $node: enable VLESS Encryption (post-quantum)")" \
+                        "$(t2 "防止今天被录下的流量将来被量子计算机解密。密钥自动生成。" \
+                            "Keeps traffic recorded today from being decrypted by a future quantum computer. Keys are generated for you.")" \
+                        "$(t2 "要求客户端内核为 Xray 25.9 或更新；旧客户端将无法连接。客户端需要重新导入链接。" \
+                            "Requires a client core of Xray 25.9 or newer; older clients stop connecting. Clients must re-import the link.")"
+                fi
+                ;;
+            hysteria2)
+                if [[ -z "$(safe_read_config_value "$file" "HY2_DOMAIN")" ]]; then
+                    pinned_nodes+="${pinned_nodes:+, }$node"
+                    if [[ -z "$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")" ]]; then
+                        upgrade_add "node.$node.hy2obfs" relink \
+                            "$(t2 "节点 $node：启用 Salamander 混淆" "Node $node: enable Salamander obfuscation")" \
+                            "$(t2 "Hysteria2 默认的握手特征很容易被识别；混淆后流量看不出协议。密码随机生成。" \
+                                "Plain Hysteria2 is easy to recognise by its handshake; obfuscation hides the protocol. The password is random.")" \
+                            "$(t2 "客户端需要重新导入这个节点的链接（混淆密码已包含在链接里）。" \
+                                "Clients must re-import this node's link (the obfs password is included in it).")"
+                    fi
+                fi
+                ;;
+            shadowsocks)
+                upgrade_add "node.$node.ss" info \
+                    "$(t2 "节点 $node 使用 Shadowsocks" "Node $node uses Shadowsocks")" \
+                    "$(t2 "Shadowsocks 没有流量伪装，新版 Xray 已对它给出弃用警告；建议只用于中转或落地，跨境直连改用 REALITY 系协议。" \
+                        "Shadowsocks has no disguise and current Xray prints a deprecation warning for it; keep it for relay or landing hops.")" \
+                    "$(t2 "无需操作，节点可继续使用。" "No action needed; the node keeps working.")"
+                ;;
+        esac
+    done
+
+    if [[ -n "$pinned_nodes" ]]; then
+        upgrade_add links.pin info \
+            "$(t2 "Hysteria2 分享链接已加入证书指纹：$pinned_nodes" "Hysteria2 share links now pin the certificate: $pinned_nodes")" \
+            "$(t2 "Xray 内核的客户端自 2026-06-01 起不再接受只带 insecure 的自签名链接，新链接多了 pinSHA256。" \
+                "Clients on an Xray core stopped accepting insecure-only links for self-signed nodes on 2026-06-01; new links add pinSHA256.")" \
+            "$(t2 "服务端无需改动。客户端连不上时，在主菜单「查看节点信息」里重新复制链接即可。" \
+                "Nothing changes on the server. If a client cannot connect, copy the link again from the node info view.")"
+    fi
+}
+
+# 当前扫描结果的指纹：ID 集合排序后的 SHA-256。用于记住用户已经看过哪一批。
+upgrade_findings_digest() {
+    (( ${#UPG_IDS[@]} > 0 )) || return 0
+    printf '%s\n' "${UPG_IDS[@]}" | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+# 记住"这一批已处理/已知悉"，之后只有出现新的项才再次提示。
+upgrade_ack_save() {
+    upgrade_scan
+    upgrade_findings_digest >"$UPGRADE_STATE_FILE" 2>/dev/null || return 0
+    chmod 600 "$UPGRADE_STATE_FILE" 2>/dev/null || true
+}
+
+# 是否存在用户还没看过的可升级项（会先执行一次扫描）。状态文件按不可信输入处理。
+upgrade_pending() {
+    local digest acked=""
+    upgrade_scan
+    (( ${#UPG_IDS[@]} > 0 )) || return 1
+    digest=$(upgrade_findings_digest)
+    if [[ -f "$UPGRADE_STATE_FILE" && ! -L "$UPGRADE_STATE_FILE" ]]; then
+        read -r acked <"$UPGRADE_STATE_FILE" 2>/dev/null || acked=""
+        acked="${acked//[^0-9a-f]/}"
+    fi
+    [[ "$digest" != "$acked" ]]
+}
+
+# 分组打印扫描结果。Usage: upgrade_print_findings [with_selection]
+upgrade_print_findings() {
+    local with_selection="${1:-}" class index number=0 box header shown
+    for class in safe relink info; do
+        shown=0
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_CLASS[$index]}" == "$class" ]] || continue
+            if (( shown == 0 )); then
+                case "$class" in
+                    safe) header="${GREEN}$(t2 "推荐 · 客户端无需任何改动" "Recommended · nothing changes for clients")${NC}" ;;
+                    relink) header="${YELLOW}$(t2 "可选 · 客户端需要重新导入链接" "Optional · clients must re-import the link")${NC}" ;;
+                    *) header="${BLUE}$(t2 "提示 · 无需操作" "Notes · no action needed")${NC}" ;;
+                esac
+                echo ""
+                echo -e "  $header"
+                shown=1
+            fi
+            if [[ "$class" == "info" ]]; then
+                echo -e "   ${BLUE}·${NC} ${UPG_TITLE[$index]}"
+            else
+                number=$((number + 1))
+                box=""
+                if [[ -n "$with_selection" ]]; then
+                    if [[ "${UPG_SEL[$index]}" == 1 ]]; then box="${GREEN}[x]${NC} "; else box="[ ] "; fi
+                fi
+                echo -e "   ${box}${GREEN}${number}.${NC} ${UPG_TITLE[$index]}"
+            fi
+            menu_note "${UPG_NOTE[$index]}" "${UPG_COST[$index]}"
+        done
+    done
+}
+
+# 第 N 个可选择项（safe / relink，按显示顺序编号）对应的数组下标。
+upgrade_index_of_number() {
+    local want="$1" class index number=0
+    for class in safe relink; do
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_CLASS[$index]}" == "$class" ]] || continue
+            number=$((number + 1))
+            if (( number == want )); then
+                printf '%s' "$index"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# 只读列出可升级项（CLI: upgrade check）。
+cmd_upgrade_check() {
+    upgrade_scan
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "协议 / 内核升级检查" "Protocol / core upgrade check")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    if (( ${#UPG_IDS[@]} == 0 )); then
+        echo ""
+        echo -e "  ${GREEN}$(t2 "没有可升级项：节点与内核都已是当前写法。" "Nothing to upgrade: nodes and cores are current.")${NC}"
+        echo ""
+        return 0
+    fi
+    upgrade_print_findings
+    echo ""
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+    echo -e "  $(t2 "进入升级向导" "Open the upgrade wizard"): ${YELLOW}bash $0 upgrade${NC}"
+    echo ""
+}
+
+# ---- 执行 ----
+
+declare -ga UPG_DONE=() UPG_FAILED=() UPG_RELINK_NODES=()
+
+# 快照节点文件与两个内核的配置，输出快照目录。节点改动失败时据此整体回滚；成功后
+# 也保留最近 5 份，万一新链接在客户端上有问题，还能手工找回旧参数。
+upgrade_snapshot() {
+    local dir stale file
+    dir="$UPGRADE_BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -p -- "$dir/nodes" || return 1
+    chmod 700 -- "$UPGRADE_BACKUP_ROOT" "$dir" || return 1
+    for file in "$NODES_DIR"/*.env; do
+        [[ -f "$file" ]] || continue
+        cp -p -- "$file" "$dir/nodes/" || return 1
+    done
+    [[ -f "$XRAY_CONF" ]] && { cp -p -- "$XRAY_CONF" "$dir/xray-config.json" || return 1; }
+    [[ -f "$SINGBOX_CONF" ]] && { cp -p -- "$SINGBOX_CONF" "$dir/sing-box-config.json" || return 1; }
+    while IFS= read -r stale; do
+        [[ -n "$stale" && "$stale" == "$UPGRADE_BACKUP_ROOT"/* ]] && rm -rf -- "$stale"
+    done < <(ls -1dt -- "$UPGRADE_BACKUP_ROOT"/*/ 2>/dev/null | tail -n +6)
+    printf '%s\n' "$dir"
+}
+
+# 把节点文件恢复成快照里的内容。升级不增删节点，只需按文件覆盖回去。
+upgrade_restore() {
+    local dir="$1" file
+    [[ -d "$dir/nodes" ]] || return 1
+    for file in "$dir"/nodes/*.env; do
+        [[ -f "$file" ]] || continue
+        cp -p -- "$file" "$NODES_DIR/" || return 1
+    done
+}
+
+# 自动测速并挑出一个新的 REALITY 目标（按延迟 + ASN/CDN 评分），输出域名。
+upgrade_pick_sni() {
+    local -A upg_latency=()
+    local -a upg_domains=() upg_latencies=()
+    test_domains_parallel upg_latency >/dev/null 2>&1 || true
+    (( ${#upg_latency[@]} > 0 )) || return 1
+    rank_sni_candidates upg_latency upg_domains upg_latencies
+    [[ -n "${upg_domains[0]:-}" ]] || return 1
+    printf '%s' "${upg_domains[0]}"
+}
+
+# 对一个节点执行一种升级并写回节点文件（不重建配置，由调用方统一重建）。
+# Usage: upgrade_apply_node NODE KIND
+upgrade_apply_node() {
+    local node="$1" kind="$2" proto new_sni
+    CURRENT_NODE_NAME="$node"
+    load_node_for_edit || return 1
+    # 很旧的节点文件没有 PROTOCOL_TYPE。save_env 会把缺失值写成 vision，那样一个靠
+    # 端口推断出来的 both / xhttp 节点会在重存时被改成 vision，所以先把类型定下来。
+    proto=$(upgrade_node_protocol "$(get_node_file "$node")")
+    PROTOCOL_TYPE="$proto"
+
+    case "$kind" in
+        sni)
+            new_sni=$(upgrade_pick_sni) || return 1
+            reality_target_discouraged "$new_sni" && return 1
+            SNI="$new_sni"
+            ;;
+        port443)
+            is_port_free 443 tcp && ! node_tcp_port_claimed 443 || return 1
+            if [[ "$proto" == "xhttp" ]]; then XHTTP_PORT=443; else PORT=443; fi
+            ;;
+        split)
+            [[ "$proto" == "both" ]] || return 1
+            gen_xhttp_credentials >/dev/null 2>&1 || return 1
+            ;;
+        vlessenc)
+            xray_supports vlessenc || return 1
+            gen_vlessenc_keys x25519 || return 1
+            ;;
+        hy2obfs)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16) || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    save_env
+}
+
+upgrade_mark_done() { UPG_DONE+=("$1"); }
+upgrade_mark_failed() { UPG_FAILED+=("$1"); }
+
+# 执行选中的升级项。结果写入 UPG_DONE / UPG_FAILED / UPG_RELINK_NODES；有任何一项
+# 失败时返回非零，但一项失败不会中断其余无关的项。
+#
+# 顺序固定为：内核 → 节点与配置 → 系统项。先更新内核，后面的配置才能用上新字段；
+# 所有节点改动合并成一次配置重建，重建或重启失败时用快照整体恢复节点文件并再次
+# 重建，保证不会留下"节点文件是新的、运行中的配置是旧的"这种半完成状态。
+# Usage: upgrade_apply ID...
+upgrade_apply() {
+    local id node kind snapshot="" need_regen=0 regen_requested=0 svc rc
+    local -a node_ids=() applied_ids=()
+    UPG_DONE=() UPG_FAILED=() UPG_RELINK_NODES=()
+    (( $# > 0 )) || return 0
+
+    # ---- 1. 内核 ----
+    for id in "$@"; do
+        case "$id" in
+            core.xray)
+                log_info "$(t2 "正在更新 Xray..." "Updating Xray...")"
+                if XRAY_CHANNEL=stable cmd_xray_update; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                XRAY_CAPS=""
+                ;;
+            core.singbox)
+                log_info "$(t2 "正在更新 sing-box..." "Updating sing-box...")"
+                if singbox_install_release update; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+            node.*) node_ids+=("$id") ;;
+            cfg.reality-fields) regen_requested=1 ;;
+        esac
+    done
+
+    # ---- 2. 节点与配置 ----
+    if (( ${#node_ids[@]} > 0 || regen_requested == 1 )); then
+        if ! snapshot=$(upgrade_snapshot); then
+            log_error "$(t2 "无法创建升级前快照，已跳过所有节点改动" "Could not snapshot the nodes; node changes were skipped")"
+            for id in ${node_ids[@]+"${node_ids[@]}"}; do upgrade_mark_failed "$id"; done
+            (( regen_requested == 1 )) && upgrade_mark_failed cfg.reality-fields
+        else
+            log_info "$(t2 "升级前快照" "Pre-upgrade snapshot"): $snapshot"
+            need_regen=$regen_requested
+            for id in ${node_ids[@]+"${node_ids[@]}"}; do
+                node="${id#node.}"
+                kind="${node##*.}"
+                node="${node%.*}"
+                if upgrade_apply_node "$node" "$kind"; then
+                    applied_ids+=("$id")
+                    need_regen=1
+                else
+                    upgrade_mark_failed "$id"
+                fi
+            done
+            if (( need_regen == 1 )); then
+                if cmd_regenerate; then
+                    for id in ${applied_ids[@]+"${applied_ids[@]}"}; do
+                        upgrade_mark_done "$id"
+                        node="${id#node.}"
+                        node="${node%.*}"
+                        [[ " ${UPG_RELINK_NODES[*]:-} " == *" $node "* ]] || UPG_RELINK_NODES+=("$node")
+                        if [[ "$id" == *.port443 ]]; then
+                            CURRENT_NODE_NAME="$node"
+                            load_node_for_edit && open_node_firewall_ports "$(upgrade_node_protocol "$(get_node_file "$node")")"
+                        fi
+                    done
+                    if (( regen_requested == 1 )); then
+                        if jq -e '[.inbounds[]?.streamSettings.realitySettings // empty
+                                | select(has("dest") or has("fingerprint"))] | length == 0' "$XRAY_CONF" >/dev/null 2>&1; then
+                            upgrade_mark_done cfg.reality-fields
+                        else
+                            upgrade_mark_failed cfg.reality-fields
+                        fi
+                    fi
+                else
+                    log_error "$(t2 "新配置未能生效，正在恢复升级前的节点" "The new configuration did not come up; restoring the nodes as they were")"
+                    if upgrade_restore "$snapshot" && cmd_regenerate; then
+                        log_warn "$(t2 "已恢复到升级前状态，节点与分享链接均未改变" "Restored: nodes and share links are unchanged")"
+                    else
+                        log_error "$(t2 "自动恢复失败，请从快照手工恢复" "Automatic restore failed; recover manually from the snapshot"): $snapshot"
+                    fi
+                    for id in ${applied_ids[@]+"${applied_ids[@]}"}; do upgrade_mark_failed "$id"; done
+                    (( regen_requested == 1 )) && upgrade_mark_failed cfg.reality-fields
+                fi
+            fi
+        fi
+    fi
+
+    # ---- 3. 系统项 ----
+    for id in "$@"; do
+        case "$id" in
+            svc.hardening)
+                local hardened=0 reverted=0
+                for svc in xray "$SINGBOX_SERVICE"; do
+                    rc=0
+                    service_hardening_ensure "$svc" force || rc=$?
+                    (( rc == 0 )) && hardened=1
+                    (( rc == 2 )) && reverted=1
+                done
+                if (( hardened == 1 && reverted == 0 )); then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+            geodata.cron)
+                if install_geodata_helper && setup_geodata_cron && ! geodata_cron_is_legacy; then
+                    upgrade_mark_done "$id"
+                else
+                    upgrade_mark_failed "$id"
+                fi
+                ;;
+            sysctl.template)
+                if sysctl_tuning_apply; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+        esac
+    done
+
+    (( ${#UPG_FAILED[@]} == 0 ))
+}
+
+# 某个 ID 在最近一次扫描里的标题（找不到时回退为 ID 本身）。
+upgrade_title_of() {
+    local index
+    for index in "${!UPG_IDS[@]}"; do
+        if [[ "${UPG_IDS[$index]}" == "$1" ]]; then
+            printf '%s' "${UPG_TITLE[$index]}"
+            return 0
+        fi
+    done
+    printf '%s' "$1"
+}
+
+# 打印执行结果；改过链接的节点逐个给出新的节点信息与分享链接。
+upgrade_print_result() {
+    local id node
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "升级结果" "Upgrade result")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    for id in ${UPG_DONE[@]+"${UPG_DONE[@]}"}; do
+        echo -e "  ${GREEN}✓${NC} $(upgrade_title_of "$id")"
+    done
+    for id in ${UPG_FAILED[@]+"${UPG_FAILED[@]}"}; do
+        echo -e "  ${RED}✗${NC} $(upgrade_title_of "$id")  ${GRAY}($(t2 "未生效，原状态已保留" "not applied; the previous state was kept"))${NC}"
+    done
+    if (( ${#UPG_RELINK_NODES[@]} > 0 )); then
+        echo ""
+        echo -e "  ${YELLOW}$(t2 "以下节点的分享链接已改变，请在客户端删除旧节点并重新导入：" \
+            "The share links of these nodes changed. Remove the old entry in your client and import again:")${NC}"
+        for node in "${UPG_RELINK_NODES[@]}"; do
+            CURRENT_NODE_NAME="$node"
+            show_info
+        done
+    fi
+    echo ""
+}
+
+# 非交互执行（CLI: upgrade apply recommended|all|ID,ID...）。
+cmd_upgrade_apply() {
+    local spec="${1:-recommended}" index id found rc=0
+    local -a wanted=() selected=()
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    upgrade_scan
+    case "$spec" in
+        recommended|safe)
+            for index in "${!UPG_IDS[@]}"; do
+                [[ "${UPG_CLASS[$index]}" == "safe" ]] && selected+=("${UPG_IDS[$index]}")
+            done
+            ;;
+        all)
+            for index in "${!UPG_IDS[@]}"; do
+                [[ "${UPG_CLASS[$index]}" != "info" ]] && selected+=("${UPG_IDS[$index]}")
+            done
+            ;;
+        *)
+            IFS=',' read -r -a wanted <<<"$spec"
+            for id in "${wanted[@]}"; do
+                found=0
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_IDS[$index]}" == "$id" && "${UPG_CLASS[$index]}" != "info" ]]; then
+                        selected+=("$id")
+                        found=1
+                    fi
+                done
+                if (( found == 0 )); then
+                    log_error "$(t2 "不是当前可执行的升级项" "Not an applicable upgrade item"): $id"
+                    return 1
+                fi
+            done
+            ;;
+    esac
+    if (( ${#selected[@]} == 0 )); then
+        log_info "$(t2 "没有需要执行的升级项" "Nothing to apply")"
+        return 0
+    fi
+    upgrade_apply "${selected[@]}" || rc=$?
+    upgrade_print_result
+    upgrade_ack_save
+    return "$rc"
+}
+
+# ---- 向导界面 ----
+
+# 交互式升级向导。界面只做三件事：把每一项讲清楚、让用户勾选、确认后执行。
+# 默认状态下直接回车就是"执行全部推荐项"，这些项都不需要动客户端；会改变分享链接
+# 的项必须由用户主动勾选，并在执行前再确认一次。
+cmd_upgrade_wizard() {
+    local answer="" token index selected_count relink_selected rc=0
+    local -a selected=() relink_titles=()
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    upgrade_scan
+    if (( ${#UPG_IDS[@]} == 0 )) || ! tty_available; then
+        # 没有可升级项，或没有终端可以提问：退化为只读报告。
+        cmd_upgrade_check
+        if (( ${#UPG_IDS[@]} > 0 )); then
+            echo -e "  $(t2 "无人值守执行推荐项" "Apply the recommended items unattended"): ${YELLOW}bash $0 upgrade apply recommended${NC}"
+            echo ""
+        fi
+        return 0
+    fi
+
+    while true; do
+        selected_count=0
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_SEL[$index]}" == 1 ]] && selected_count=$((selected_count + 1))
+        done
+        {
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}        $(t2 "协议 / 内核升级向导" "Protocol / core upgrade wizard")${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        menu_note "$(t2 "这台机器上有用旧版脚本创建的节点或旧版内核。下面逐项说明可以升级什么、为什么、有什么代价。" \
+            "This server has nodes or cores created by an older script. Each item below says what can be upgraded, why, and what it costs.")" \
+            "$(t2 "[x] 表示已勾选。直接回车会执行已勾选的项；在你确认之前不会改动任何东西。" \
+            "[x] means selected. Enter applies the selected items; nothing changes until you confirm.")" \
+            "$(t2 "节点改动会先做快照，新配置起不来时自动恢复原样。" \
+            "Node changes are snapshotted first and restored automatically if the new configuration fails to start.")"
+        upgrade_print_findings with_selection
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}$(t2 "回车" "Enter")${NC}  $(t2 "执行已勾选的 $selected_count 项" "apply the $selected_count selected item(s)")"
+        echo -e "  ${GREEN}$(t2 "数字" "number")${NC}  $(t2 "切换勾选，可一次输入多个，如 2 5" "toggle an item; several at once, e.g. 2 5")"
+        echo -e "  ${GREEN}r${NC}     $(t2 "只勾选推荐项（默认）" "select only the recommended items (default)")"
+        echo -e "  ${GREEN}a${NC}     $(t2 "全部勾选（含需要重新导入链接的项）" "select everything, including items that change links")"
+        echo -e "  ${GREEN}n${NC}     $(t2 "全部取消" "clear the selection")"
+        echo -e "  ${GREEN}q${NC}     $(t2 "退出，不做任何改动" "quit without changing anything")"
+        echo ""
+        echo -n "  > "
+        } | tty_print
+        tty_read answer
+
+        case "$answer" in
+            q|Q|0)
+                log_info "$(t2 "已退出，未做任何改动" "Left the wizard; nothing was changed")"
+                return 0
+                ;;
+            r|R)
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_CLASS[$index]}" == "safe" ]]; then UPG_SEL[$index]=1; else UPG_SEL[$index]=0; fi
+                done
+                continue
+                ;;
+            a|A)
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_CLASS[$index]}" != "info" ]]; then UPG_SEL[$index]=1; fi
+                done
+                continue
+                ;;
+            n|N)
+                for index in "${!UPG_IDS[@]}"; do UPG_SEL[$index]=0; done
+                continue
+                ;;
+            "") ;;
+            *)
+                for token in ${answer//,/ }; do
+                    if [[ "$token" =~ ^[0-9]{1,3}$ ]] && index=$(upgrade_index_of_number "$((10#$token))"); then
+                        UPG_SEL[$index]=$(( 1 - UPG_SEL[index] ))
+                    else
+                        echo -e "  ${RED}$(t2 "无法识别的输入" "Unrecognised input"): $token${NC}" | tty_print
+                    fi
+                done
+                continue
+                ;;
+        esac
+
+        # ---- 回车：汇总并确认 ----
+        selected=()
+        relink_titles=()
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_SEL[$index]}" == 1 && "${UPG_CLASS[$index]}" != "info" ]] || continue
+            selected+=("${UPG_IDS[$index]}")
+            [[ "${UPG_CLASS[$index]}" == "relink" ]] && relink_titles+=("${UPG_TITLE[$index]}")
+        done
+        if (( ${#selected[@]} == 0 )); then
+            {
+            echo ""
+            echo -e "  ${YELLOW}$(t2 "没有勾选任何项。" "Nothing is selected.")${NC}"
+            echo -n "  $(t2 "以后不再提示这些项? [y/N]" "Stop reminding about these items? [y/N]"): "
+            } | tty_print
+            tty_read answer
+            if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+                upgrade_ack_save
+            fi
+            return 0
+        fi
+        if (( ${#relink_titles[@]} > 0 )); then
+            {
+            echo ""
+            echo -e "  ${YELLOW}$(t2 "注意：下面这些改动会让对应节点的旧分享链接失效，客户端必须重新导入：" \
+                "Note: these changes invalidate the old share links; clients must import the new ones:")${NC}"
+            for token in "${relink_titles[@]}"; do
+                echo -e "   ${YELLOW}·${NC} $token"
+            done
+            menu_note "$(t2 "执行完成后会直接显示新的链接与二维码所需信息。" \
+                "The new links are shown as soon as the upgrade finishes.")"
+            echo -n "  $(t2 "确认执行? [y/N]" "Go ahead? [y/N]"): "
+            } | tty_print
+            tty_read answer
+            if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+                continue
+            fi
+        fi
+        break
+    done
+
+    upgrade_apply "${selected[@]}" || rc=$?
+    upgrade_print_result
+    upgrade_ack_save
+    return "$rc"
+}
+
+# 打开交互菜单时调用：机器上有还没看过的可升级项，就先问一句。
+# 提问只出现一次——选择"不再提示"或走完向导都会记下这一批；之后只有出现新的可升级
+# 项（例如脚本更新带来新的安全基线）才会再问。任何时候都能从主菜单 P 进入向导。
+upgrade_startup_prompt() {
+    local answer="" index safe_count=0 relink_count=0 info_count=0
+    is_root || return 0
+    tty_available || return 0
+    upgrade_pending || return 0
+    for index in "${!UPG_IDS[@]}"; do
+        case "${UPG_CLASS[$index]}" in
+            safe) safe_count=$((safe_count + 1)) ;;
+            relink) relink_count=$((relink_count + 1)) ;;
+            *) info_count=$((info_count + 1)) ;;
+        esac
+    done
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "发现可以升级的协议 / 内核" "Protocol / core upgrades are available")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    menu_note "$(t2 "这台机器上的节点或内核是旧版脚本创建的，新版脚本可以帮你升级：" \
+        "The nodes or cores on this server were set up by an older script. This version can upgrade them:")"
+    (( safe_count > 0 )) && echo -e "   ${GREEN}·${NC} $(t2 "$safe_count 项推荐升级（客户端无需任何改动）" "$safe_count recommended (nothing changes for clients)")"
+    (( relink_count > 0 )) && echo -e "   ${YELLOW}·${NC} $(t2 "$relink_count 项可选升级（客户端需要重新导入链接）" "$relink_count optional (clients must re-import the link)")"
+    (( info_count > 0 )) && echo -e "   ${BLUE}·${NC} $(t2 "$info_count 条提示" "$info_count note(s)")"
+    echo ""
+    echo -e "  ${GREEN}$(t2 "回车" "Enter")${NC}  $(t2 "查看详情并选择要升级的项（推荐）" "review the details and choose what to upgrade (recommended)")"
+    echo -e "  ${GREEN}n${NC}     $(t2 "这次先不处理，下次打开再问" "not now; ask again next time")"
+    echo -e "  ${GREEN}s${NC}     $(t2 "不再提示这些项（之后仍可从主菜单 P 进入）" "do not remind me about these (still reachable from the main menu, P)")"
+    echo ""
+    echo -n "  > "
+    } | tty_print
+    tty_read answer
+    case "$answer" in
+        n|N) return 0 ;;
+        s|S) upgrade_ack_save ;;
+        *) cmd_upgrade_wizard || true ;;
+    esac
+    return 0
+}
+
+# CLI 入口。Usage: cmd_upgrade [check | apply recommended|all|ID,ID...]
+# 不带参数时进入向导。
+cmd_upgrade() {
+    case "${1:-}" in
+        check|--check) cmd_upgrade_check ;;
+        apply|--apply) cmd_upgrade_apply "${2:-recommended}" ;;
+        *) cmd_upgrade_wizard ;;
+    esac
+}
+
 # ============== 系统工具菜单 ==============
 
 cmd_tools() {
@@ -10782,13 +13287,14 @@ cmd_tools() {
         echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
         echo -e "  ${GREEN}8.${NC} $(msg xray_restart_title)"
         echo -e "  ${GREEN}9.${NC} $(msg xray_release_title)"
+        echo -e "  ${GREEN}11.${NC} sing-box $(t2 "版本 / 更新" "Version / Update")"
         echo ""
         echo -e "  ${BLUE}[其他]${NC}"
         echo -e "  ${GREEN}10.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-10]: "
+        echo -n "  $(msg menu_choice) [0-11]: "
         read -r choice
 
         case "$choice" in
@@ -10801,6 +13307,7 @@ cmd_tools() {
             7) cmd_logs ;;
             8) cmd_xray_restart ;;
             9) cmd_xray_release_menu ;;
+            11) cmd_singbox_release_menu ;;
             10)
                 install_standalone_tools
                 echo ""
@@ -10844,6 +13351,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}N.${NC} $(msg netstack_title)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}P.${NC} $(t2 "协议 / 内核升级向导                                      " \
+        "Protocol / core upgrade wizard                           ")${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${MAGENTA}L.${NC} $(msg menu_lang)                                            ${CYAN}║${NC}"
@@ -10855,9 +13364,12 @@ show_menu() {
 }
 
 main_menu() {
+    # 旧版脚本留下的节点或内核有可升级项时，进菜单前先提示一次。
+    upgrade_startup_prompt
+
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,P,L,U]: "
         read -r choice
         echo ""
 
@@ -10925,6 +13437,11 @@ main_menu() {
             [Tt])
                 cmd_tools
                 ;;
+            [Pp])
+                cmd_upgrade || true
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Ll])
                 select_language
                 ;;
@@ -10965,6 +13482,10 @@ show_help() {
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
     echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
+    echo "  upgrade     Upgrade wizard for nodes and cores set up by an older script"
+    echo "              upgrade check                 list what can be upgraded (read-only)"
+    echo "              upgrade apply recommended     apply items that change nothing for clients"
+    echo "              upgrade apply all|ID,ID       apply everything, or the listed items"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -10980,6 +13501,8 @@ show_help() {
     echo "  xray-restart  Schedule periodic Xray restart (systemd timer or cron)"
     echo "  xray-version  Show installed/stable/prerelease Xray versions"
     echo "  xray-update   Safely update Xray with config test and rollback"
+    echo "  singbox-version  Show installed/stable sing-box versions and the security baseline"
+    echo "  singbox-update   Update sing-box with SHA-256 verification, config check and rollback"
     echo ""
     echo "Other:"
     echo "  menu        Show interactive menu"
@@ -11034,6 +13557,11 @@ show_help() {
     echo "  XRAY_VERSION=v26.7.11           Install an explicit Xray version (highest priority)"
     echo "  xray_channel=stable|prerelease  Lowercase compatibility alias"
     echo "  xray_version=v26.7.11           Lowercase compatibility alias"
+    echo ""
+    echo "sing-box release management:"
+    echo "  SINGBOX_VERSION=v1.14.4         Install an explicit sing-box version with singbox-update"
+    echo "  SINGBOX_SHA256=<hex>            Expected archive digest when the release metadata has none"
+    echo "  SINGBOX_BACKUP_KEEP=3           Number of script-created binary backups to keep"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
@@ -11205,6 +13733,21 @@ case "${1:-}" in
         check_lock_for_write_ops
         cmd_xray_update
         ;;
+    singbox-version)
+        cmd_singbox_version
+        ;;
+    singbox-update)
+        check_lock_for_write_ops
+        cmd_singbox_update
+        ;;
+    upgrade|migrate)
+        # check 是只读的，不占用写锁；其余形式会修改节点与内核。
+        if [[ "${2:-}" != "check" && "${2:-}" != "--check" ]]; then
+            check_lock_for_write_ops
+        fi
+        init_language_if_needed
+        cmd_upgrade "${@:2}"
+        ;;
     ports)
         check_lock_for_write_ops
         init_language_if_needed
@@ -11228,7 +13771,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=436167 body-sha256=fd926be89ee97c5386af0ab14d5c7eee1d8965aa8b13d2d8643441bf2d2f4125
-# build-id=fd926be89ee97c5386af0ab14d5c7eee1d8965aa8b13d2d8643441bf2d2f4125
+# body-bytes=569528 body-sha256=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
+# build-id=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
 # module-count=11
 # proxy-hub-bundle-end-v1

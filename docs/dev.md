@@ -34,20 +34,26 @@ proxy-hub.sh (loader)
 
 | 模块 | 主要职责 |
 | --- | --- |
-| `00_security_state.sh` | 锁、安全下载/配置读取、JSON builder、加密、全局状态与常量 |
+| `00_security_state.sh` | 锁、安全下载/配置读取、JSON builder、加密、全局状态与常量；内核能力探测、安全基线、终端读写接缝 |
 | `10_runtime_platform_ui.sh` | 生命周期、日志与输入 UI、包管理器/init/service 适配、i18n、节点目录 |
 | `15_xray_release.sh` | Xray release 查询、选择、校验、安装/更新事务、备份与恢复 |
-| `20_installers_restart.sh` | sing-box、GeoData 安装、Xray service 衔接与代理内核定时重启 |
+| `20_installers_restart.sh` | sing-box 安装入口与服务定义、Hysteria2 端口跳跃、带校验的 GeoData 更新、Xray service 衔接与代理内核定时重启 |
 | `30_provision_network.sh` | 协议选择、凭据/transport-aware 端口生成、IP、证书与 SNI 探测 |
 | `40_config_share.sh` | Xray/sing-box 配置渲染、校验、同步、节点持久化、分享链接与二维码 |
 | `50_node_commands.sh` | 节点 install/info/list/edit/remove/health/update 等命令编排 |
-| `60_system_tools.sh` | WARP、BBR、Swap、Fail2ban |
+| `60_system_tools.sh` | 安装时的可选增强（后量子、Hysteria2 加固）与引导菜单、sing-box release 管理、WARP、BBR、Swap、Fail2ban |
 | `70_ports_logs.sh` | SSH/代理端口与日志管理、独立工具命令安装 |
-| `80_timesync.sh` | 容器识别与时间同步管理 |
+| `80_timesync.sh` | 容器识别与时间同步管理、服务沙箱加固、协议/内核升级向导 |
 | `90_main.sh` | 工具菜单、主菜单、帮助、初始化和 CLI dispatch |
 
 模块编号就是装载顺序，也是依赖方向。不得让低编号模块在 source 阶段调用尚未
 定义的高编号模块；模块之间仍共享一个 Bash 进程和全局命名空间。
+
+模块数量与单模块行数都有结构测试把关（`lib/` 顶层不超过 12 个文件，每个模块少于
+1500 行），而 `10_`、`15_` 已贴近上限。因此新功能按"哪里还有空间且运行期才被调用"
+落位，文件名不再完全覆盖其职责——`60_` 与 `80_` 的职责以上表为准。`cmd_install`
+（`50_`）在运行期调用 `60_`、`80_` 中的函数是允许的：禁止的只是 source 阶段的反向
+调用。测试若只 source 到 `50_` 又要驱动真实的 `cmd_install`，需要一并 source `60_`。
 
 ## 四分支语义移植设计
 
@@ -138,6 +144,105 @@ Hysteria2 两者都没有。这两个事实叠加，会产生两类缺陷：
 `save_env` 另以 `${VAR:-}` 兜底。回归覆盖见 `tests/test_remote_branch_features.sh`
 的 `node-state-contract`，它刻意使用真实 `save_env`——把 `save_env` 打桩正是当初
 让该缺陷逃过测试的原因。
+
+## 协议刷新（2026-11）
+
+这一轮把协议层从"2025 年中的写法"带到当前上游状态，同时保证两件事：既有节点不被
+悄悄改变，新功能不抬高使用门槛。
+
+### 内核能力探测，而不是版本号比较
+
+普通 `install` 不替换健康的既有内核，所以渲染配置时不能假设 binary 认识新字段。
+`xray_supports` 读取 `xray help` 列出的子命令：有 `mldsa65` 命令即支持 ML-DSA-65，
+并据此判定 `realitySettings.target` 可用（该别名早于这个命令出现）；有 `vlessenc`
+命令即支持 VLESS Encryption。binary 缺失或无法执行时一律按"不支持"，产物退回旧写法。
+探测结果按 binary 的 inode/大小/mtime 缓存，`xray-update` 之后自动失效；
+`write_config` 在父 shell 预热一次，因为各 builder 都跑在命令替换的子 shell 里。
+
+两个方向的失败策略不同：内核不认识的**通用字段**退回旧写法（`dest`）；节点**显式
+启用**了某能力（`MLDSA65_SEED`、`VLESS_DECRYPTION`）而内核不支持时，配置生成失败。
+后者如果静默丢字段，会让所有按新参数配置的客户端连不上，且服务端毫无提示。
+
+### 新字段全部可选、缺省即旧行为
+
+节点文件新增的字段见 `docs/api.md`。每一个都满足"缺失时渲染结果与新增之前逐字段
+一致"：没有 `XHTTP_*` 的 `both` 节点继续共用凭据，没有 `EXTRA_SHORT_IDS` 的节点仍是
+单元素 `shortIds`，没有 `HY2_*` 的 Hysteria2 节点仍是自签名 + masquerade。因此不存在
+"节点文件迁移"这一步，升级向导改的是节点的**参数**而不是文件格式。
+
+### 引导菜单与"推荐的随机化配置"
+
+新增选项的交互遵循同一套规则，目的是让不熟悉协议的人也能直接用：
+
+1. 每个选项下面用一两行写明"它做什么"和"代价是什么"（`menu_note`）。
+2. 复杂功能提供预设方案，方案所需的全部参数由脚本随机生成（混淆密码、端口跳跃
+   范围、密钥对、新的伪装域名），用户不需要自己想一个值。
+3. 回车总是落在推荐项上；只有"自定义"才逐项提问，且每一问也有回车默认值。
+4. 只要调用方用 `proto=` 或任一增强变量驱动安装，就不出现任何新提问，增强项默认
+   关闭——既有无人值守脚本的行为不变。没有控制终端时同样不提问、按默认处理。
+
+新菜单经 `tty_available` / `tty_print` / `tty_read` 与终端对话，不再各自写死
+`/dev/tty`。`PROXY_HUB_TTY_FD` 与 `PROXY_HUB_TTY_OUT` 是测试接缝，让向导逻辑能在
+没有终端的沙箱里被完整驱动；它们不是面向用户的配置。新文案用 `t2 "中文" "English"`
+在调用点成对给出，因为 `msg()` 所在模块已无空间容纳新的映射。
+
+### REALITY 目标选择
+
+候选列表移除 Apple / iCloud 系域名（Xray 自 v26.3.27 起对其告警），手工指定时只告警
+不拦截。测速在本机 openssl 支持时要求 TLS 1.3。延迟最低的一批候选再经一次批量 ASN
+查询重排：与服务器同 ASN 的排最前，通用 CDN 的排最后。查询走 Team Cymru whois 的
+bash `/dev/tcp`，不引入依赖；43 端口不通时静默退回纯延迟排序，`SNI_ASN_CHECK=0` 可
+关闭。`rank_sni_candidates` 的局部变量统一加 `_rk_` 前缀——它通过 nameref 读写调用方
+的数组，同名局部变量会让引用悄悄落到自己身上。
+
+### Hysteria2 端口跳跃
+
+服务端只监听一个 UDP 端口，跳跃靠 NAT 重定向。规则放在专用链
+`PROXY_HUB_HY2_HOP`，每次同步先拆后建，因此幂等且不触碰用户自己的规则。iptables
+规则重启即丢，所以生成一个 helper，由 sing-box 服务启动前调用（systemd drop-in 或
+OpenRC `start_pre`）。同步在 IPv4 上失败即整体失败：分享链接已声明 `mport`，规则没
+下发会让客户端跳到无人接收的端口上；缺少 IPv6 NAT 表只影响 IPv6 的跳跃。
+
+### sing-box Release 与 Xray 的差别
+
+目标一致（未通过官方 SHA-256 的归档不被执行，替换失败能回到旧 binary），实现刻意
+更轻：没有持久 journal 与崩溃恢复。理由是 sing-box 的替换只有一步同目录 rename，任何
+时刻该路径上要么是旧 binary 要么是新 binary；rename 之后的失败由内存里的备份路径
+回滚。被 `SIGKILL` 打断时可能留下一个 `.sing-box.new.*` 暂存文件或一份备份，不会留下
+半个 binary。完整顺序见 `docs/api.md`。
+
+### 服务沙箱加固
+
+通过 drop-in 而不是改 unit：Xray 的 unit 由带 managed marker 的原子发布逻辑管理，往里
+加指令会破坏"是否为脚本管理内容"的判定。两条约束决定了实现——需要挂载命名空间的
+指令在 LXC/OpenVZ 里常以 226/NAMESPACE 失败，所以容器里只下发不依赖命名空间的核心
+集合；即便如此也无法穷举宿主环境，所以加固只对已经在运行的服务下发，重启后确认
+active，否则删除 drop-in、再次重启并写跳过标记。安装流程因此在健康门**之后**才加固，
+加固失败不影响安装结果。端口跳跃 helper 在 systemd ≥ 231 上以 `+` 前缀运行，使其
+不受沙箱限制、仍能加载 NAT 内核模块。
+
+### 升级向导
+
+三层：`upgrade_scan`（离线只读，产出带分类与说明的可升级项）、`upgrade_apply`
+（执行）、`cmd_upgrade_wizard` / `upgrade_startup_prompt`（界面）。可升级项清单、
+分类与触发条件是对外契约，见 `docs/api.md`。几个不可交换的设计点：
+
+- **按"对客户端的代价"分类，而不是按技术领域。** 用户真正需要回答的只有一个问题：
+  这一项执行后我要不要去动客户端。`safe` 默认勾选、`relink` 默认不勾选且二次确认，
+  所以"直接回车"永远不会让任何客户端断线。
+- **顺序固定为内核 → 节点与配置 → 系统项。** 先更新内核，后面的配置重建才能用上
+  新字段；加固放最后，是因为它要对"已经用新配置跑起来"的服务做验证。
+- **节点改动合并成一次重建，并以快照兜底。** 重建或重启失败时恢复节点文件并再次
+  重建，保证不留下"节点文件是新的、运行中的配置是旧的"的半完成状态。
+- **提示只出现一次。** 走完向导或选择"不再提示"都会记下这一批的指纹；只有出现
+  新的可升级项才再次提示。退出向导（`q`）不记录，下次仍会问。
+- **扫描不联网。** 它在每次打开菜单时运行，所以只比较本地版本与内置基线，不查询
+  "是否有更新的 release"；后者属于 `xray-version` / `singbox-version`。
+
+没有做的事也在这里说明：现有节点的 shortId 长度不作为可升级项（轮换会让客户端
+断线，换来的收益可以忽略）；ML-DSA-65 不在向导里提供（它依赖目标证书大小，且链接
+无法扫码，留给安装时显式选择）；Hysteria2 没有迁到 Xray 原生实现（上线时间尚短，
+继续由 sing-box 承载）。
 
 ## 网络栈（IPv4 / IPv6）选择
 
@@ -439,10 +544,20 @@ bash tests/test_ssh_rollback.sh
 bash tests/test_remote_branch_features.sh
 bash tests/test_firewall_protocols.sh
 bash tests/test_netstack.sh
+bash tests/test_protocol_refresh.sh
+bash tests/test_upgrade.sh
 bash tests/test_xray_release.sh
 bash tests/test_xray_transaction.sh
 git diff --check
 ```
+
+`test_protocol_refresh.sh` 用真实的 jq builder 渲染配置。设置
+`PROXY_HUB_TEST_XRAY_BIN` 与 `PROXY_HUB_TEST_SINGBOX_BIN` 指向真实内核时，渲染结果
+还会经过 `xray run -test` 与 `sing-box check`；未设置时这部分断言被跳过并在输出中
+注明。涉及协议字段的改动应当带着真实内核跑一次——字段名写错在 jq 层面是看不出来的。
+
+这一轮的改动对历史基线的差异集中在 `tests/fixtures/protocol-refresh.patch` 一个累计
+补丁里，由 `diff -U0` 对"基线加既有补丁"与当前 bundle 正文生成。
 
 构建器与 loader 使用相同的安全临时父目录规则，并在发布 manifest/dist 以及递归
 清理前重新核对 staging 目录的 owner 与 device/inode identity；同路径被替换时
@@ -490,6 +605,16 @@ identity-bound 的 `.proxy-hub.release.lock`。活跃并发 publisher 会失败�
   `set -u` 下留下未赋值的节点变量；AnyTLS/AnyTLS+REALITY 的 UUID 与 REALITY
   字段划分；同一会话内连续安装不串用上一个节点的凭据；IPv6 Only 主机上
   `SERVER_IP` 回退路径；以及 `reset_node_state` 覆盖 `save_env` 全部写出字段；
+- REALITY 字段名随内核能力切换、shortId 列表、`both` 拆分凭据、ML-DSA-65 与 VLESS
+  Encryption 的渲染/链接/失败关闭、自签名证书算法与指纹链接；
+- Hysteria2 混淆、端口跳跃（范围校验、冲突、专用链幂等、IPv4 失败关闭）与 ACME 在
+  新旧 sing-box 上的两种渲染；
+- 引导菜单的默认项、说明文字、自定义分支的回车默认值，以及脚本化安装不被提问；
+- sing-box release 的摘要缺失/错误/畸形、非官方下载地址、配置被新版本拒绝、启动失败
+  回滚、不自动降级与备份保留；GeoData 校验失败不动现有数据、cron 不堆叠；
+- 服务加固的容器/非容器指令集、失败自动撤销与跳过标记；内核安全基线；
+- 升级扫描的每一类触发条件与只读性、执行顺序、快照与失败恢复、非交互选择的校验，
+  以及向导与启动提示的全部按键路径；
 - 生成 bundle 与历史基线 `8ca0766e66278ce22377ce81040a98c8159d9c6e` 加显式
   安全补丁的逐字等价性。该字节级门限覆盖
   未单独触发的只读/写命令 dispatch、协议实现和旧节点兼容代码，确保它们没有在

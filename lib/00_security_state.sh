@@ -397,12 +397,14 @@ safe_read_config_value() {
 # save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
 reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
-    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
+    XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
+    MLDSA65_SEED="" MLDSA65_VERIFY="" VLESS_DECRYPTION="" VLESS_ENCRYPTION=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -433,9 +435,18 @@ safe_load_node_config() {
     PUBLIC_KEY=$(safe_read_config_value "$file" "PUBLIC_KEY")
     PRIVATE_KEY=$(safe_read_config_value "$file" "PRIVATE_KEY")
     SHORT_ID=$(safe_read_config_value "$file" "SHORT_ID")
+    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
+    XHTTP_UUID=$(safe_read_config_value "$file" "XHTTP_UUID")
+    XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
+    XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
+    XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
+    MLDSA65_SEED=$(safe_read_config_value "$file" "MLDSA65_SEED")
+    MLDSA65_VERIFY=$(safe_read_config_value "$file" "MLDSA65_VERIFY")
+    VLESS_DECRYPTION=$(safe_read_config_value "$file" "VLESS_DECRYPTION")
+    VLESS_ENCRYPTION=$(safe_read_config_value "$file" "VLESS_ENCRYPTION")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -443,6 +454,10 @@ safe_load_node_config() {
     SS_PASSWORD=$(safe_read_config_value "$file" "SS_PASSWORD")
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
+    HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
+    HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
+    HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
+    HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
 
     return 0
 }
@@ -585,8 +600,129 @@ netstack_openssl_family() {
     esac
 }
 
+# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
+# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
+# Usage: t2 "中文" "English"
+t2() {
+    if [[ "${CURRENT_LANG:-zh}" == "en" ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ---- 交互终端读写 ----
+#
+# 新增的引导式菜单统一经过这三个函数与用户对话，而不是各自写死 /dev/tty：
+#   tty_available  当前能否提问（没有控制终端时返回非零，调用方按默认值处理）
+#   tty_print      把一段界面输出到终端（从 stdin 读入内容）
+#   tty_read VAR   读一行输入到变量
+# PROXY_HUB_TTY_FD / PROXY_HUB_TTY_OUT 是测试用的接缝：分别指定读取答案的文件描述符
+# 和界面输出的文件，使菜单逻辑可以在没有终端的测试沙箱里被完整驱动。
+tty_available() {
+    [[ -n "${PROXY_HUB_TTY_FD:-}" ]] || ( : >/dev/tty ) 2>/dev/null
+}
+
+tty_print() {
+    cat >>"${PROXY_HUB_TTY_OUT:-/dev/tty}"
+}
+
+tty_read() {
+    local __tty_line=""
+    if [[ -n "${PROXY_HUB_TTY_FD:-}" ]]; then
+        IFS= read -r -u "$PROXY_HUB_TTY_FD" __tty_line || __tty_line=""
+    else
+        IFS= read -r __tty_line </dev/tty || __tty_line=""
+    fi
+    printf -v "$1" '%s' "$__tty_line"
+}
+
+# 菜单项下方的说明文字：缩进、灰色，每个参数一行。
+# Usage: menu_note "第一行" ["第二行"...]
+menu_note() {
+    local line
+    for line in "$@"; do
+        echo -e "     ${GRAY}${line}${NC}"
+    done
+}
+
+# ============== 内核能力探测 ==============
+#
+# 普通 `install` 发现健康的既有 Xray 时只报告版本、不升级，因此渲染配置时不能假设
+# binary 认识新字段：旧 binary 会在 `xray -test` 阶段拒绝配置，把一次装节点变成安装
+# 失败。这里用 `xray help` 列出的子命令判断能力，而不是比较版本号——子命令是否存在
+# 是 binary 自己的陈述，不依赖我们对发布历史的记忆。
+#   mldsa65  -> REALITY ML-DSA-65 签名；该命令晚于 `target` 别名出现，因此同时用来
+#               判定 `realitySettings.target` 可用
+#   vlessenc -> VLESS Encryption（mlkem768x25519plus）
+# binary 不存在或无法执行时所有能力都按"不支持"处理，产物退回旧写法。
+XRAY_CAPS=""
+XRAY_CAPS_KEY=""
+
+xray_probe_capabilities() {
+    local key="" out="" caps="probed"
+    if [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]]; then
+        key=$(stat -c '%i:%s:%Y' "$XRAY_BIN" 2>/dev/null) || key=""
+    fi
+    if [[ -n "$XRAY_CAPS" && "$key" == "$XRAY_CAPS_KEY" ]]; then
+        return 0
+    fi
+    if [[ -n "$key" ]]; then
+        out=$(timeout 10 "$XRAY_BIN" help 2>/dev/null </dev/null) || out=""
+        [[ "$out" =~ (^|[[:space:]])mldsa65([[:space:]]|$) ]] && caps+=" mldsa65 target"
+        [[ "$out" =~ (^|[[:space:]])vlessenc([[:space:]]|$) ]] && caps+=" vlessenc"
+    fi
+    XRAY_CAPS="$caps"
+    XRAY_CAPS_KEY="$key"
+}
+
+# Usage: xray_supports mldsa65|vlessenc|target
+xray_supports() {
+    xray_probe_capabilities
+    [[ " $XRAY_CAPS " == *" $1 "* ]]
+}
+
+# REALITY 伪装目标的字段名。`dest` 是旧名，新版核心以 `target` 为正式名并保留别名。
+xray_reality_target_key() {
+    if xray_supports target; then
+        printf '%s' target
+    else
+        printf '%s' dest
+    fi
+}
+
+# REALITY shortId 列表以冒号连接（节点文件的安全字符集不含逗号）。每个 ID 必须是
+# 偶数个十六进制字符、最多 16 个；空串表示"客户端可以不填 shortId"，只允许单独出现。
+# Usage: validate_reality_short_ids "id1:id2"
+validate_reality_short_ids() {
+    local list="${1:-}" id
+    local -a ids=()
+    [[ -z "$list" ]] && return 0
+    [[ "$list" != :* && "$list" != *: && "$list" != *::* ]] || return 1
+    IFS=':' read -r -a ids <<<"$list"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9a-fA-F]{2,16}$ ]] || return 1
+        (( ${#id} % 2 == 0 )) || return 1
+    done
+}
+
+# 主 shortId 与附加 shortId 合并成 builder 接受的冒号列表。主 ID 用于分享链接，附加
+# ID 只进入服务端白名单，便于给不同客户端发放可单独吊销的 ID。
+# Usage: reality_short_id_list PRIMARY [EXTRA_LIST]
+reality_short_id_list() {
+    local primary="${1:-}" extra="${2:-}"
+    if [[ -n "$primary" && -n "$extra" ]]; then
+        printf '%s:%s' "$primary" "$extra"
+    else
+        printf '%s' "${primary}${extra}"
+    fi
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
-# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED] [DECRYPTION]
+#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
+#   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
+#   DECRYPTION 非空时启用 VLESS Encryption（`xray vlessenc` 生成的 decryption 串）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -594,6 +730,8 @@ build_vision_inbound() {
     local sni="$4"
     local private_key="$5"
     local short_id="$6"
+    local mldsa65_seed="${7:-}"
+    local decryption="${8:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -607,6 +745,9 @@ build_vision_inbound() {
         --arg short_id "$short_id" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -614,26 +755,27 @@ build_vision_inbound() {
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "tcp",
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build XHTTP inbound JSON using jq (prevents injection)
-# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED] [DECRYPTION]
+#   启用 VLESS Encryption 后 flow 改为 xtls-rprx-vision：Vision 流控原本只能用在
+#   TCP + TLS/REALITY 上，VLESS Encryption 解除了对底层传输的限制。
 build_xhttp_inbound() {
     local name="$1"
     local port="$2"
@@ -642,6 +784,8 @@ build_xhttp_inbound() {
     local private_key="$5"
     local short_id="$6"
     local xhttp_path="$7"
+    local mldsa65_seed="${8:-}"
+    local decryption="${9:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -656,14 +800,17 @@ build_xhttp_inbound() {
         --arg path "$xhttp_path" \
         --arg listen "$(netstack_listen_addr)" \
         --argjson sockopt "$(netstack_sockopt_json)" \
+        --arg target_key "$(xray_reality_target_key)" \
+        --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": $uuid, "flow": ""}],
-                "decryption": "none"
+                "clients": [{"id": $uuid, "flow": (if $decryption == "" then "" else "xtls-rprx-vision" end)}],
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "xhttp",
@@ -671,15 +818,14 @@ build_xhttp_inbound() {
                 "xhttpSettings": {"path": $path},
                 "realitySettings": {
                     "show": false,
-                    "dest": "\($sni):443",
+                    ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id],
-                    "fingerprint": "chrome"
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-        }'
+        } | if $mldsa65_seed != "" then .streamSettings.realitySettings.mldsa65Seed = $mldsa65_seed else . end'
 }
 
 # Build Shadowsocks inbound JSON using jq (prevents injection)
@@ -748,7 +894,7 @@ build_anytls_inbound() {
                     "enabled": true,
                     "handshake": {"server": $sni, "server_port": 443},
                     "private_key": $priv,
-                    "short_id": [$sid]
+                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
                 }
             }') || return 1
     else
@@ -805,8 +951,96 @@ validate_tls_server_name() {
     done
 }
 
+# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
+}
+
+# 已安装的 sing-box 版本号（如 1.14.4）；无法读取时返回非零。
+singbox_installed_version() {
+    local out
+    [[ -x "$SINGBOX_BIN" ]] || return 1
+    out=$(timeout 10 "$SINGBOX_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ sing-box[[:space:]]+version[[:space:]]+([0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# systemd 主版本号（如 252）；不是 systemd 或读不出时返回非零。
+systemd_version() {
+    local line
+    line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$line" =~ ^systemd[[:space:]]+([0-9]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# ---- 内核安全基线 ----
+#
+# 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
+# 基线是"低于它就应该更新"的最低版本，由健康检查和升级向导共用：
+#   Xray     v26.10.31  默认关闭 MPTCP（规避 Linux 内核 IPv4 MPTCP 监听的远程漏洞）；
+#                       v26.10.21 起还移除了内置根证书中的问题证书
+#   sing-box 1.13.16    AnyTLS 默认不再上传客户端元数据
+XRAY_BASELINE_VERSION="26.10.31"
+SINGBOX_BASELINE_VERSION="1.13.16"
+
+# 已安装的 Xray 版本号（如 26.11.9）；无法读取时返回非零。
+xray_installed_version_plain() {
+    local out
+    [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]] || return 1
+    out=$(timeout 10 "$XRAY_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ [Xx]ray[[:space:]]+v?([0-9]+(\.[0-9]+){1,3}) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# 列出低于安全基线的内核，每行 "NAME INSTALLED BASELINE"。只看确实装着的内核；
+# 读不出版本的不算（那是另一类问题，由各自的 release 命令处理）。
+core_baseline_gaps() {
+    local installed
+    if installed=$(xray_installed_version_plain) && ! version_ge "$installed" "$XRAY_BASELINE_VERSION"; then
+        printf 'xray %s %s\n' "$installed" "$XRAY_BASELINE_VERSION"
+    fi
+    if installed=$(singbox_installed_version) && ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+        printf 'sing-box %s %s\n' "$installed" "$SINGBOX_BASELINE_VERSION"
+    fi
+    return 0
+}
+
+# Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
+# inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
+# 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。
+# TLS-ALPN-01 需要 443/tcp，HTTP-01 需要 80/tcp；端口已被本机节点占用的那种挑战
+# 直接关掉，避免证书签发去和 REALITY 入站抢端口。
+# Usage: build_hy2_acme_json NODE_NAME DOMAIN EMAIL DATA_DIR USE_PROVIDER(0|1) NO_ALPN(0|1) NO_HTTP(0|1)
+build_hy2_acme_json() {
+    local name="$1" domain="$2" email="$3" data_dir="$4" use_provider="$5" no_alpn="$6" no_http="$7"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    validate_tls_server_name "$domain" || return 1
+    [[ -z "$email" || "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]] || return 1
+    jq -n \
+        --arg tag "acme-${name}" \
+        --arg domain "$domain" \
+        --arg email "$email" \
+        --arg data_dir "$data_dir" \
+        --argjson use_provider "$use_provider" \
+        --argjson no_alpn "$no_alpn" \
+        --argjson no_http "$no_http" \
+        '({"domain": [$domain], "data_directory": $data_dir}
+            | if $email != "" then . + {"email": $email} else . end
+            | if $no_alpn == 1 then . + {"disable_tls_alpn_challenge": true} else . end
+            | if $no_http == 1 then . + {"disable_http_challenge": true} else . end) as $acme
+        | if $use_provider == 1 then
+            {"tls": {"enabled": true, "server_name": $domain, "certificate_provider": $tag},
+             "provider": ({"type": "acme", "tag": $tag} + $acme)}
+          else
+            {"tls": {"enabled": true, "server_name": $domain, "acme": $acme}, "provider": null}
+          end'
+}
+
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
+#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
+#   伪装站点随之失去意义，因此同时去掉 masquerade。
+#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -814,12 +1048,16 @@ build_hysteria2_inbound() {
     local sni="$4"
     local cert="$5"
     local key="$6"
+    local obfs_password="${7:-}"
+    local tls_json="${8:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
-    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
+    [[ -n "$tls_json" ]] || tls_json=null
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
         --arg tag "${name}_hysteria2" \
@@ -830,24 +1068,28 @@ build_hysteria2_inbound() {
         --arg cert "$cert" \
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
+        --arg obfs_password "$obfs_password" \
+        --argjson tls_override "$tls_json" \
         '{
             "type": "hysteria2",
             "tag": $tag,
             "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
-            "tls": {
+            "tls": ($tls_override // {
                 "enabled": true,
                 "server_name": $sni,
                 "certificate_path": $cert,
                 "key_path": $key
-            },
+            }),
             "masquerade": {
                 "type": "proxy",
                 "url": "https://www.bing.com",
                 "rewrite_host": true
             }
-        }'
+        } | if $obfs_password != "" then
+                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
+            else . end'
 }
 
 # Optional encryption for sensitive config values
@@ -941,7 +1183,18 @@ CURRENT_LANG="${CURRENT_LANG:-}"
 # Spinner 动画帧
 SPINNER_FRAMES=('|' '/' '-' '\')
 
-# SNI 域名列表（完整列表，用于延迟测试）
+# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
+# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
+# Usage: reality_target_discouraged DOMAIN
+reality_target_discouraged() {
+    local domain="${1,,}"
+    case "$domain" in
+        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 0 ;;
+    esac
+    return 1
+}
+
+# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
 SNI_LIST=(
     "amd.com"
     "aws.com"
@@ -958,15 +1211,11 @@ SNI_LIST=(
     "www.sony.com"
     "rum.hlx.page"
     "www.bing.com"
-    "xp.apple.com"
     "www.wowt.com"
-    "www.apple.com"
     "www.intel.com"
     "www.tesla.com"
     "www.xilinx.com"
     "www.oracle.com"
-    "www.icloud.com"
-    "apps.apple.com"
     "c.marsflag.com"
     "www.nvidia.com"
     "snap.licdn.com"
@@ -976,7 +1225,6 @@ SNI_LIST=(
     "s.go-mpulse.net"
     "tags.tiqcdn.com"
     "cdn.bizible.com"
-    "ocsp2.apple.com"
     "cdn.userway.org"
     "download.amd.com"
     "d1.awsstatic.com"
@@ -984,14 +1232,12 @@ SNI_LIST=(
     "mscom.demdex.net"
     "a0.awsstatic.com"
     "go.microsoft.com"
-    "apps.mzstatic.com"
     "sisu.xboxlive.com"
     "www.microsoft.com"
     "s.mp.marsflag.com"
     "images.nvidia.com"
     "vs.aws.amazon.com"
     "c.s-microsoft.com"
-    "statici.icloud.com"
     "beacon.gtv-pub.com"
     "ts4.tc.mm.bing.net"
     "ts3.tc.mm.bing.net"
@@ -1010,14 +1256,12 @@ SNI_LIST=(
     "assets.adobedtm.com"
     "lpcdn.lpsnmedia.net"
     "res-1.cdn.office.net"
-    "is1-ssl.mzstatic.com"
     "electronics.sony.com"
     "intelcorp.scene7.com"
     "acctcdn.msftauth.net"
     "cdnssl.clicktale.net"
     "catalog.gamepass.com"
     "consent.trustarc.com"
-    "gsp-ssl.ls.apple.com"
     "munchkin.marketo.net"
     "s.company-target.com"
     "cdn77.api.userway.org"
@@ -1028,20 +1272,15 @@ SNI_LIST=(
     "api.company-target.com"
     "devblogs.microsoft.com"
     "s7mbrstream.scene7.com"
-    "fpinit.itunes.apple.com"
     "digitalassets.tesla.com"
     "d.impactradius-event.com"
     "downloadmirror.intel.com"
-    "iosapps.itunes.apple.com"
-    "se-edge.itunes.apple.com"
     "publisher.liveperson.net"
     "tag-logger.demandbase.com"
     "services.digitaleast.mobi"
-    "configuration.ls.apple.com"
     "gray-wowt-prod.gtv-cdn.com"
     "visualstudio.microsoft.com"
     "prod.log.shortbread.aws.dev"
-    "amp-api-edge.apps.apple.com"
     "store-images.s-microsoft.com"
     "cdn-dynmedia-1.microsoft.com"
     "github.gallerycdn.vsassets.io"
@@ -1054,7 +1293,6 @@ SNI_LIST=(
     "ms-python.gallerycdn.vsassets.io"
     "gray-config-prod.api.arc-cdn.net"
     "i7158c100-ds-aksb-a.akamaihd.net"
-    "downloaddispatch.itunes.apple.com"
     "res.public.onecdn.static.microsoft"
     "gray.video-player.arcpublishing.com"
     "gray-config-prod.api.cdn.arcpublishing.com"
