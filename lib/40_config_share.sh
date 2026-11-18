@@ -313,7 +313,7 @@ EOF
 write_singbox_config() {
     mkdir -p "$SINGBOX_DIR"
 
-    local inbounds_json="[]"
+    local inbounds_json="[]" providers_json="[]"
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
@@ -353,13 +353,30 @@ write_singbox_config() {
         if [[ "$n_proto" == "hysteria2" ]]; then
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
-            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
+            if [[ -n "$n_domain" ]]; then
+                # ACME 真证书：不再使用逐节点自签名证书。
+                sb_version=$(singbox_installed_version) || sb_version=""
+                [[ -n "$sb_version" ]] && version_ge "$sb_version" 1.14.0 && use_provider=1
+                node_tcp_port_claimed 443 && no_alpn=1
+                node_tcp_port_claimed 80 && no_http=1
+                if ! n_acme=$(build_hy2_acme_json "$n_name" "$n_domain" \
+                    "$(safe_read_config_value "$node_file" "HY2_EMAIL")" "$SINGBOX_DIR/acme" \
+                    "$use_provider" "$no_alpn" "$no_http"); then
+                    log_error "Failed to build ACME settings for node '$n_name'"
+                    return 1
+                fi
+                n_tls_json=$(jq -c '.tls' <<<"$n_acme")
+                providers_json=$(jq -c --argjson acme "$n_acme" \
+                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
+                n_sni="$n_domain"
+            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
-            local n_obfs
-            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -403,12 +420,13 @@ write_singbox_config() {
     local config_json
     if ! config_json=$(jq -n \
         --argjson inbounds "$inbounds_json" \
+        --argjson providers "$providers_json" \
         '{
             "log": {"level": "warn", "timestamp": true},
             "inbounds": $inbounds,
             "outbounds": [{"type": "direct", "tag": "direct"}],
             "route": {"final": "direct"}
-        }' 2>&1); then
+        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
         log_error "Failed to assemble sing-box config: $config_json"
         return 1
     fi
@@ -548,6 +566,8 @@ ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
 HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
+HY2_DOMAIN=${HY2_DOMAIN:-}
+HY2_EMAIL=${HY2_EMAIL:-}
 ENV
     chmod 600 "$node_file"
 
@@ -876,9 +896,14 @@ get_hy2_link() {
         ip_formatted="[$ip]"
     fi
 
-    query="sni=${SNI:-www.bing.com}&insecure=1"
-    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
-    [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    if [[ -n "${HY2_DOMAIN:-}" ]]; then
+        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
+        query="sni=${HY2_DOMAIN}"
+    else
+        query="sni=${SNI:-www.bing.com}&insecure=1"
+        pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
+        [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    fi
     [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
     [[ -n "${HY2_HOP_PORTS:-}" ]] && query+="&mport=${HY2_HOP_PORTS}"
 
@@ -1094,9 +1119,14 @@ show_info() {
             echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
         fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
-        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
-        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
-        show_selfsigned_cert_pins
+        if [[ -n "${HY2_DOMAIN:-}" ]]; then
+            echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
+            echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"
+        else
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
+            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+            show_selfsigned_cert_pins
+        fi
         echo ""
 
         if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then

@@ -1047,4 +1047,111 @@ openrc_script=$(declare -f create_singbox_openrc_service)
 assert_contains "$openrc_script" "proxy-hub-hy2-hop apply" "the OpenRC service must re-apply hop rules on start"
 SCENARIO
 
+# Hysteria2 with an ACME certificate: the config shape follows the installed
+# sing-box, challenges that would fight a local node for a port are disabled,
+# and the share link drops insecure/pin in favour of normal verification.
+run_scenario hysteria2-acme <<'SCENARIO'
+load_modules
+make_singbox() {
+    printf '#!/bin/sh\n[ "$1" = version ] && echo "sing-box version %s"\nexit 0\n' "$1" >/srv/bin/sing-box-fake
+    chmod 755 /srv/bin/sing-box-fake
+    SINGBOX_BIN=/srv/bin/sing-box-fake
+}
+
+version_ge 1.14.4 1.14.0 || fail_case "1.14.4 >= 1.14.0"
+version_ge v1.14.0 1.14.0 || fail_case "v-prefixed versions compare equal"
+assert_fails "1.13.16 < 1.14.0" version_ge 1.13.16 1.14.0
+assert_fails "1.9.9 < 1.14.0 (numeric, not lexical)" version_ge 1.9.9 1.14.0
+make_singbox 1.14.4
+assert_eq "1.14.4" "$(singbox_installed_version)" "installed version is parsed"
+SINGBOX_BIN=/srv/absent-sing-box
+assert_fails "an absent binary has no version" singbox_installed_version
+
+# Option validation.
+get_ipv4() { echo 203.0.113.10; }
+get_ipv6() { echo ""; }
+getent() { [[ "$2" == hy.example.com ]] && printf '203.0.113.10 STREAM hy.example.com\n'; return 0; }
+ss() { printf 'State Recv-Q Send-Q Local Address:Port\n'; for p in ${LISTENING:-}; do printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "$p"; done; }
+CURRENT_NODE_NAME=fresh
+hy2domain=HY.Example.com hy2email=ops@example.com configure_hy2_options 2>/dev/null
+assert_eq "hy.example.com/ops@example.com" "$HY2_DOMAIN/$HY2_EMAIL" "domain is lower-cased and the email kept"
+configure_hy2_options
+assert_eq "" "$HY2_DOMAIN" "ACME must stay off unless a domain is given"
+for bad in localhost 203.0.113.10 'bad domain.com' 'a..b.com' '-x.example.com'; do
+    rc=0
+    ( hy2domain="$bad" configure_hy2_options 2>/dev/null ) || rc=$?
+    assert_eq "1" "$rc" "ACME domain '$bad' must be rejected"
+done
+rc=0
+( hy2domain=hy.example.com hy2email='not an email' configure_hy2_options 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "an invalid ACME email must be rejected"
+rc=0
+( LISTENING="80 443"; hy2domain=hy.example.com configure_hy2_options 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "ACME without a free challenge port must be rejected"
+hy2domain=other.example.com configure_hy2_options 2>/srv/acme.warn
+assert_contains "$(cat /srv/acme.warn)" "does not resolve yet" "an unresolvable domain must be flagged"
+getent() { printf '198.51.100.7 STREAM x\n'; }
+hy2domain=hy.example.com configure_hy2_options 2>/srv/acme.warn
+assert_contains "$(cat /srv/acme.warn)" "not this server" "a domain pointing elsewhere must be flagged"
+
+# Rendering on sing-box >= 1.14: shared certificate provider.
+write_node acme hysteria2 "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com"
+write_node self hysteria2
+sed -i 's/^PORT=1443$/PORT=5443/' "$NODES_DIR/self.env"
+make_singbox 1.14.4
+write_singbox_config
+assert_eq '{"enabled":true,"server_name":"hy.example.com","certificate_provider":"acme-acme"}' \
+    "$(jq -c '.inbounds[] | select(.tag == "acme_hysteria2") | .tls' "$SINGBOX_CONF")" "provider reference"
+assert_eq '[{"type":"acme","tag":"acme-acme","domain":["hy.example.com"],"data_directory":"/srv/sing-box/acme","email":"ops@example.com"}]' \
+    "$(jq -c '.certificate_providers' "$SINGBOX_CONF")" "shared ACME provider"
+assert_eq "/srv/sing-box/certs/self.crt" \
+    "$(jq -r '.inbounds[] | select(.tag == "self_hysteria2") | .tls.certificate_path' "$SINGBOX_CONF")" \
+    "self-signed nodes keep their certificate files"
+[[ ! -e "$SINGBOX_CERT_DIR/acme.crt" ]] || fail_case "an ACME node must not get a self-signed certificate"
+
+# A REALITY node on 443 turns off the TLS-ALPN challenge.
+write_node web vision
+sed -i 's/^PORT=1443$/PORT=443/' "$NODES_DIR/web.env"
+write_singbox_config
+assert_eq "true/null" \
+    "$(jq -r '.certificate_providers[0] | "\(.disable_tls_alpn_challenge)/\(.disable_http_challenge)"' "$SINGBOX_CONF")" \
+    "443 claimed by a node disables TLS-ALPN-01 only"
+rm -f -- "$NODES_DIR/web.env"
+
+# Older sing-box: inline ACME, no top-level providers.
+make_singbox 1.13.16
+write_singbox_config
+assert_eq "hy.example.com" \
+    "$(jq -r '.inbounds[] | select(.tag == "acme_hysteria2") | .tls.acme.domain[0]' "$SINGBOX_CONF")" "inline ACME"
+assert_eq "null" "$(jq -r '.certificate_providers' "$SINGBOX_CONF")" "no provider list before 1.14"
+
+# Without ACME nodes the config has no provider key at all.
+rm -f -- "$NODES_DIR/acme.env"
+make_singbox 1.14.4
+write_singbox_config
+assert_eq "false" "$(jq 'has("certificate_providers")' "$SINGBOX_CONF")" "no ACME node, no provider key"
+
+# Link and info.
+write_node acme hysteria2 "HY2_DOMAIN=hy.example.com"
+CURRENT_NODE_NAME=acme
+link=$(get_share_link)
+assert_contains "$link" "/?sni=hy.example.com#" "the link verifies against the domain"
+assert_not_contains "$link" "insecure" "a CA-issued certificate needs no insecure flag"
+assert_not_contains "$link" "pinSHA256" "a renewing certificate must not be pinned"
+assert_contains "$(show_info)" "ACME" "node info states the certificate source"
+
+assert_fails "the ACME builder must reject an unsafe domain" \
+    build_hy2_acme_json n 'bad"domain' "" /d 1 0 0
+assert_fails "the ACME builder must reject an unsafe email" \
+    build_hy2_acme_json n hy.example.com 'a"b@c' /d 1 0 0
+
+if use_real_singbox; then
+    write_node acme hysteria2 "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com" \
+        "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+    write_singbox_config || fail_case "the real sing-box rejected the ACME provider config"
+    assert_eq "acme-acme" "$(jq -r '.inbounds[] | select(.tag == "acme_hysteria2") | .tls.certificate_provider' "$SINGBOX_CONF")" \
+        "the real core is new enough for certificate providers"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

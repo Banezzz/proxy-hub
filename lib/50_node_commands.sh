@@ -59,6 +59,15 @@ open_node_firewall_ports() {
         hysteria2)
             open_firewall_port "$PORT" udp || \
                 log_warn "Could not automatically open UDP port $PORT"
+            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
+            if [[ -n "${HY2_DOMAIN:-}" ]]; then
+                local acme_port
+                for acme_port in 80 443; do
+                    node_tcp_port_claimed "$acme_port" && continue
+                    open_firewall_port "$acme_port" tcp || \
+                        log_warn "Could not automatically open TCP port $acme_port for ACME"
+                done
+            fi
             ;;
         shadowsocks)
             open_firewall_port "$PORT" both || \
@@ -216,6 +225,8 @@ cmd_install() {
         fi
         choose_ports || return 1
         configure_hy2_options || return 1
+        # ACME 节点的 TLS SNI 就是证书域名。
+        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
 
         UUID=""
         PUBLIC_KEY=""
@@ -297,8 +308,8 @@ cmd_install() {
     save_env
 
     if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
-        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
+        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
             if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
                 log_error "Failed to generate TLS certificate, rolling back..."
                 rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
@@ -716,6 +727,8 @@ cmd_edit() {
                 new_hy2_sni="${new_hy2_sni:-${SNI:-www.bing.com}}"
                 if validate_tls_server_name "$new_hy2_sni"; then
                     SNI="$new_hy2_sni"
+                    # ACME 节点的 SNI 即证书域名，两者一起改。
+                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
                     sni_changed=true
                     changed=true
                 else
@@ -813,7 +826,7 @@ cmd_edit() {
     # 重新生成对应内核配置并重启
     if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
         # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
-        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
+        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
             rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
             gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
         fi

@@ -404,7 +404,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -456,6 +456,8 @@ safe_load_node_config() {
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
     HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
     HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
+    HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
+    HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
 
     return 0
 }
@@ -914,10 +916,56 @@ validate_tls_server_name() {
     done
 }
 
+# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
+}
+
+# 已安装的 sing-box 版本号（如 1.14.4）；无法读取时返回非零。
+singbox_installed_version() {
+    local out
+    [[ -x "$SINGBOX_BIN" ]] || return 1
+    out=$(timeout 10 "$SINGBOX_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ sing-box[[:space:]]+version[[:space:]]+([0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
+# inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
+# 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。
+# TLS-ALPN-01 需要 443/tcp，HTTP-01 需要 80/tcp；端口已被本机节点占用的那种挑战
+# 直接关掉，避免证书签发去和 REALITY 入站抢端口。
+# Usage: build_hy2_acme_json NODE_NAME DOMAIN EMAIL DATA_DIR USE_PROVIDER(0|1) NO_ALPN(0|1) NO_HTTP(0|1)
+build_hy2_acme_json() {
+    local name="$1" domain="$2" email="$3" data_dir="$4" use_provider="$5" no_alpn="$6" no_http="$7"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    validate_tls_server_name "$domain" || return 1
+    [[ -z "$email" || "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]] || return 1
+    jq -n \
+        --arg tag "acme-${name}" \
+        --arg domain "$domain" \
+        --arg email "$email" \
+        --arg data_dir "$data_dir" \
+        --argjson use_provider "$use_provider" \
+        --argjson no_alpn "$no_alpn" \
+        --argjson no_http "$no_http" \
+        '({"domain": [$domain], "data_directory": $data_dir}
+            | if $email != "" then . + {"email": $email} else . end
+            | if $no_alpn == 1 then . + {"disable_tls_alpn_challenge": true} else . end
+            | if $no_http == 1 then . + {"disable_http_challenge": true} else . end) as $acme
+        | if $use_provider == 1 then
+            {"tls": {"enabled": true, "server_name": $domain, "certificate_provider": $tag},
+             "provider": ({"type": "acme", "tag": $tag} + $acme)}
+          else
+            {"tls": {"enabled": true, "server_name": $domain, "acme": $acme}, "provider": null}
+          end'
+}
+
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
 #   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
 #   伪装站点随之失去意义，因此同时去掉 masquerade。
+#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -926,12 +974,14 @@ build_hysteria2_inbound() {
     local cert="$5"
     local key="$6"
     local obfs_password="${7:-}"
+    local tls_json="${8:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
-    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
+    [[ -n "$tls_json" ]] || tls_json=null
     [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
@@ -944,18 +994,19 @@ build_hysteria2_inbound() {
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
         --arg obfs_password "$obfs_password" \
+        --argjson tls_override "$tls_json" \
         '{
             "type": "hysteria2",
             "tag": $tag,
             "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
-            "tls": {
+            "tls": ($tls_override // {
                 "enabled": true,
                 "server_name": $sni,
                 "certificate_path": $cert,
                 "key_path": $key
-            },
+            }),
             "masquerade": {
                 "type": "proxy",
                 "url": "https://www.bing.com",

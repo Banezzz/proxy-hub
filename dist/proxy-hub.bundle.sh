@@ -420,7 +420,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -472,6 +472,8 @@ safe_load_node_config() {
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
     HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
     HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
+    HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
+    HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
 
     return 0
 }
@@ -930,10 +932,56 @@ validate_tls_server_name() {
     done
 }
 
+# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
+}
+
+# 已安装的 sing-box 版本号（如 1.14.4）；无法读取时返回非零。
+singbox_installed_version() {
+    local out
+    [[ -x "$SINGBOX_BIN" ]] || return 1
+    out=$(timeout 10 "$SINGBOX_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ sing-box[[:space:]]+version[[:space:]]+([0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
+# inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
+# 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。
+# TLS-ALPN-01 需要 443/tcp，HTTP-01 需要 80/tcp；端口已被本机节点占用的那种挑战
+# 直接关掉，避免证书签发去和 REALITY 入站抢端口。
+# Usage: build_hy2_acme_json NODE_NAME DOMAIN EMAIL DATA_DIR USE_PROVIDER(0|1) NO_ALPN(0|1) NO_HTTP(0|1)
+build_hy2_acme_json() {
+    local name="$1" domain="$2" email="$3" data_dir="$4" use_provider="$5" no_alpn="$6" no_http="$7"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    validate_tls_server_name "$domain" || return 1
+    [[ -z "$email" || "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]] || return 1
+    jq -n \
+        --arg tag "acme-${name}" \
+        --arg domain "$domain" \
+        --arg email "$email" \
+        --arg data_dir "$data_dir" \
+        --argjson use_provider "$use_provider" \
+        --argjson no_alpn "$no_alpn" \
+        --argjson no_http "$no_http" \
+        '({"domain": [$domain], "data_directory": $data_dir}
+            | if $email != "" then . + {"email": $email} else . end
+            | if $no_alpn == 1 then . + {"disable_tls_alpn_challenge": true} else . end
+            | if $no_http == 1 then . + {"disable_http_challenge": true} else . end) as $acme
+        | if $use_provider == 1 then
+            {"tls": {"enabled": true, "server_name": $domain, "certificate_provider": $tag},
+             "provider": ({"type": "acme", "tag": $tag} + $acme)}
+          else
+            {"tls": {"enabled": true, "server_name": $domain, "acme": $acme}, "provider": null}
+          end'
+}
+
 # Build a Hysteria2 inbound for sing-box using jq (prevents JSON injection).
-# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
 #   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
 #   伪装站点随之失去意义，因此同时去掉 masquerade。
+#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
 build_hysteria2_inbound() {
     local name="$1"
     local port="$2"
@@ -942,12 +990,14 @@ build_hysteria2_inbound() {
     local cert="$5"
     local key="$6"
     local obfs_password="${7:-}"
+    local tls_json="${8:-}"
 
     port=$(get_validated_port "$port" true) || return 1
     [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
     validate_tls_server_name "$sni" || return 1
-    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
+    [[ -n "$tls_json" ]] || tls_json=null
     [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
 
     jq -n \
@@ -960,18 +1010,19 @@ build_hysteria2_inbound() {
         --arg key "$key" \
         --arg listen "$(netstack_singbox_listen_addr)" \
         --arg obfs_password "$obfs_password" \
+        --argjson tls_override "$tls_json" \
         '{
             "type": "hysteria2",
             "tag": $tag,
             "listen": $listen,
             "listen_port": $port,
             "users": [{"name": $name, "password": $password}],
-            "tls": {
+            "tls": ($tls_override // {
                 "enabled": true,
                 "server_name": $sni,
                 "certificate_path": $cert,
                 "key_path": $key
-            },
+            }),
             "masquerade": {
                 "type": "proxy",
                 "url": "https://www.bing.com",
@@ -5705,12 +5756,57 @@ apply_hy2_hop_range() {
         "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
 }
 
+# 采用一个 ACME 域名：校验格式、确认至少一种挑战可用，并提示 DNS 是否指向本机。
+# 签发发生在 sing-box 启动之后，这里无法提前证明能签下来，只能把明显会失败的情况
+# 拦在前面。
+# Usage: apply_hy2_acme_domain DOMAIN [EMAIL]
+apply_hy2_acme_domain() {
+    local domain="${1,,}" email="${2:-}" resolved="" own4 own6
+    if ! validate_tls_server_name "$domain" || [[ "$domain" != *.* || "$domain" =~ ^[0-9.]+$ ]]; then
+        log_error "$(t2 "ACME 域名无效" "Invalid ACME domain"): ${1:-}"
+        return 1
+    fi
+    if [[ -n "$email" && ! "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]]; then
+        log_error "$(t2 "ACME 邮箱无效" "Invalid ACME email"): $email"
+        return 1
+    fi
+    local alpn_ok=1 http_ok=1
+    { node_tcp_port_claimed 443 || ! is_port_free 443 tcp; } && alpn_ok=0
+    { node_tcp_port_claimed 80 || ! is_port_free 80 tcp; } && http_ok=0
+    if (( alpn_ok == 0 && http_ok == 0 )); then
+        log_error "$(t2 "ACME 签发需要 80/tcp 或 443/tcp 至少一个空闲，当前都被占用" \
+            "ACME needs 80/tcp or 443/tcp to be free, and both are in use")"
+        return 1
+    fi
+    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ')
+    own4=$(get_ipv4)
+    own6=$(get_ipv6)
+    if [[ -z "$resolved" ]]; then
+        log_warn "$(t2 "域名 $domain 目前无法解析，证书签发会失败，请先添加 DNS 记录" \
+            "Domain $domain does not resolve yet; issuance will fail until its DNS record exists")"
+    elif [[ " $resolved" != *" ${own4:-none} "* && " $resolved" != *" ${own6:-none} "* ]]; then
+        log_warn "$(t2 "域名 $domain 解析到 ${resolved}，不是本机地址，证书签发可能失败" \
+            "Domain $domain resolves to ${resolved}, not this server; issuance may fail")"
+    fi
+    HY2_DOMAIN="$domain"
+    HY2_EMAIL="$email"
+    log_info "$(t2 "将为 $domain 申请 ACME 证书（sing-box 启动后自动签发与续期）" \
+        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
+}
+
 # 为当前正在安装的 Hysteria2 节点应用可选加固。
 #   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
 #   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
+#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
 configure_hy2_options() {
     HY2_OBFS_PASSWORD=""
     HY2_HOP_PORTS=""
+    HY2_DOMAIN=""
+    HY2_EMAIL=""
+
+    if [[ -n "${hy2domain:-}" ]]; then
+        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
+    fi
 
     if [[ -n "${hy2hop:-}" ]]; then
         apply_hy2_hop_range "$hy2hop" || return 1
@@ -7237,7 +7333,7 @@ EOF
 write_singbox_config() {
     mkdir -p "$SINGBOX_DIR"
 
-    local inbounds_json="[]"
+    local inbounds_json="[]" providers_json="[]"
 
     for node_file in "$NODES_DIR"/*.env; do
         [[ -f "$node_file" ]] || continue
@@ -7277,13 +7373,30 @@ write_singbox_config() {
         if [[ "$n_proto" == "hysteria2" ]]; then
             local cert_path="$SINGBOX_CERT_DIR/${n_name}.crt"
             local key_path="$SINGBOX_CERT_DIR/${n_name}.key"
-            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
+            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            n_domain=$(safe_read_config_value "$node_file" "HY2_DOMAIN")
+            if [[ -n "$n_domain" ]]; then
+                # ACME 真证书：不再使用逐节点自签名证书。
+                sb_version=$(singbox_installed_version) || sb_version=""
+                [[ -n "$sb_version" ]] && version_ge "$sb_version" 1.14.0 && use_provider=1
+                node_tcp_port_claimed 443 && no_alpn=1
+                node_tcp_port_claimed 80 && no_http=1
+                if ! n_acme=$(build_hy2_acme_json "$n_name" "$n_domain" \
+                    "$(safe_read_config_value "$node_file" "HY2_EMAIL")" "$SINGBOX_DIR/acme" \
+                    "$use_provider" "$no_alpn" "$no_http"); then
+                    log_error "Failed to build ACME settings for node '$n_name'"
+                    return 1
+                fi
+                n_tls_json=$(jq -c '.tls' <<<"$n_acme")
+                providers_json=$(jq -c --argjson acme "$n_acme" \
+                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
+                n_sni="$n_domain"
+            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
                 gen_selfsigned_cert "$n_name" "${n_sni:-www.bing.com}" || return 1
             fi
-            local n_obfs
-            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
             if ! inbound=$(build_hysteria2_inbound "$n_name" "$validated_port" "$n_pw" \
-                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs"); then
+                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
                 log_error "Failed to build Hysteria2 inbound for node '$n_name'"
                 return 1
             fi
@@ -7327,12 +7440,13 @@ write_singbox_config() {
     local config_json
     if ! config_json=$(jq -n \
         --argjson inbounds "$inbounds_json" \
+        --argjson providers "$providers_json" \
         '{
             "log": {"level": "warn", "timestamp": true},
             "inbounds": $inbounds,
             "outbounds": [{"type": "direct", "tag": "direct"}],
             "route": {"final": "direct"}
-        }' 2>&1); then
+        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
         log_error "Failed to assemble sing-box config: $config_json"
         return 1
     fi
@@ -7472,6 +7586,8 @@ ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
 HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
+HY2_DOMAIN=${HY2_DOMAIN:-}
+HY2_EMAIL=${HY2_EMAIL:-}
 ENV
     chmod 600 "$node_file"
 
@@ -7800,9 +7916,14 @@ get_hy2_link() {
         ip_formatted="[$ip]"
     fi
 
-    query="sni=${SNI:-www.bing.com}&insecure=1"
-    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
-    [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    if [[ -n "${HY2_DOMAIN:-}" ]]; then
+        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
+        query="sni=${HY2_DOMAIN}"
+    else
+        query="sni=${SNI:-www.bing.com}&insecure=1"
+        pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
+        [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
+    fi
     [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
     [[ -n "${HY2_HOP_PORTS:-}" ]] && query+="&mport=${HY2_HOP_PORTS}"
 
@@ -8018,9 +8139,14 @@ show_info() {
             echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
         fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
-        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
-        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
-        show_selfsigned_cert_pins
+        if [[ -n "${HY2_DOMAIN:-}" ]]; then
+            echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
+            echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"
+        else
+            echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
+            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
+            show_selfsigned_cert_pins
+        fi
         echo ""
 
         if [[ -n "${SERVER_IPV4:-}" ]] && netstack_allows v4; then
@@ -8234,6 +8360,15 @@ open_node_firewall_ports() {
         hysteria2)
             open_firewall_port "$PORT" udp || \
                 log_warn "Could not automatically open UDP port $PORT"
+            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
+            if [[ -n "${HY2_DOMAIN:-}" ]]; then
+                local acme_port
+                for acme_port in 80 443; do
+                    node_tcp_port_claimed "$acme_port" && continue
+                    open_firewall_port "$acme_port" tcp || \
+                        log_warn "Could not automatically open TCP port $acme_port for ACME"
+                done
+            fi
             ;;
         shadowsocks)
             open_firewall_port "$PORT" both || \
@@ -8391,6 +8526,8 @@ cmd_install() {
         fi
         choose_ports || return 1
         configure_hy2_options || return 1
+        # ACME 节点的 TLS SNI 就是证书域名。
+        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
 
         UUID=""
         PUBLIC_KEY=""
@@ -8472,8 +8609,8 @@ cmd_install() {
     save_env
 
     if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
-        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
+        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
+        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
             if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
                 log_error "Failed to generate TLS certificate, rolling back..."
                 rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
@@ -8891,6 +9028,8 @@ cmd_edit() {
                 new_hy2_sni="${new_hy2_sni:-${SNI:-www.bing.com}}"
                 if validate_tls_server_name "$new_hy2_sni"; then
                     SNI="$new_hy2_sni"
+                    # ACME 节点的 SNI 即证书域名，两者一起改。
+                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
                     sni_changed=true
                     changed=true
                 else
@@ -8988,7 +9127,7 @@ cmd_edit() {
     # 重新生成对应内核配置并重启
     if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
         # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
-        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
+        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
             rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
             gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
         fi
@@ -12135,7 +12274,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=481921 body-sha256=a6200207b60f9dc4f74bfb49a5dae5fd5d27e0828ed36f7328fae41c3ae80265
-# build-id=a6200207b60f9dc4f74bfb49a5dae5fd5d27e0828ed36f7328fae41c3ae80265
+# body-bytes=489821 body-sha256=e2241be3d2b043ecf869a7fd515f18ab356e5542ae75fa87a32eb89a07805f44
+# build-id=e2241be3d2b043ecf869a7fd515f18ab356e5542ae75fa87a32eb89a07805f44
 # module-count=11
 # proxy-hub-bundle-end-v1

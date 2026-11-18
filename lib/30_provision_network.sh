@@ -161,12 +161,57 @@ apply_hy2_hop_range() {
         "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
 }
 
+# 采用一个 ACME 域名：校验格式、确认至少一种挑战可用，并提示 DNS 是否指向本机。
+# 签发发生在 sing-box 启动之后，这里无法提前证明能签下来，只能把明显会失败的情况
+# 拦在前面。
+# Usage: apply_hy2_acme_domain DOMAIN [EMAIL]
+apply_hy2_acme_domain() {
+    local domain="${1,,}" email="${2:-}" resolved="" own4 own6
+    if ! validate_tls_server_name "$domain" || [[ "$domain" != *.* || "$domain" =~ ^[0-9.]+$ ]]; then
+        log_error "$(t2 "ACME 域名无效" "Invalid ACME domain"): ${1:-}"
+        return 1
+    fi
+    if [[ -n "$email" && ! "$email" =~ ^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+$ ]]; then
+        log_error "$(t2 "ACME 邮箱无效" "Invalid ACME email"): $email"
+        return 1
+    fi
+    local alpn_ok=1 http_ok=1
+    { node_tcp_port_claimed 443 || ! is_port_free 443 tcp; } && alpn_ok=0
+    { node_tcp_port_claimed 80 || ! is_port_free 80 tcp; } && http_ok=0
+    if (( alpn_ok == 0 && http_ok == 0 )); then
+        log_error "$(t2 "ACME 签发需要 80/tcp 或 443/tcp 至少一个空闲，当前都被占用" \
+            "ACME needs 80/tcp or 443/tcp to be free, and both are in use")"
+        return 1
+    fi
+    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ')
+    own4=$(get_ipv4)
+    own6=$(get_ipv6)
+    if [[ -z "$resolved" ]]; then
+        log_warn "$(t2 "域名 $domain 目前无法解析，证书签发会失败，请先添加 DNS 记录" \
+            "Domain $domain does not resolve yet; issuance will fail until its DNS record exists")"
+    elif [[ " $resolved" != *" ${own4:-none} "* && " $resolved" != *" ${own6:-none} "* ]]; then
+        log_warn "$(t2 "域名 $domain 解析到 ${resolved}，不是本机地址，证书签发可能失败" \
+            "Domain $domain resolves to ${resolved}, not this server; issuance may fail")"
+    fi
+    HY2_DOMAIN="$domain"
+    HY2_EMAIL="$email"
+    log_info "$(t2 "将为 $domain 申请 ACME 证书（sing-box 启动后自动签发与续期）" \
+        "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
+}
+
 # 为当前正在安装的 Hysteria2 节点应用可选加固。
 #   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
 #   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
+#   hy2domain=example.com    用 ACME 为该域名签发真证书，替代自签名证书（hy2email 可选）
 configure_hy2_options() {
     HY2_OBFS_PASSWORD=""
     HY2_HOP_PORTS=""
+    HY2_DOMAIN=""
+    HY2_EMAIL=""
+
+    if [[ -n "${hy2domain:-}" ]]; then
+        apply_hy2_acme_domain "$hy2domain" "${hy2email:-}" || return 1
+    fi
 
     if [[ -n "${hy2hop:-}" ]]; then
         apply_hy2_hop_range "$hy2hop" || return 1
