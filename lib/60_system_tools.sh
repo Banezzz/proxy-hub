@@ -598,6 +598,70 @@ singbox_install_release() {
     return 0
 }
 
+# 只读显示 sing-box 的本地版本、latest stable 与安全基线。远端查询失败只把该项标为
+# 不可用，本地结果照常显示。
+cmd_singbox_version() {
+    local installed latest="" json relation=""
+    installed=$(singbox_installed_version) || installed=""
+    json=$(singbox_release_json "") || json=""
+    latest=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null) || latest=""
+    latest="${latest#v}"
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     sing-box $(t2 "版本" "version")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  $(t2 "已安装" "Installed"):      ${YELLOW}${installed:+v}${installed:-$(t2 "未安装" "Not installed")}${NC}"
+    echo -e "  Latest stable:  ${YELLOW}${latest:+v}${latest:-$(t2 "查询失败" "unavailable")}${NC}"
+    echo -e "  $(t2 "安全基线" "Security baseline"): v${SINGBOX_BASELINE_VERSION}"
+    if [[ -n "$installed" ]]; then
+        if ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+            relation="${RED}$(t2 "低于安全基线，建议立即更新" "below the security baseline; update now")${NC}"
+        elif [[ -n "$latest" ]] && ! version_ge "$installed" "$latest"; then
+            relation="${YELLOW}$(t2 "有新版本可用" "an update is available")${NC}"
+        elif [[ -n "$latest" ]]; then
+            relation="${GREEN}$(t2 "已是最新" "up to date")${NC}"
+        fi
+        [[ -n "$relation" ]] && echo -e "  $(t2 "状态" "Status"):        $relation"
+    fi
+    echo ""
+}
+
+# 更新 sing-box 到 latest stable，或 SINGBOX_VERSION 指定的版本。
+cmd_singbox_update() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        log_error "$(t2 "sing-box 尚未安装；添加 AnyTLS 或 Hysteria2 节点时会自动安装" \
+            "sing-box is not installed; it is installed automatically with the first AnyTLS or Hysteria2 node")"
+        return 1
+    fi
+    singbox_install_release update
+}
+
+# 工具菜单入口：先显示状态，再确认是否更新。
+cmd_singbox_release_menu() {
+    local answer=""
+    cmd_singbox_version
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        read -rp "$(msg menu_press_enter)"
+        return 0
+    fi
+    menu_note "$(t2 "更新会校验官方 SHA-256，并先用新版本检查现有配置；启动失败自动回滚旧版本。" \
+        "An update verifies the official SHA-256 and checks the current config with the new version; a failed start rolls back.")"
+    echo ""
+    echo -n "  $(t2 "更新到 latest stable?" "Update to the latest stable?") [y/N]: "
+    read -r answer
+    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+        cmd_singbox_update || true
+    fi
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
 # ============== WARP 管理 ==============
 
 cmd_warp() {

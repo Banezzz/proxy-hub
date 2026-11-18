@@ -9899,6 +9899,70 @@ singbox_install_release() {
     return 0
 }
 
+# 只读显示 sing-box 的本地版本、latest stable 与安全基线。远端查询失败只把该项标为
+# 不可用，本地结果照常显示。
+cmd_singbox_version() {
+    local installed latest="" json relation=""
+    installed=$(singbox_installed_version) || installed=""
+    json=$(singbox_release_json "") || json=""
+    latest=$(jq -r '.tag_name // empty' <<<"$json" 2>/dev/null) || latest=""
+    latest="${latest#v}"
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                     sing-box $(t2 "版本" "version")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  $(t2 "已安装" "Installed"):      ${YELLOW}${installed:+v}${installed:-$(t2 "未安装" "Not installed")}${NC}"
+    echo -e "  Latest stable:  ${YELLOW}${latest:+v}${latest:-$(t2 "查询失败" "unavailable")}${NC}"
+    echo -e "  $(t2 "安全基线" "Security baseline"): v${SINGBOX_BASELINE_VERSION}"
+    if [[ -n "$installed" ]]; then
+        if ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+            relation="${RED}$(t2 "低于安全基线，建议立即更新" "below the security baseline; update now")${NC}"
+        elif [[ -n "$latest" ]] && ! version_ge "$installed" "$latest"; then
+            relation="${YELLOW}$(t2 "有新版本可用" "an update is available")${NC}"
+        elif [[ -n "$latest" ]]; then
+            relation="${GREEN}$(t2 "已是最新" "up to date")${NC}"
+        fi
+        [[ -n "$relation" ]] && echo -e "  $(t2 "状态" "Status"):        $relation"
+    fi
+    echo ""
+}
+
+# 更新 sing-box 到 latest stable，或 SINGBOX_VERSION 指定的版本。
+cmd_singbox_update() {
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        log_error "$(t2 "sing-box 尚未安装；添加 AnyTLS 或 Hysteria2 节点时会自动安装" \
+            "sing-box is not installed; it is installed automatically with the first AnyTLS or Hysteria2 node")"
+        return 1
+    fi
+    singbox_install_release update
+}
+
+# 工具菜单入口：先显示状态，再确认是否更新。
+cmd_singbox_release_menu() {
+    local answer=""
+    cmd_singbox_version
+    if [[ ! -f "$SINGBOX_BIN" ]]; then
+        read -rp "$(msg menu_press_enter)"
+        return 0
+    fi
+    menu_note "$(t2 "更新会校验官方 SHA-256，并先用新版本检查现有配置；启动失败自动回滚旧版本。" \
+        "An update verifies the official SHA-256 and checks the current config with the new version; a failed start rolls back.")"
+    echo ""
+    echo -n "  $(t2 "更新到 latest stable?" "Update to the latest stable?") [y/N]: "
+    read -r answer
+    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+        cmd_singbox_update || true
+    fi
+    echo ""
+    read -rp "$(msg menu_press_enter)"
+}
+
 # ============== WARP 管理 ==============
 
 cmd_warp() {
@@ -12142,13 +12206,14 @@ cmd_tools() {
         echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
         echo -e "  ${GREEN}8.${NC} $(msg xray_restart_title)"
         echo -e "  ${GREEN}9.${NC} $(msg xray_release_title)"
+        echo -e "  ${GREEN}11.${NC} sing-box $(t2 "版本 / 更新" "Version / Update")"
         echo ""
         echo -e "  ${BLUE}[其他]${NC}"
         echo -e "  ${GREEN}10.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-10]: "
+        echo -n "  $(msg menu_choice) [0-11]: "
         read -r choice
 
         case "$choice" in
@@ -12161,6 +12226,7 @@ cmd_tools() {
             7) cmd_logs ;;
             8) cmd_xray_restart ;;
             9) cmd_xray_release_menu ;;
+            11) cmd_singbox_release_menu ;;
             10)
                 install_standalone_tools
                 echo ""
@@ -12340,6 +12406,8 @@ show_help() {
     echo "  xray-restart  Schedule periodic Xray restart (systemd timer or cron)"
     echo "  xray-version  Show installed/stable/prerelease Xray versions"
     echo "  xray-update   Safely update Xray with config test and rollback"
+    echo "  singbox-version  Show installed/stable sing-box versions and the security baseline"
+    echo "  singbox-update   Update sing-box with SHA-256 verification, config check and rollback"
     echo ""
     echo "Other:"
     echo "  menu        Show interactive menu"
@@ -12394,6 +12462,11 @@ show_help() {
     echo "  XRAY_VERSION=v26.7.11           Install an explicit Xray version (highest priority)"
     echo "  xray_channel=stable|prerelease  Lowercase compatibility alias"
     echo "  xray_version=v26.7.11           Lowercase compatibility alias"
+    echo ""
+    echo "sing-box release management:"
+    echo "  SINGBOX_VERSION=v1.14.4         Install an explicit sing-box version with singbox-update"
+    echo "  SINGBOX_SHA256=<hex>            Expected archive digest when the release metadata has none"
+    echo "  SINGBOX_BACKUP_KEEP=3           Number of script-created binary backups to keep"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
@@ -12565,6 +12638,13 @@ case "${1:-}" in
         check_lock_for_write_ops
         cmd_xray_update
         ;;
+    singbox-version)
+        cmd_singbox_version
+        ;;
+    singbox-update)
+        check_lock_for_write_ops
+        cmd_singbox_update
+        ;;
     ports)
         check_lock_for_write_ops
         init_language_if_needed
@@ -12588,7 +12668,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=508791 body-sha256=65257c85510d516a651de4ecde91b4852f858eca623611b861161e7e6f79844e
-# build-id=65257c85510d516a651de4ecde91b4852f858eca623611b861161e7e6f79844e
+# body-bytes=512819 body-sha256=851c2eb896d689864d2120aa939fd0c21cafcc0f8600663aef0957d29490f011
+# build-id=851c2eb896d689864d2120aa939fd0c21cafcc0f8600663aef0957d29490f011
 # module-count=11
 # proxy-hub-bundle-end-v1

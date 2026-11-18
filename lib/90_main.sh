@@ -22,13 +22,14 @@ cmd_tools() {
         echo -e "  ${GREEN}7.${NC} 日志查看 (Logs)"
         echo -e "  ${GREEN}8.${NC} $(msg xray_restart_title)"
         echo -e "  ${GREEN}9.${NC} $(msg xray_release_title)"
+        echo -e "  ${GREEN}11.${NC} sing-box $(t2 "版本 / 更新" "Version / Update")"
         echo ""
         echo -e "  ${BLUE}[其他]${NC}"
         echo -e "  ${GREEN}10.${NC} 安装独立工具命令"
         echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
         echo -e "  ${RED}0.${NC} Back / 返回"
         echo ""
-        echo -n "  $(msg menu_choice) [0-10]: "
+        echo -n "  $(msg menu_choice) [0-11]: "
         read -r choice
 
         case "$choice" in
@@ -41,6 +42,7 @@ cmd_tools() {
             7) cmd_logs ;;
             8) cmd_xray_restart ;;
             9) cmd_xray_release_menu ;;
+            11) cmd_singbox_release_menu ;;
             10)
                 install_standalone_tools
                 echo ""
@@ -220,6 +222,8 @@ show_help() {
     echo "  xray-restart  Schedule periodic Xray restart (systemd timer or cron)"
     echo "  xray-version  Show installed/stable/prerelease Xray versions"
     echo "  xray-update   Safely update Xray with config test and rollback"
+    echo "  singbox-version  Show installed/stable sing-box versions and the security baseline"
+    echo "  singbox-update   Update sing-box with SHA-256 verification, config check and rollback"
     echo ""
     echo "Other:"
     echo "  menu        Show interactive menu"
@@ -274,6 +278,11 @@ show_help() {
     echo "  XRAY_VERSION=v26.7.11           Install an explicit Xray version (highest priority)"
     echo "  xray_channel=stable|prerelease  Lowercase compatibility alias"
     echo "  xray_version=v26.7.11           Lowercase compatibility alias"
+    echo ""
+    echo "sing-box release management:"
+    echo "  SINGBOX_VERSION=v1.14.4         Install an explicit sing-box version with singbox-update"
+    echo "  SINGBOX_SHA256=<hex>            Expected archive digest when the release metadata has none"
+    echo "  SINGBOX_BACKUP_KEEP=3           Number of script-created binary backups to keep"
     echo ""
     echo "Examples:"
     echo "  bash $0                                    # Interactive menu"
@@ -444,6 +453,13 @@ case "${1:-}" in
     xray-update)
         check_lock_for_write_ops
         cmd_xray_update
+        ;;
+    singbox-version)
+        cmd_singbox_version
+        ;;
+    singbox-update)
+        check_lock_for_write_ops
+        cmd_singbox_update
         ;;
     ports)
         check_lock_for_write_ops

@@ -1502,4 +1502,57 @@ assert_eq "2" "$(ls "$SINGBOX_BIN".bak-v* | wc -l | tr -d ' ')" "only the newest
 [[ -e "$SINGBOX_BIN.bak-manual" ]] || fail_case "a backup the script did not create must not be pruned"
 SCENARIO
 
+# sing-box release commands: a read-only status view and a guarded update.
+run_scenario singbox-release-commands <<'SCENARIO'
+load_modules
+SINGBOX_BIN=/srv/bin/sing-box
+make_core() { printf '#!/bin/sh\n[ "$1" = version ] && echo "sing-box version %s"\nexit 0\n' "$1" >"$SINGBOX_BIN"; chmod 755 "$SINGBOX_BIN"; }
+LATEST_TAG=v1.14.4
+secure_curl() { [[ -n "$LATEST_TAG" ]] || return 22; printf '{"tag_name":"%s","assets":[]}\n' "$LATEST_TAG"; }
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+make_core 1.14.4
+out=$(cmd_singbox_version | strip)
+assert_contains "$out" "Installed:      v1.14.4" "the installed version is shown"
+assert_contains "$out" "Latest stable:  v1.14.4" "the latest stable version is shown"
+assert_contains "$out" "up to date" "a current core is reported as up to date"
+
+make_core 1.14.0
+assert_contains "$(cmd_singbox_version | strip)" "an update is available" "an older core is offered an update"
+
+make_core 1.12.3
+out=$(cmd_singbox_version | strip)
+assert_contains "$out" "Security baseline: v1.13.16" "the baseline is shown"
+assert_contains "$out" "below the security baseline" "a core below the baseline is flagged"
+
+# A failed remote query keeps the local result.
+LATEST_TAG=""
+out=$(cmd_singbox_version | strip)
+assert_contains "$out" "Installed:      v1.12.3" "the local version survives a failed query"
+assert_contains "$out" "Latest stable:  unavailable" "the remote side is marked unavailable"
+assert_contains "$out" "below the security baseline" "the baseline check needs no network"
+
+rm -f -- "$SINGBOX_BIN"
+assert_contains "$(cmd_singbox_version | strip)" "Not installed" "an absent core is reported"
+
+# The update command refuses to run unprivileged or without an installed core.
+is_root() { return 1; }
+assert_fails "an unprivileged update must be refused" cmd_singbox_update
+is_root() { return 0; }
+rc=0
+cmd_singbox_update 2>/srv/update.err || rc=$?
+assert_eq "1" "$rc" "updating a core that is not installed must fail"
+assert_contains "$(cat /srv/update.err)" "sing-box is not installed" "the failure must explain itself"
+make_core 1.14.0
+singbox_install_release() { printf '%s\n' "$1" >/srv/update.intent; }
+cmd_singbox_update
+assert_eq "update" "$(cat /srv/update.intent)" "the command drives the update intent"
+
+# CLI wiring.
+main=$(cat /mnt/lib/90_main.sh)
+assert_contains "$main" "singbox-version)" "singbox-version must be dispatched"
+assert_contains "$main" "singbox-update)" "singbox-update must be dispatched"
+assert_contains "$main" "cmd_singbox_release_menu" "the tools menu must reach the sing-box release view"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
