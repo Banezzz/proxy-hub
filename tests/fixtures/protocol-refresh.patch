@@ -3,9 +3,16 @@
 @@ -416 +416 @@
 -    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
 +    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
-@@ -451,0 +452 @@
+@@ -417,0 +418 @@
++    XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
+@@ -451,0 +453 @@
 +    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
-@@ -603,0 +605,83 @@
+@@ -454,0 +457,4 @@
++    XHTTP_UUID=$(safe_read_config_value "$file" "XHTTP_UUID")
++    XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
++    XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
++    XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
+@@ -603,0 +610,83 @@
 +# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
 +# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
 +# Usage: t2 "中文" "English"
@@ -89,30 +96,30 @@
 +    fi
 +}
 +
-@@ -605,0 +690 @@
+@@ -605,0 +695 @@
 +#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
-@@ -625,0 +711 @@
+@@ -625,0 +716 @@
 +        --arg target_key "$(xray_reality_target_key)" \
-@@ -640 +726 @@
+@@ -640 +731 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -643,2 +729 @@
+@@ -643,2 +734 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
 +                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
-@@ -674,0 +760 @@
+@@ -674,0 +765 @@
 +        --arg target_key "$(xray_reality_target_key)" \
-@@ -690 +776 @@
+@@ -690 +781 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -693,2 +779 @@
+@@ -693,2 +784 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
 +                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
-@@ -767 +852 @@
+@@ -767 +857 @@
 -                    "short_id": [$sid]
 +                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
-@@ -960 +1045,12 @@
+@@ -960 +1050,12 @@
 -# SNI 域名列表（完整列表，用于延迟测试）
 +# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
 +# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
@@ -126,35 +133,35 @@
 +}
 +
 +# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
-@@ -977 +1072,0 @@
+@@ -977 +1077,0 @@
 -    "xp.apple.com"
-@@ -979 +1073,0 @@
+@@ -979 +1078,0 @@
 -    "www.apple.com"
-@@ -984,2 +1077,0 @@
+@@ -984,2 +1082,0 @@
 -    "www.icloud.com"
 -    "apps.apple.com"
-@@ -995 +1086,0 @@
+@@ -995 +1091,0 @@
 -    "ocsp2.apple.com"
-@@ -1003 +1093,0 @@
+@@ -1003 +1098,0 @@
 -    "apps.mzstatic.com"
-@@ -1010 +1099,0 @@
+@@ -1010 +1104,0 @@
 -    "statici.icloud.com"
-@@ -1029 +1117,0 @@
+@@ -1029 +1122,0 @@
 -    "is1-ssl.mzstatic.com"
-@@ -1036 +1123,0 @@
+@@ -1036 +1128,0 @@
 -    "gsp-ssl.ls.apple.com"
-@@ -1047 +1133,0 @@
+@@ -1047 +1138,0 @@
 -    "fpinit.itunes.apple.com"
-@@ -1051,2 +1136,0 @@
+@@ -1051,2 +1141,0 @@
 -    "iosapps.itunes.apple.com"
 -    "se-edge.itunes.apple.com"
-@@ -1056 +1139,0 @@
+@@ -1056 +1144,0 @@
 -    "configuration.ls.apple.com"
-@@ -1060 +1142,0 @@
+@@ -1060 +1147,0 @@
 -    "amp-api-edge.apps.apple.com"
-@@ -1073 +1154,0 @@
+@@ -1073 +1159,0 @@
 -    "downloaddispatch.itunes.apple.com"
-@@ -5429,0 +5511,37 @@
+@@ -5429,0 +5516,37 @@
 +# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
 +# 已经分配给别的节点的端口再发一次。
 +# Usage: node_tcp_port_claimed PORT
@@ -192,25 +199,25 @@
 +    gen_random_free_port "$exclude_port"
 +}
 +
-@@ -5522 +5640,5 @@
+@@ -5522 +5645,5 @@
 -            default_at_port=$(gen_random_free_port)
 +            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 +                default_at_port=$(default_reality_port)
 +            else
 +                default_at_port=$(gen_random_free_port)
 +            fi
-@@ -5559 +5681 @@
+@@ -5559 +5686 @@
 -            default_vision_port=$(gen_random_free_port)
 +            default_vision_port=$(default_reality_port)
-@@ -5575 +5697 @@
+@@ -5575 +5702 @@
 -            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
 +            default_xhttp_port=$(default_reality_port "${PORT:-0}")
-@@ -5634 +5756,3 @@
+@@ -5634 +5761,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +5776,16 @@
+@@ -5651,0 +5781,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -227,11 +234,11 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +5850,3 @@
+@@ -5709,0 +5855,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -5951,0 +6095,104 @@
+@@ -5951,0 +6100,104 @@
 +# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
 +# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
 +# 预热一次，后台子 shell 直接继承。
@@ -336,21 +343,21 @@
 +    done
 +}
 +
-@@ -5959 +6206 @@
+@@ -5959 +6211 @@
 -    local t1 t2 family_flag
 +    local t1 t2 family_flag tls13_flag
-@@ -5962,0 +6210,3 @@
+@@ -5962,0 +6215,3 @@
 +    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
 +    tls13_flag=$(sni_tls13_flag)
 +    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
-@@ -5987,0 +6238 @@
+@@ -5987,0 +6243 @@
 +    sni_tls13_flag >/dev/null
-@@ -6082,0 +6334 @@
+@@ -6082,0 +6339 @@
 +    sni_tls13_flag >/dev/null
-@@ -6201 +6453 @@
+@@ -6201 +6458 @@
 -    # 获取排序后的 Top 5 域名
 +    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
-@@ -6204,6 +6456 @@
+@@ -6204,6 +6461 @@
 -    while IFS=' ' read -r lat dom; do
 -        top_domains+=("$dom")
 -        top_latencies+=("$lat")
@@ -358,13 +365,13 @@
 -        echo "${latency_map[$domain]} $domain"
 -    done | sort -n | head -5)
 +    rank_sni_candidates latency_map top_domains top_latencies
-@@ -6303 +6550,4 @@
+@@ -6303 +6555,4 @@
 -                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
 +                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
 +                printf "\n"
-@@ -6377,0 +6628,9 @@
+@@ -6377,0 +6633,9 @@
 +# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
 +# 自己的理由（例如目标与服务器同 ASN）。
 +# Usage: warn_discouraged_reality_target DOMAIN
@@ -374,32 +381,86 @@
 +        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
 +}
 +
-@@ -6398,0 +6658 @@
+@@ -6398,0 +6663 @@
 +            warn_discouraged_reality_target "$SNI"
-@@ -6478,0 +6739,4 @@
+@@ -6478,0 +6744,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +6748 @@
+@@ -6484 +6753 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +6760,2 @@
-+        n_sid_list=$(reality_short_id_list "$n_short_id" \
-+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6563 +6829 @@
+@@ -6495,0 +6765,3 @@
++        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list
++        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
++        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
+@@ -6501,0 +6774,14 @@
++        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
++        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
++        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
++        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
++        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
++        n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
++        [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
++        if [[ -z "$n_xhttp_private_key" ]]; then
++            n_xhttp_private_key="$n_private_key"
++            n_xhttp_sid_list="$n_sid_list"
++        else
++            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
++        fi
++
+@@ -6563 +6849 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
-@@ -6591 +6857 @@
+@@ -6591 +6877 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
-+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
-@@ -6709 +6975,2 @@
++            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path")
+@@ -6709 +6995,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6891,0 +7159 @@
+@@ -6870,0 +7158,2 @@
++    local save_xhttp_uuid="${XHTTP_UUID:-}"
++    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
+@@ -6872,0 +7162,2 @@
++        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
++        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
+@@ -6891,0 +7183 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6989,0 +7258,31 @@
+@@ -6894,0 +7187,4 @@
++XHTTP_UUID=$save_xhttp_uuid
++XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
++XHTTP_PRIVATE_KEY=$save_xhttp_private_key
++XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
+@@ -6944 +7240,25 @@
+-    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
++    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
++    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
++    if [[ -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
++        link_pbk="$XHTTP_PUBLIC_KEY"
++        link_sid="${XHTTP_SHORT_ID:-}"
++    fi
++    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${link_sid}#${node_label}"
++}
++
++# 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
++# gen_reality_keys 直接写全局的 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，因此先保存 Vision
++# 的那一套，生成后搬到 XHTTP_* 再还原。
++gen_xhttp_credentials() {
++    local keep_public="$PUBLIC_KEY" keep_private="$PRIVATE_KEY" keep_sid="$SHORT_ID" rc=0
++    gen_reality_keys || rc=$?
++    if ((rc == 0)); then
++        XHTTP_PUBLIC_KEY="$PUBLIC_KEY"
++        XHTTP_PRIVATE_KEY="$PRIVATE_KEY"
++        XHTTP_SHORT_ID="$SHORT_ID"
++        XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
++    fi
++    PUBLIC_KEY="$keep_public"
++    PRIVATE_KEY="$keep_private"
++    SHORT_ID="$keep_sid"
++    return "$rc"
+@@ -6989,0 +7310,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -431,15 +492,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7290,5 @@
+@@ -6990,0 +7342,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7299 @@
+@@ -6994,0 +7351 @@
 +    local pin="" query
-@@ -7000 +7305,19 @@
+@@ -7000 +7357,19 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    query="sni=${SNI:-www.bing.com}&insecure=1"
 +    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
@@ -460,26 +521,47 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7092,0 +7416,6 @@
+@@ -7092,0 +7468,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7179,0 +7509 @@
+@@ -7179,0 +7561 @@
 +        show_selfsigned_cert_pins
-@@ -7207,0 +7538 @@
+@@ -7207,0 +7590 @@
 +            show_extra_short_ids
-@@ -7212,0 +7544 @@
+@@ -7212,0 +7596 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +7594 @@
+@@ -7261,0 +7646,6 @@
 +        show_extra_short_ids
-@@ -7552,0 +7886 @@
++        if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
++            echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
++            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
++            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
++        fi
+@@ -7552,0 +7943 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7572,0 +7907 @@
+@@ -7572,0 +7964 @@
 +            apply_extra_short_ids || return 1
-@@ -7588,0 +7924 @@
+@@ -7588,0 +7981 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7595,0 +7932 @@
+@@ -7595,0 +7989,5 @@
 +        apply_extra_short_ids || return 1
++        # both 节点的两个 inbound 各用一套凭据，互不牵连。
++        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
++            gen_xhttp_credentials || return 1
++        fi
+@@ -7921,0 +8320,2 @@
++    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
++    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
+@@ -8028,0 +8429,2 @@
++                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
++                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
+@@ -8033,0 +8436,5 @@
++                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
++                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
++                        local keep_xhttp_uuid="$XHTTP_UUID"
++                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
++                    fi

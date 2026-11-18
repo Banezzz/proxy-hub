@@ -415,6 +415,7 @@ reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
     PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
+    XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
@@ -453,6 +454,10 @@ safe_load_node_config() {
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
+    XHTTP_UUID=$(safe_read_config_value "$file" "XHTTP_UUID")
+    XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
+    XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
+    XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -6757,13 +6762,28 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
-        n_sid_list=$(reality_short_id_list "$n_short_id" \
-            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
+        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list
+        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
+        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
         n_uuid=$(decrypt_value "$n_uuid")
         n_ss_password=$(decrypt_value "$n_ss_password")
+
+        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
+        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
+        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
+        n_xhttp_uuid=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_UUID")")
+        n_xhttp_private_key=$(decrypt_value "$(safe_read_config_value "$node_file" "XHTTP_PRIVATE_KEY")")
+        n_xhttp_sid_list=$(safe_read_config_value "$node_file" "XHTTP_SHORT_ID")
+        [[ -z "$n_xhttp_uuid" ]] && n_xhttp_uuid="$n_uuid"
+        if [[ -z "$n_xhttp_private_key" ]]; then
+            n_xhttp_private_key="$n_private_key"
+            n_xhttp_sid_list="$n_sid_list"
+        else
+            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
+        fi
 
         # 向后兼容：旧配置没有 PROTOCOL_TYPE，根据端口判断
         if [[ -z "$n_protocol_type" ]]; then
@@ -6854,7 +6874,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -7135,8 +7155,12 @@ save_env() {
     local save_ss_password="${SS_PASSWORD:-}"
     local save_anytls_password="${ANYTLS_PASSWORD:-}"
     local save_hy2_password="${HY2_PASSWORD:-}"
+    local save_xhttp_uuid="${XHTTP_UUID:-}"
+    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
 
     if is_encryption_enabled; then
+        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
+        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
         # encrypt_value 对空串直接返回空串，因此无需额外判空。
         save_uuid=$(encrypt_value "$save_uuid")
         save_private_key=$(encrypt_value "$save_private_key")
@@ -7160,6 +7184,10 @@ EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
+XHTTP_UUID=$save_xhttp_uuid
+XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
+XHTTP_PRIVATE_KEY=$save_xhttp_private_key
+XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
@@ -7209,7 +7237,31 @@ get_xhttp_link() {
     # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
     local encoded_path
     encoded_path=$(echo -n "$XHTTP_PATH" | sed 's|/|%2F|g')
-    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
+    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
+    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
+    if [[ -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+        link_pbk="$XHTTP_PUBLIC_KEY"
+        link_sid="${XHTTP_SHORT_ID:-}"
+    fi
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${link_sid}#${node_label}"
+}
+
+# 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
+# gen_reality_keys 直接写全局的 PUBLIC_KEY/PRIVATE_KEY/SHORT_ID，因此先保存 Vision
+# 的那一套，生成后搬到 XHTTP_* 再还原。
+gen_xhttp_credentials() {
+    local keep_public="$PUBLIC_KEY" keep_private="$PRIVATE_KEY" keep_sid="$SHORT_ID" rc=0
+    gen_reality_keys || rc=$?
+    if ((rc == 0)); then
+        XHTTP_PUBLIC_KEY="$PUBLIC_KEY"
+        XHTTP_PRIVATE_KEY="$PRIVATE_KEY"
+        XHTTP_SHORT_ID="$SHORT_ID"
+        XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    PUBLIC_KEY="$keep_public"
+    PRIVATE_KEY="$keep_private"
+    SHORT_ID="$keep_sid"
+    return "$rc"
 }
 
 # 生成 Shadowsocks 分享链接
@@ -7592,6 +7644,11 @@ show_info() {
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
         show_extra_short_ids
+        if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
+            echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
+            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
+            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
+        fi
         echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 
@@ -7930,6 +7987,10 @@ cmd_install() {
         choose_ports
         gen_reality_keys
         apply_extra_short_ids || return 1
+        # both 节点的两个 inbound 各用一套凭据，互不牵连。
+        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
+            gen_xhttp_credentials || return 1
+        fi
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -8256,6 +8317,8 @@ cmd_edit() {
     SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
     ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
     HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
+    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -8363,11 +8426,18 @@ cmd_edit() {
             vision:3|xhttp:3|both:4)
                 UUID=$(cat /proc/sys/kernel/random/uuid)
                 log_info "新 UUID: $UUID"
+                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
+                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
                 changed=true ;;
 
             # ---- Reality 密钥对 ----
             vision:4|xhttp:4|both:5|anytls_reality:5)
                 if gen_reality_keys; then
+                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
+                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
+                        local keep_xhttp_uuid="$XHTTP_UUID"
+                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
+                    fi
                     log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
                     changed=true
                 fi ;;
@@ -11565,7 +11635,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=452352 body-sha256=f313296894b5f73bc967df50da1a0568fb3e60d896251625e3b1d4278e7cb50f
-# build-id=f313296894b5f73bc967df50da1a0568fb3e60d896251625e3b1d4278e7cb50f
+# body-bytes=456285 body-sha256=57be6fc7c33a3f3c6d8ca6a0ae626be69f729e81d0a036859231c91fbb8fd9db
+# build-id=57be6fc7c33a3f3c6d8ca6a0ae626be69f729e81d0a036859231c91fbb8fd9db
 # module-count=11
 # proxy-hub-bundle-end-v1

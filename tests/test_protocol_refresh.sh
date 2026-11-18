@@ -575,4 +575,88 @@ assert_eq "198.51.100.1 13335
 assert_fails "an empty lookup must fail" sni_bulk_asn
 SCENARIO
 
+# `both` nodes: Vision and XHTTP get separate UUIDs, REALITY keys and short IDs.
+# A node created before the split keeps rendering the shared credentials.
+run_scenario both-split-credentials <<'SCENARIO'
+load_modules
+
+# Legacy node: no XHTTP_* fields, both inbounds share everything.
+write_node legacy both
+write_config
+vision=$(jq -c '.inbounds[] | select(.tag == "legacy_vision")' "$XRAY_CONF")
+xhttp=$(jq -c '.inbounds[] | select(.tag == "legacy_xhttp")' "$XRAY_CONF")
+assert_eq "$(jq -r '.settings.clients[0].id' <<<"$vision")" "$(jq -r '.settings.clients[0].id' <<<"$xhttp")" \
+    "a legacy both node keeps one UUID"
+assert_eq "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$vision")" \
+    "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$xhttp")" "a legacy both node keeps one key"
+CURRENT_NODE_NAME=legacy
+safe_load_node_config "$NODES_DIR/legacy.env"
+assert_contains "$(get_xhttp_link 203.0.113.10 l)" "vless://11111111-1111-4111-8111-111111111111@" \
+    "a legacy XHTTP link uses the shared UUID"
+
+# Split node.
+write_node split both \
+    "XHTTP_UUID=22222222-2222-4222-8222-222222222222" \
+    "XHTTP_PUBLIC_KEY=SplitPublicKey_abc" \
+    "XHTTP_PRIVATE_KEY=YEaD36oML8mWHgw86qao95BwbYgzHxa6_xnLkoKR8aA" \
+    "XHTTP_SHORT_ID=fedcba9876543210" \
+    "EXTRA_SHORT_IDS=aa11"
+write_config
+vision=$(jq -c '.inbounds[] | select(.tag == "split_vision")' "$XRAY_CONF")
+xhttp=$(jq -c '.inbounds[] | select(.tag == "split_xhttp")' "$XRAY_CONF")
+assert_eq "11111111-1111-4111-8111-111111111111" "$(jq -r '.settings.clients[0].id' <<<"$vision")" "Vision UUID"
+assert_eq "22222222-2222-4222-8222-222222222222" "$(jq -r '.settings.clients[0].id' <<<"$xhttp")" "XHTTP UUID"
+assert_eq "YEaD36oML8mWHgw86qao95BwbYgzHxa6_xnLkoKR8aA" \
+    "$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$xhttp")" "XHTTP private key"
+assert_eq '["0123456789abcdef","aa11"]' "$(jq -c '.streamSettings.realitySettings.shortIds' <<<"$vision")" \
+    "Vision short IDs"
+assert_eq '["fedcba9876543210","aa11"]' "$(jq -c '.streamSettings.realitySettings.shortIds' <<<"$xhttp")" \
+    "XHTTP short IDs: its own primary plus the shared extras"
+
+CURRENT_NODE_NAME=split
+safe_load_node_config "$NODES_DIR/split.env"
+xlink=$(get_xhttp_link 203.0.113.10 x)
+vlink=$(get_vision_link 203.0.113.10 v)
+assert_contains "$xlink" "vless://22222222-2222-4222-8222-222222222222@203.0.113.10:2443" "XHTTP link UUID and port"
+assert_contains "$xlink" "pbk=SplitPublicKey_abc&" "XHTTP link public key"
+assert_contains "$xlink" "sid=fedcba9876543210" "XHTTP link short ID"
+assert_contains "$vlink" "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:1443" "Vision link is unchanged"
+assert_not_contains "$vlink" "SplitPublicKey" "Vision link must not carry the XHTTP key"
+info=$(show_info)
+assert_contains "$info" "SplitPublicKey_abc" "node info shows the XHTTP key"
+assert_contains "$info" "XHTTP has its own credentials" "node info explains the split"
+
+# save_env round trip.
+save_env
+for field in XHTTP_UUID XHTTP_PUBLIC_KEY XHTTP_PRIVATE_KEY XHTTP_SHORT_ID; do
+    [[ -n "$(safe_read_config_value "$NODES_DIR/split.env" "$field")" ]] || fail_case "$field was not persisted"
+done
+
+# Generator: fresh XHTTP credentials, Vision ones restored.
+cat >/srv/bin/xray-keys <<'XRAY'
+#!/bin/sh
+n=$(cat /srv/keycount 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >/srv/keycount
+printf 'PrivateKey: priv%s\nPassword (PublicKey): pub%s\n' "$n" "$n"
+XRAY
+chmod 755 /srv/bin/xray-keys
+XRAY_BIN=/srv/bin/xray-keys
+reset_node_state
+gen_reality_keys 2>/dev/null
+vision_sid="$SHORT_ID"
+gen_xhttp_credentials 2>/dev/null
+assert_eq "priv1/pub1/$vision_sid" "$PRIVATE_KEY/$PUBLIC_KEY/$SHORT_ID" "Vision credentials must be restored"
+assert_eq "priv2/pub2" "$XHTTP_PRIVATE_KEY/$XHTTP_PUBLIC_KEY" "XHTTP must receive a second key pair"
+[[ "$XHTTP_SHORT_ID" =~ ^[0-9a-f]{16}$ && "$XHTTP_SHORT_ID" != "$vision_sid" ]] || \
+    fail_case "XHTTP must receive its own short ID"
+[[ "$XHTTP_UUID" =~ ^[0-9a-f-]{36}$ ]] || fail_case "XHTTP must receive its own UUID"
+
+if use_real_xray; then
+    write_config
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+        cat /srv/xray-test.out >&2
+        fail_case "the real core rejected the split-credential config"
+    }
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

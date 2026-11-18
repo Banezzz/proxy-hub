@@ -399,6 +399,7 @@ reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
     PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
+    XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
@@ -437,6 +438,10 @@ safe_load_node_config() {
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
+    XHTTP_UUID=$(safe_read_config_value "$file" "XHTTP_UUID")
+    XHTTP_PUBLIC_KEY=$(safe_read_config_value "$file" "XHTTP_PUBLIC_KEY")
+    XHTTP_PRIVATE_KEY=$(safe_read_config_value "$file" "XHTTP_PRIVATE_KEY")
+    XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")

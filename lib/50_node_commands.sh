@@ -280,6 +280,10 @@ cmd_install() {
         choose_ports
         gen_reality_keys
         apply_extra_short_ids || return 1
+        # both 节点的两个 inbound 各用一套凭据，互不牵连。
+        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
+            gen_xhttp_credentials || return 1
+        fi
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -606,6 +610,8 @@ cmd_edit() {
     SS_PASSWORD=$(decrypt_value "$SS_PASSWORD")
     ANYTLS_PASSWORD=$(decrypt_value "$ANYTLS_PASSWORD")
     HY2_PASSWORD=$(decrypt_value "$HY2_PASSWORD")
+    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
+    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -713,11 +719,18 @@ cmd_edit() {
             vision:3|xhttp:3|both:4)
                 UUID=$(cat /proc/sys/kernel/random/uuid)
                 log_info "新 UUID: $UUID"
+                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
+                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
                 changed=true ;;
 
             # ---- Reality 密钥对 ----
             vision:4|xhttp:4|both:5|anytls_reality:5)
                 if gen_reality_keys; then
+                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
+                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
+                        local keep_xhttp_uuid="$XHTTP_UUID"
+                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
+                    fi
                     log_warn "Reality 密钥已更新，客户端需同步新的 PublicKey/ShortID"
                     changed=true
                 fi ;;
