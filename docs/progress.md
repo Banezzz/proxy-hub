@@ -1,5 +1,46 @@
 # 变更记录
 
+## 2026-11-18 — 协议刷新的后续：加密缺陷、Xray 承载 Hysteria2、shortId 升级项
+
+- **修复可选配置加密写出多行密文**。`ENABLE_CONFIG_ENCRYPTION=true` 时 `encrypt_value`
+  的 base64 每 64 字符换行，UUID 与 REALITY 私钥的密文都是两行，写进逐行的节点文件
+  后第二行丢失、节点无法再读出。密文现在恒为单行。同时修正失败语义：解不开的密文
+  不再被原样当作明文返回（那会把 base64 写进内核配置），`load_node_for_edit` 遇到
+  解不开的字段即中止，不会在重存时用空值覆盖仅存的密文。
+- **Hysteria2 可由 Xray 承载**。`hy2core=xray`（安装）或节点编辑里的"切换承载内核"。
+  默认仍是 sing-box；两个后端对客户端等价，分享链接不变。节点归属的判断收拢到
+  `node_core_of` 一处。Xray 不支持的组合（ACME、OpenRC 上的端口跳跃、低于 v26.3.27）
+  在写入任何东西之前被拒绝。端口跳跃的 NAT 规则同时挂到 xray 服务。
+- **升级向导新增 `node.<name>.shortid`**（可选、会改链接、默认不勾选），说明里写明
+  收益有限。
+- `help` 补上上一轮新增却没有列出的 Hysteria2 / REALITY / VLESS 安装参数。
+
+影响范围：`encrypt_value` / `decrypt_value` 与全部经它们读写的敏感字段、节点编辑与
+升级向导的加载路径；Hysteria2 的安装、编辑、回滚、两个内核的配置渲染与节点计数、
+端口跳跃 drop-in；升级扫描与执行；`help`。节点 env 新增可选字段 `HY2_CORE`。
+
+兼容性：
+
+- 未启用加密的安装不受加密修复影响。启用了加密且节点文件里已有被截断的密文的，
+  数据在旧版本写入时就已丢失，无法恢复；现在的表现是该字段读作空并告警、节点编辑
+  被拒绝，而不是把密文写进配置。这类节点需要重新生成凭据或重装。
+- `HY2_CORE` 缺失即 sing-box，既有 Hysteria2 节点的归属、配置与链接都不变。
+- `rollback_candidate_node` 增加可选的第三个参数（内核），省略时按协议的默认归属，
+  既有调用方式不变。
+
+验证方式：`bash tests/test_protocol_refresh.sh`（27 个场景）与
+`bash tests/test_upgrade.sh`。新增的加密场景在修复前的代码上于第一条断言失败（36
+字节的值加密成两行），修复后覆盖全部敏感字段经 `save_env`、加载器与渲染器的往返，
+以及截断密文与密钥文件缺失。Hysteria2 的两个后端在提供真实内核时由
+`hysteria2-interop` 场景做回环互通：真实 Xray 26.11.9 / sing-box 1.14.4 作服务端、
+真实 sing-box 作客户端，每个后端 6 次探测（明文、错误密码、多余混淆、匹配的
+Salamander、缺混淆、错误混淆密码）加 1 个无入站对照，共 13 次，全部符合预期。这同时
+是 sing-box 后端 Salamander 选项的首次端到端证据。
+
+未验证：Xray 承载的 Hysteria2 在 IPv6 上的行为（验证环境没有 IPv6），见
+`docs/audits.md`。`tests/test_loader.sh` 与 `tests/test_xray_transaction.sh` 在该环境中
+仍各有一个与本轮无关、改动前就存在的失败用例。
+
 ## 2026-11-18 — 协议刷新、引导菜单与升级向导
 
 对照上游截至 2026-11 的状态（Xray v26.11.9、sing-box 1.14.4）更新协议层，并为旧版

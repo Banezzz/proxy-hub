@@ -183,3 +183,16 @@
   同 ASN，此时评分的实际作用只是把通用 CDN 后面的目标排到后面。真正的"同 ASN 目标"
   需要扫描服务器的邻近网段，脚本没有做这件事。
 - 临时缓解：自行找到同 ASN 的目标后，用 `reym=` 或 SNI 菜单的"手动输入"指定。
+
+## Xray 承载的 Hysteria2 在 IPv6 上未经验证
+
+- 严重性：low
+- 影响范围：`HY2_CORE=xray` 的 Hysteria2 节点，在双栈或 IPv6 Only 主机上。
+- 触发条件：客户端经 IPv6 连接，或网络栈设置为 `v6`。
+- 影响：该后端在 IPv4 回环上与真实 sing-box 客户端互通（含 Salamander 与反例）。但
+  验证环境没有 IPv6，下面两点没有实测：`dual` 档下监听 `0.0.0.0` 的 UDP socket 是否
+  同时接受 IPv6 连接（TCP 入站依赖的"通配监听即双栈"是否对 Xray 的 QUIC 监听同样
+  成立）；`v6` 档下 `listen "::"` 加 `sockopt.v6only` 是否生效。在没有 IPv6 的主机上，
+  后者只会让 Xray 记一条"failed to set IPV6_V6ONLY"并继续提供 IPv4 服务。
+- 临时缓解：需要 IPv6 入口的 Hysteria2 节点保持默认的 sing-box 后端（它在 `dual` 档
+  监听 `::`），或在一台双栈主机上实测后再切换。
