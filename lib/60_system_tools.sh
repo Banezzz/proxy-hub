@@ -798,8 +798,13 @@ warp_toggle_netflix() {
         rm -f /root/.warp_netflix
         log_info "Netflix routing disabled"
     else
-        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库
-        ensure_geodata
+        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库。数据库没有通过校验时
+        # 不启用规则：引用一个不存在的 geosite 会让 Xray 配置校验失败。
+        if ! ensure_geodata; then
+            echo ""
+            read -rp "$(msg menu_press_enter)"
+            return
+        fi
         touch /root/.warp_netflix
         log_info "Netflix routing enabled"
     fi
@@ -820,7 +825,11 @@ warp_toggle_ai() {
         log_info "AI services routing disabled"
     else
         # 分流规则使用 geosite:openai/anthropic，需要 GeoSite 数据库
-        ensure_geodata
+        if ! ensure_geodata; then
+            echo ""
+            read -rp "$(msg menu_press_enter)"
+            return
+        fi
         touch /root/.warp_ai
         log_info "AI services routing enabled"
     fi

@@ -1663,4 +1663,101 @@ uninstall=$(declare -f warp_uninstall)
 assert_not_contains "$uninstall" "bash menu.sh" "a local menu.sh is not a trusted source"
 SCENARIO
 
+# GeoData: both databases must match their published checksums before either
+# replaces the live copy, and the weekly cron job runs the same verified helper.
+run_scenario geodata-verified-update <<'SCENARIO'
+load_modules
+XRAY_GEODATA_DIR=/srv/geo
+GEODATA_HELPER=/srv/state/libexec/proxy-hub-geodata-update
+mkdir -p /srv/geo /srv/remote
+printf 'old-geoip\n' >/srv/geo/geoip.dat
+printf 'old-geosite\n' >/srv/geo/geosite.dat
+
+# A fake curl serving /srv/remote by file name.
+cat >/srv/bin/curl <<'FAKE'
+#!/bin/sh
+url=""; dest=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) dest="$2"; shift ;; https://*) url="$1" ;; esac
+  shift
+done
+name="${url##*/}"
+[ -f "/srv/remote/$name" ] || exit 22
+cp "/srv/remote/$name" "$dest"
+FAKE
+chmod 755 /srv/bin/curl
+PATH="/srv/bin:$PATH"
+publish() {
+    printf '%s\n' "$1" >/srv/remote/geoip.dat
+    printf '%s\n' "$2" >/srv/remote/geosite.dat
+    printf '%s  geoip.dat\n' "$(sha256sum /srv/remote/geoip.dat | awk '{print $1}')" >/srv/remote/geoip.dat.sha256sum
+    printf '%s  geosite.dat\n' "$(sha256sum /srv/remote/geosite.dat | awk '{print $1}')" >/srv/remote/geosite.dat.sha256sum
+}
+
+install_geodata_helper || fail_case "the helper could not be installed"
+sh -n "$GEODATA_HELPER" || fail_case "the helper is not valid POSIX sh"
+
+publish new-geoip new-geosite
+"$GEODATA_HELPER" || fail_case "a verified update must succeed"
+assert_eq "new-geoip/new-geosite" "$(cat /srv/geo/geoip.dat)/$(cat /srv/geo/geosite.dat)" "both databases are replaced"
+[[ -z "$(find /srv/geo -name '.geodata.*')" ]] || fail_case "the staging directory was left behind"
+
+# One bad checksum keeps both old files: no half-updated pair.
+publish newer-geoip newer-geosite
+printf '%s  geosite.dat\n' "$(printf x | sha256sum | awk '{print $1}')" >/srv/remote/geosite.dat.sha256sum
+rc=0
+"$GEODATA_HELPER" 2>/srv/geo.err || rc=$?
+assert_eq "1" "$rc" "a checksum mismatch must fail"
+assert_contains "$(cat /srv/geo.err)" "checksum mismatch: geosite.dat" "the failing file is named"
+assert_eq "new-geoip/new-geosite" "$(cat /srv/geo/geoip.dat)/$(cat /srv/geo/geosite.dat)" \
+    "a failed update must leave both live files untouched"
+
+# A missing or malformed checksum file fails closed as well.
+publish newer-geoip newer-geosite
+rm -f /srv/remote/geoip.dat.sha256sum
+assert_fails "a missing checksum file must fail" "$GEODATA_HELPER"
+printf 'not-a-hash  geoip.dat\n' >/srv/remote/geoip.dat.sha256sum
+assert_fails "a malformed checksum must fail" "$GEODATA_HELPER"
+: >/srv/remote/geoip.dat.sha256sum
+assert_fails "an empty checksum must fail" "$GEODATA_HELPER"
+assert_eq "new-geoip" "$(cat /srv/geo/geoip.dat)" "failed runs never touch the live data"
+[[ -z "$(find /srv/geo -name '.geodata.*')" ]] || fail_case "a failed run leaked its staging directory"
+
+# Cron: the legacy unverified entry is replaced by one call to the helper.
+CRONTAB_FILE=/srv/crontab
+cat >"$CRONTAB_FILE" <<'CRON'
+15 3 * * * /usr/bin/backup
+0 4 * * 0 curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o /usr/local/share/xray/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o /usr/local/share/xray/geosite.dat >/dev/null 2>&1
+CRON
+# Like the real crontab, the stub replaces the table only after reading all input.
+crontab() {
+    if [[ "${1:-}" == "-l" ]]; then
+        cat "$CRONTAB_FILE"
+    else
+        cat >"$CRONTAB_FILE.new"
+        mv -f "$CRONTAB_FILE.new" "$CRONTAB_FILE"
+    fi
+}
+geodata_cron_is_legacy || fail_case "the unverified cron entry must be recognised as legacy"
+setup_geodata_cron
+setup_geodata_cron
+assert_eq "1" "$(grep -c 'proxy-hub-geodata' "$CRONTAB_FILE")" "repeated setup must not stack cron entries"
+assert_contains "$(cat "$CRONTAB_FILE")" "0 4 * * 0 $GEODATA_HELPER" "cron runs the verified helper"
+assert_not_contains "$(cat "$CRONTAB_FILE")" "geoip.dat -o" "the unverified download is gone"
+assert_contains "$(cat "$CRONTAB_FILE")" "/usr/bin/backup" "unrelated cron entries survive"
+assert_fails "a migrated crontab is no longer legacy" geodata_cron_is_legacy
+
+# install_geodata reports failure instead of pretending the data is ready.
+execute_task() { bash -c "$1"; }
+msg() { printf '%s' "$1"; }
+ln() { :; }
+rm -f /srv/remote/geoip.dat
+rc=0
+install_geodata >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$rc" "install_geodata must fail when the download fails"
+publish final-geoip final-geosite
+install_geodata >/dev/null 2>&1 || fail_case "install_geodata failed with valid data"
+assert_eq "final-geoip" "$(cat /srv/geo/geoip.dat)" "install_geodata installs verified data"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

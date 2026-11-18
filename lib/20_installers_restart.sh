@@ -789,23 +789,65 @@ ensure_geodata() {
     install_geodata
 }
 
+# GeoIP/GeoSite 以 root 身份被 Xray 加载并决定路由，却是从第三方 release 的 latest
+# 链接取的。这里把"下载 → 校验 → 替换"收进一个独立 helper，安装时与每周 cron 共用：
+#   - 两个文件各自对照同一 release 发布的 .sha256sum，任何一个不一致就整体放弃；
+#   - 全部通过后才用 rename 替换，Xray 永远读不到写了一半的文件；
+#   - 失败时保留旧数据，不会把可用的数据库换成损坏的。
+GEODATA_HELPER="/usr/local/libexec/proxy-hub-geodata-update"
+GEODATA_CRON_MARKER="# proxy-hub-geodata"
+
+install_geodata_helper() {
+    local tmp
+    mkdir -p -- "$(dirname "$GEODATA_HELPER")" || return 1
+    tmp=$(mktemp "${GEODATA_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: geodata-update-v1
+# Downloads geoip.dat / geosite.dat, verifies them against the published
+# .sha256sum files, and replaces the live copies only when both verify.
+DIR='$XRAY_GEODATA_DIR'
+BASE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download'
+fetch() { curl --proto '=https' --tlsv1.2 --max-redirs 5 -fsSL "\$1" -o "\$2"; }
+mkdir -p "\$DIR" || exit 1
+tmp=\$(mktemp -d "\$DIR/.geodata.XXXXXXXX") || exit 1
+trap 'rm -rf "\$tmp"' EXIT
+for name in geoip.dat geosite.dat; do
+    fetch "\$BASE/\$name" "\$tmp/\$name" || { echo "download failed: \$name" >&2; exit 1; }
+    fetch "\$BASE/\$name.sha256sum" "\$tmp/\$name.sha256sum" || { echo "checksum download failed: \$name" >&2; exit 1; }
+    want=\$(awk 'NR == 1 { print \$1 }' "\$tmp/\$name.sha256sum")
+    have=\$(sha256sum "\$tmp/\$name" | awk '{ print \$1 }')
+    case "\$want" in
+        ????????????????????????????????????????????????????????????????) ;;
+        *) echo "malformed checksum: \$name" >&2; exit 1 ;;
+    esac
+    [ "\$want" = "\$have" ] || { echo "checksum mismatch: \$name" >&2; exit 1; }
+done
+for name in geoip.dat geosite.dat; do
+    chmod 644 "\$tmp/\$name" && mv -f "\$tmp/\$name" "\$DIR/\$name" || exit 1
+done
+exit 0
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$GEODATA_HELPER" || { rm -f -- "$tmp"; return 1; }
+}
+
 install_geodata() {
     log_info "$(msg install_geodata)"
 
     mkdir -p "$XRAY_GEODATA_DIR"
-
-    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-
-    # 下载 geoip.dat（使用安全的 curl 选项，内联因为 execute_task 在子 shell 运行）
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
-        # 创建软链接到 /usr/local/bin (Xray 查找位置)
-        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
+    if ! install_geodata_helper; then
+        log_error "Failed to install the GeoData update helper"
+        return 1
     fi
 
-    # 下载 geosite.dat
-    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
+    if execute_task "'$GEODATA_HELPER'" "Downloading and verifying geoip.dat / geosite.dat"; then
+        # 创建软链接到 /usr/local/bin (Xray 查找位置)
+        ln -sf "$XRAY_GEODATA_DIR/geoip.dat" /usr/local/bin/geoip.dat 2>/dev/null || true
         ln -sf "$XRAY_GEODATA_DIR/geosite.dat" /usr/local/bin/geosite.dat 2>/dev/null || true
+    else
+        log_error "$(t2 "GeoData 下载或 SHA-256 校验失败，未改动现有数据" \
+            "GeoData download or SHA-256 verification failed; existing data is untouched")"
+        return 1
     fi
 
     # 设置自动更新定时任务（每周日 4:00）
@@ -815,17 +857,23 @@ install_geodata() {
 }
 
 setup_geodata_cron() {
-    # Use secure curl options in cron job (--proto, --tlsv1.2)
-    local cron_cmd="curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
-    local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
+    local cron_job="0 4 * * 0 $GEODATA_HELPER >/dev/null 2>&1 $GEODATA_CRON_MARKER"
 
     # 检查 crontab 命令是否存在
     if ! command -v crontab &>/dev/null; then
         return 0
     fi
 
-    # 添加定时任务（先删除旧的）
-    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
+    # 添加定时任务。先删除旧条目：既包括带标记的新形式，也包括升级前那条直接把
+    # 未校验的下载结果写到数据文件上的 curl 命令。
+    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat' \
+        | grep -vF "$GEODATA_CRON_MARKER"; echo "$cron_job") | crontab - 2>/dev/null || true
+}
+
+# 现有 crontab 是否还在用升级前的未校验更新命令。
+geodata_cron_is_legacy() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -F 'v2ray-rules-dat' | grep -qvF "$GEODATA_CRON_MARKER"
 }
 
 # ============== Xray 定时重启 ==============
