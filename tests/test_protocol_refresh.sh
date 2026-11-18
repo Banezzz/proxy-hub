@@ -1286,4 +1286,19 @@ if ! ( : >/dev/tty ) 2>/dev/null; then
 fi
 SCENARIO
 
+# The protocol menu explains every choice and positions Shadowsocks honestly.
+run_scenario protocol-menu-guidance <<'SCENARIO'
+load_modules
+menu=$(declare -f prompt_protocol_type)
+assert_contains "$menu" "[recommended, default]" "the menu must mark a recommended protocol"
+assert_contains "$menu" "relay or landing use only" "Shadowsocks must be positioned as a relay protocol"
+assert_contains "$menu" "No domain or certificate needed" "REALITY must explain why it is the default"
+assert_contains "$menu" "needs UDP allowed" "Hysteria2 must state its network requirement"
+for choice in 1 2 3 4 5 6 7; do
+    assert_contains "$menu" "\${GREEN}${choice}.\${NC}" "protocol choice $choice must still be offered"
+done
+install_flow=$(declare -f cmd_install)
+assert_contains "$install_flow" "Shadowsocks has no traffic disguise" "installing Shadowsocks must warn about its positioning"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

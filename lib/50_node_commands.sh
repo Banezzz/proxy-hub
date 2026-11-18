@@ -187,6 +187,10 @@ cmd_install() {
     # Shadowsocks 和 VLESS 的安装流程不同
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
         # Shadowsocks 安装流程
+        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
+        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
+        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
+            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
         # 选择加密方式（或使用环境变量 ssmethod=xxx）
         if [[ -n "${ssmethod:-}" ]]; then
             SS_METHOD="$ssmethod"

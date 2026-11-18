@@ -5628,23 +5628,38 @@ SS_METHODS_LEGACY=(
     "aes-256-gcm"
 )
 
-# 选择协议类型
+# 选择协议类型。每个选项下面用一两行说明它适合谁、需要什么，让不熟悉协议的用户
+# 也能直接选；回车采用推荐项。
 prompt_protocol_type() {
     {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}                     选择节点协议类型${NC}"
+    echo -e "${GREEN}        $(t2 "选择节点协议类型（回车采用推荐）" "Choose a protocol (Enter for the recommended one)")${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
-    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
-    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
-    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022         ${GRAY}(SS 协议, 高性能)${NC}"
-    echo -e "  ${GREEN}5.${NC} AnyTLS                   ${GRAY}(sing-box, 自签名证书)${NC}"
-    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY         ${GRAY}(sing-box, 抗封锁, 推荐)${NC}"
-    echo -e "  ${GREEN}7.${NC} Hysteria2                ${GRAY}(sing-box, QUIC/UDP)${NC}"
+    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${YELLOW}$(t2 "[推荐，默认]" "[recommended, default]")${NC}"
+    menu_note "$(t2 "伪装成访问一个真实网站的 HTTPS，最稳妥的通用选择；无需域名和证书。" \
+        "Looks like HTTPS to a real website; the safest general choice. No domain or certificate needed.")"
+    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY"
+    menu_note "$(t2 "同样的伪装，流量形态更像网页请求；需要较新的客户端。" \
+        "Same disguise with traffic shaped like web requests; needs a fairly recent client.")"
+    echo -e "  ${GREEN}3.${NC} $(t2 "Vision + XHTTP 两个都装" "Vision + XHTTP together")"
+    menu_note "$(t2 "一次生成两个端口、两套独立凭据，客户端可以互为备用。" \
+        "Two ports with separate credentials, so clients have a fallback.")"
+    echo -e "  ${GREEN}4.${NC} Shadowsocks 2022  ${GRAY}$(t2 "[仅建议中转/落地]" "[relay or landing use only]")${NC}"
+    menu_note "$(t2 "速度快但没有伪装，不建议直接跨境使用；适合放在中转链路后面。" \
+        "Fast but undisguised; not advised for crossing a censored border directly. Suited to sit behind a relay.")"
+    echo -e "  ${GREEN}5.${NC} AnyTLS"
+    menu_note "$(t2 "对抗 TLS-in-TLS 识别，自签名证书；客户端需支持 AnyTLS（sing-box / mihomo）。" \
+        "Counters TLS-in-TLS detection with a self-signed certificate; clients need AnyTLS support (sing-box / mihomo).")"
+    echo -e "  ${GREEN}6.${NC} AnyTLS + REALITY  ${YELLOW}$(t2 "[AnyTLS 客户端推荐]" "[recommended for AnyTLS clients]")${NC}"
+    menu_note "$(t2 "AnyTLS 加上 REALITY 伪装，无需证书，抗封锁能力更强。" \
+        "AnyTLS with the REALITY disguise: no certificate, stronger against blocking.")"
+    echo -e "  ${GREEN}7.${NC} Hysteria2"
+    menu_note "$(t2 "基于 UDP/QUIC，丢包或高延迟线路上明显更快；需放行 UDP，部分网络会限速 UDP。" \
+        "UDP/QUIC based, clearly faster on lossy or high-latency links; needs UDP allowed, and some networks throttle UDP.")"
     echo ""
-    echo -n "  请选择 [1-7] (默认 1): "
+    echo -n "  $(t2 "请选择" "Select") [1-7] ($(t2 "默认" "default") 1): "
     } >/dev/tty
 
     local choice
@@ -8262,6 +8277,10 @@ cmd_install() {
     # Shadowsocks 和 VLESS 的安装流程不同
     if [[ "$PROTOCOL_TYPE" == "shadowsocks" ]]; then
         # Shadowsocks 安装流程
+        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
+        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
+        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
+            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
         # 选择加密方式（或使用环境变量 ssmethod=xxx）
         if [[ -n "${ssmethod:-}" ]]; then
             SS_METHOD="$ssmethod"
@@ -12438,7 +12457,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=499078 body-sha256=9486c54a1e2f79b3a9d086e3311c8fdbfb28e7278236c396a7008344c7583dc3
-# build-id=9486c54a1e2f79b3a9d086e3311c8fdbfb28e7278236c396a7008344c7583dc3
+# body-bytes=501303 body-sha256=5fd6408e12a44938c10cb56cd7107b4a42e702abae2e8fb55d5a4fffc0ff1ca1
+# build-id=5fd6408e12a44938c10cb56cd7107b4a42e702abae2e8fb55d5a4fffc0ff1ca1
 # module-count=11
 # proxy-hub-bundle-end-v1
