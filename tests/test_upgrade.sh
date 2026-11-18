@@ -418,4 +418,248 @@ remove_all_nodes
 assert_contains "$(cmd_upgrade check | strip_colors)" "Nothing to upgrade" "a clean host says so"
 SCENARIO
 
+# Applying upgrades: one config rebuild for all node changes, a snapshot taken
+# first, and a full restore when the new configuration does not come up.
+run_scenario upgrade-apply <<'SCENARIO'
+load_modules
+sleep() { :; }
+log_info() { :; }
+log_warn() { printf 'warn: %s\n' "$*" >>/srv/apply.log; }
+log_error() { printf 'error: %s\n' "$*" >>/srv/apply.log; }
+: >/srv/apply.log
+RESTART_OK=yes
+service_restart() {
+    printf 'restart:%s\n' "$1" >>/srv/service.calls
+    [[ "$RESTART_OK" == yes ]] || return 1
+    [[ " $ACTIVE_SERVICES " == *" $1 "* ]] || ACTIVE_SERVICES+=" $1"
+}
+service_enable() { :; }
+service_stop() { ACTIVE_SERVICES="${ACTIVE_SERVICES// $1/}"; }
+service_disable() { :; }
+open_firewall_port() { printf '%s/%s\n' "$1" "$2" >>/srv/firewall.calls; }
+: >/srv/service.calls; : >/srv/firewall.calls
+snapshot_files() { (cd "$NODES_DIR" && sha256sum -- *.env); }
+
+write_legacy_node hk vision
+write_legacy_node pair both
+set_node_field pair XHTTP_PORT 32443
+set_node_field pair XHTTP_PATH /p
+write_legacy_node hy hysteria2
+set_node_field hy HY2_PASSWORD SafeHy2Password
+set_node_field hy SNI www.bing.com
+gen_selfsigned_cert hy www.bing.com
+printf '%s\n' '{"inbounds":[{"streamSettings":{"realitySettings":{"dest":"www.tesla.com:443","fingerprint":"chrome"}}}]}' >"$XRAY_CONF"
+ACTIVE_SERVICES="xray sing-box"
+before=$(snapshot_files)
+
+# Several node changes plus the config rewrite: one rebuild, everything recorded.
+upgrade_scan
+upgrade_apply node.pair.split node.hk.vlessenc node.hy.hy2obfs cfg.reality-fields || {
+    cat /srv/apply.log >&2; fail_case "a healthy apply must succeed"; }
+assert_eq "cfg.reality-fields node.hk.vlessenc node.hy.hy2obfs node.pair.split" \
+    "$(printf '%s\n' "${UPG_DONE[@]}" | sort | tr '\n' ' ' | sed 's/ $//')" "every selected item is reported done"
+assert_eq "0" "${#UPG_FAILED[@]}" "nothing failed"
+assert_eq "hk hy pair" "$(printf '%s\n' "${UPG_RELINK_NODES[@]}" | sort | tr '\n' ' ' | sed 's/ $//')" \
+    "nodes whose links changed are collected once each"
+assert_eq "1" "$(grep -c '^restart:xray$' /srv/service.calls)" "all node changes share one Xray restart"
+
+[[ -n "$(node_field pair XHTTP_PUBLIC_KEY)" && -n "$(node_field pair XHTTP_UUID)" ]] || fail_case "pair was not split"
+assert_eq "LegacyPublicKey_1" "$(node_field pair PUBLIC_KEY)" "splitting must keep the Vision key"
+assert_contains "$(node_field hk VLESS_DECRYPTION)" "mlkem768x25519plus." "hk gained VLESS Encryption"
+[[ "$(node_field hy HY2_OBFS_PASSWORD)" =~ ^[0-9a-f]{32}$ ]] || fail_case "hy gained no obfs password"
+assert_eq "true" "$(jq '[.inbounds[].streamSettings.realitySettings | has("target") and (has("dest") | not) and (has("fingerprint") | not)] | all' "$XRAY_CONF")" \
+    "the config is re-rendered with current field names"
+assert_eq "salamander" "$(jq -r '.inbounds[0].obfs.type' "$SINGBOX_CONF")" "sing-box picked up the obfuscation"
+
+# The snapshot holds the nodes exactly as they were.
+snap=$(ls -1d "$UPGRADE_BACKUP_ROOT"/*/ | head -n 1)
+assert_eq "$before" "$(cd "$snap/nodes" && sha256sum -- *.env)" "the snapshot preserves the pre-upgrade nodes"
+assert_eq "700" "$(stat -c '%a' "$snap")" "snapshots hold credentials and must be private"
+[[ -f "$snap/xray-config.json" ]] || fail_case "the snapshot must include the Xray config"
+
+# A typeless legacy node keeps its inferred type when it is rewritten.
+write_legacy_node old both
+sed -i '/^PROTOCOL_TYPE=/d' "$NODES_DIR/old.env"
+set_node_field old PORT 34443
+set_node_field old XHTTP_PORT 35443
+set_node_field old XHTTP_PATH /o
+upgrade_scan
+upgrade_apply node.old.split || fail_case "splitting a typeless node failed"
+assert_eq "both" "$(node_field old PROTOCOL_TYPE)" "an inferred both node must not be saved as vision"
+assert_eq "2" "$(jq '[.inbounds[] | select(.tag | startswith("old_"))] | length' "$XRAY_CONF")" \
+    "both inbounds of the typeless node survive"
+
+# Moving to 443 updates the node and opens the port.
+: >/srv/firewall.calls
+upgrade_scan
+assert_contains "$(ids)" "node.hk.port443" "hk is offered 443"
+upgrade_apply node.hk.port443 || fail_case "moving to 443 failed"
+assert_eq "443" "$(node_field hk PORT)" "the node moved to 443"
+assert_eq "443/tcp" "$(cat /srv/firewall.calls)" "the new port is opened for its transport"
+assert_eq "443" "$(jq -r '.inbounds[] | select(.tag == "hk_vision") | .port' "$XRAY_CONF")" "the inbound listens on 443"
+# 443 is taken now, so a stale request for another node is refused, not forced.
+rc=0
+upgrade_apply node.pair.port443 || rc=$?
+assert_eq "1" "$rc" "a second node cannot take 443"
+assert_eq "node.pair.port443" "${UPG_FAILED[*]}" "the refused item is reported failed"
+assert_eq "31443" "$(node_field pair PORT)" "the refused node keeps its port"
+
+# Replacing an Apple target picks a new domain automatically.
+set_node_field pair SNI www.icloud.com
+upgrade_pick_sni() { printf '%s' www.example.org; }
+upgrade_apply node.pair.sni || fail_case "replacing the target failed"
+assert_eq "www.example.org" "$(node_field pair SNI)" "the node uses the picked target"
+set_node_field pair SNI www.icloud.com
+upgrade_pick_sni() { printf '%s' xp.apple.com; }
+rc=0
+upgrade_apply node.pair.sni || rc=$?
+assert_eq "1/www.icloud.com" "$rc/$(node_field pair SNI)" "a discouraged pick is rejected and nothing is saved"
+upgrade_pick_sni() { return 1; }
+rc=0
+upgrade_apply node.pair.sni || rc=$?
+assert_eq "1" "$rc" "no reachable candidate fails the item"
+set_node_field pair SNI www.tesla.com
+
+# The real picker: fastest candidate after ranking.
+eval "$(declare -f upgrade_pick_sni | sed 's/^upgrade_pick_sni/unused_picker/')"
+source /mnt/lib/80_timesync.sh
+point_paths_at_scratch
+test_domains_parallel() { local -n out=$1; out=([slow.example]=80 [fast.example]=12); }
+SNI_ASN_CHECK=0
+assert_eq "fast.example" "$(upgrade_pick_sni)" "the picker returns the best-ranked candidate"
+test_domains_parallel() { local -n out=$1; out=(); }
+assert_fails "no reachable candidate yields no pick" upgrade_pick_sni
+
+# Failure: the new configuration does not come up, so the nodes are restored.
+write_legacy_node fresh both
+set_node_field fresh PORT 36443
+set_node_field fresh XHTTP_PORT 37443
+set_node_field fresh XHTTP_PATH /f
+before=$(snapshot_files)
+: >/srv/service.calls; : >/srv/apply.log
+RESTART_OK=no
+rc=0
+upgrade_apply node.fresh.split node.fresh.vlessenc || rc=$?
+RESTART_OK=yes
+assert_eq "1" "$rc" "a failed rebuild must fail the apply"
+assert_eq "$before" "$(snapshot_files)" "every node file is restored byte for byte"
+assert_eq "node.fresh.split node.fresh.vlessenc" "${UPG_FAILED[*]}" "both items are reported failed"
+assert_eq "0" "${#UPG_DONE[@]}" "nothing is reported done after a restore"
+assert_eq "0" "${#UPG_RELINK_NODES[@]}" "no link changed after a restore"
+assert_contains "$(cat /srv/apply.log)" "restoring the nodes as they were" "the restore is announced"
+(( $(grep -c '^restart:xray$' /srv/service.calls) >= 2 )) || fail_case "the restored configuration must be applied again"
+
+# Cores: updates run first and a failed one does not block the rest.
+cmd_xray_update() { printf 'xray:%s\n' "${XRAY_CHANNEL:-}" >>/srv/core.calls; return "${XRAY_UPDATE_RC:-0}"; }
+singbox_install_release() { printf 'singbox:%s\n' "$1" >>/srv/core.calls; }
+: >/srv/core.calls
+XRAY_UPDATE_RC=1
+rc=0
+upgrade_apply core.xray core.singbox node.fresh.split || rc=$?
+unset XRAY_UPDATE_RC
+assert_eq "1" "$rc" "a failed core update fails the run"
+assert_eq "xray:stable
+singbox:update" "$(cat /srv/core.calls)" "both cores are updated through their verified paths"
+assert_eq "core.xray" "${UPG_FAILED[*]}" "only the failed core is reported failed"
+assert_contains " ${UPG_DONE[*]} " " core.singbox " "the other core still succeeds"
+assert_contains " ${UPG_DONE[*]} " " node.fresh.split " "node changes still run after a core failure"
+
+# System items.
+service_hardening_ensure() { printf 'harden:%s:%s\n' "$1" "${2:-}" >>/srv/system.calls; return "${HARDEN_RC:-0}"; }
+install_geodata_helper() { printf 'geodata-helper\n' >>/srv/system.calls; }
+setup_geodata_cron() { printf 'geodata-cron\n' >>/srv/system.calls; : >/srv/crontab; }
+sysctl_tuning_apply() { printf 'sysctl\n' >>/srv/system.calls; }
+: >/srv/system.calls
+upgrade_apply svc.hardening geodata.cron sysctl.template || fail_case "system items failed"
+assert_eq "harden:xray:force
+harden:sing-box:force
+geodata-helper
+geodata-cron
+sysctl" "$(cat /srv/system.calls)" "system items run their own verified helpers"
+assert_eq "3" "${#UPG_DONE[@]}" "all three system items are done"
+HARDEN_RC=2
+rc=0
+upgrade_apply svc.hardening || rc=$?
+unset HARDEN_RC
+assert_eq "1/svc.hardening" "$rc/${UPG_FAILED[*]}" "reverted hardening is reported as not applied"
+
+# Nothing selected is a successful no-op.
+upgrade_apply || fail_case "applying nothing must succeed"
+assert_eq "0/0" "${#UPG_DONE[@]}/${#UPG_FAILED[@]}" "nothing is reported for an empty run"
+SCENARIO
+
+# The non-interactive entry point: named selections, validated IDs, a printed
+# result with fresh links, and an acknowledgement so the same set is not
+# offered again.
+run_scenario upgrade-apply-cli <<'SCENARIO'
+load_modules
+is_root() { return 0; }
+write_legacy_node hk vision
+write_legacy_node hy hysteria2
+set_node_field hy HY2_PASSWORD SafeHy2Password
+write_legacy_node ss shadowsocks
+printf '%s\n' 'net.ipv4.tcp_low_latency = 1' >"$SYSCTL_TUNING_FILE"
+ACTIVE_SERVICES="xray"
+upgrade_apply() { printf '%s\n' "$*" >/srv/apply.args; UPG_DONE=("$@"); UPG_FAILED=(); UPG_RELINK_NODES=(); return "${APPLY_RC:-0}"; }
+show_info() { printf 'INFO:%s\n' "$CURRENT_NODE_NAME"; }
+
+cmd_upgrade apply >/srv/cli.out 2>&1 || fail_case "apply with the default selection failed"
+assert_eq "svc.hardening sysctl.template" "$(cat /srv/apply.args)" "the default selection is the recommended set"
+cmd_upgrade apply recommended >/dev/null 2>&1
+assert_eq "svc.hardening sysctl.template" "$(cat /srv/apply.args)" "recommended selects only client-neutral items"
+cmd_upgrade apply all >/dev/null 2>&1
+all_args=$(cat /srv/apply.args)
+assert_contains "$all_args" "node.hk.vlessenc" "all includes items that change links"
+assert_contains "$all_args" "node.hy.hy2obfs" "all includes every actionable node item"
+assert_not_contains "$all_args" "node.ss.ss" "notes are never applied"
+assert_not_contains "$all_args" "links.pin" "notes are never applied"
+
+cmd_upgrade apply node.hy.hy2obfs,sysctl.template >/dev/null 2>&1
+assert_eq "node.hy.hy2obfs sysctl.template" "$(cat /srv/apply.args)" "an explicit list is honoured in order"
+: >/srv/apply.args
+for bad in node.nope.split node.ss.ss links.pin 'sysctl.template;id' ""; do
+    rc=0
+    cmd_upgrade apply "sysctl.template,$bad" >/srv/cli.out 2>&1 || rc=$?
+    [[ -n "$bad" ]] || continue
+    assert_eq "1" "$rc" "unknown or non-actionable item '$bad' must be rejected"
+    assert_eq "" "$(cat /srv/apply.args)" "a rejected selection must apply nothing"
+done
+
+# A failing apply propagates, still prints the result and still acknowledges.
+APPLY_RC=1
+rc=0
+cmd_upgrade apply recommended >/srv/cli.out 2>&1 || rc=$?
+unset APPLY_RC
+assert_eq "1" "$rc" "a failed apply must return non-zero"
+assert_contains "$(strip_colors </srv/cli.out)" "Upgrade result" "the result is printed even on failure"
+[[ -s "$UPGRADE_STATE_FILE" ]] || fail_case "the run must be acknowledged"
+
+# The printed result lists outcomes and re-shows nodes whose links changed.
+upgrade_scan
+UPG_DONE=(sysctl.template node.hy.hy2obfs)
+UPG_FAILED=(svc.hardening)
+UPG_RELINK_NODES=(hy)
+result=$(upgrade_print_result | strip_colors)
+assert_contains "$result" "✓ Refresh the network tuning parameters" "done items are listed by title"
+assert_contains "$result" "✗ Enable sandbox hardening" "failed items are listed by title"
+assert_contains "$result" "the previous state was kept" "a failed item says nothing was broken"
+assert_contains "$result" "import again" "the re-import instruction is shown"
+assert_contains "$result" "INFO:hy" "the changed node is shown again with its new link"
+
+# Unprivileged callers are refused before anything is scanned or applied.
+is_root() { return 1; }
+: >/srv/apply.args
+assert_fails "apply needs root" cmd_upgrade apply all
+assert_eq "" "$(cat /srv/apply.args)" "an unprivileged apply must do nothing"
+is_root() { return 0; }
+
+# Nothing to do.
+remove_all_nodes
+ACTIVE_SERVICES=""
+: >"$SYSCTL_TUNING_FILE"
+: >/srv/apply.args
+cmd_upgrade apply all >/dev/null 2>&1 || fail_case "an empty selection must succeed"
+assert_eq "" "$(cat /srv/apply.args)" "nothing is applied on a current host"
+SCENARIO
+
 printf '%s\n' "All upgrade contract tests passed."

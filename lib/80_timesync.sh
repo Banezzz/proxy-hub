@@ -947,10 +947,293 @@ cmd_upgrade_check() {
     echo ""
 }
 
-# CLI 入口。Usage: cmd_upgrade [check]
+# ---- 执行 ----
+
+declare -ga UPG_DONE=() UPG_FAILED=() UPG_RELINK_NODES=()
+
+# 快照节点文件与两个内核的配置，输出快照目录。节点改动失败时据此整体回滚；成功后
+# 也保留最近 5 份，万一新链接在客户端上有问题，还能手工找回旧参数。
+upgrade_snapshot() {
+    local dir stale file
+    dir="$UPGRADE_BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -p -- "$dir/nodes" || return 1
+    chmod 700 -- "$UPGRADE_BACKUP_ROOT" "$dir" || return 1
+    for file in "$NODES_DIR"/*.env; do
+        [[ -f "$file" ]] || continue
+        cp -p -- "$file" "$dir/nodes/" || return 1
+    done
+    [[ -f "$XRAY_CONF" ]] && { cp -p -- "$XRAY_CONF" "$dir/xray-config.json" || return 1; }
+    [[ -f "$SINGBOX_CONF" ]] && { cp -p -- "$SINGBOX_CONF" "$dir/sing-box-config.json" || return 1; }
+    while IFS= read -r stale; do
+        [[ -n "$stale" && "$stale" == "$UPGRADE_BACKUP_ROOT"/* ]] && rm -rf -- "$stale"
+    done < <(ls -1dt -- "$UPGRADE_BACKUP_ROOT"/*/ 2>/dev/null | tail -n +6)
+    printf '%s\n' "$dir"
+}
+
+# 把节点文件恢复成快照里的内容。升级不增删节点，只需按文件覆盖回去。
+upgrade_restore() {
+    local dir="$1" file
+    [[ -d "$dir/nodes" ]] || return 1
+    for file in "$dir"/nodes/*.env; do
+        [[ -f "$file" ]] || continue
+        cp -p -- "$file" "$NODES_DIR/" || return 1
+    done
+}
+
+# 自动测速并挑出一个新的 REALITY 目标（按延迟 + ASN/CDN 评分），输出域名。
+upgrade_pick_sni() {
+    local -A upg_latency=()
+    local -a upg_domains=() upg_latencies=()
+    test_domains_parallel upg_latency >/dev/null 2>&1 || true
+    (( ${#upg_latency[@]} > 0 )) || return 1
+    rank_sni_candidates upg_latency upg_domains upg_latencies
+    [[ -n "${upg_domains[0]:-}" ]] || return 1
+    printf '%s' "${upg_domains[0]}"
+}
+
+# 对一个节点执行一种升级并写回节点文件（不重建配置，由调用方统一重建）。
+# Usage: upgrade_apply_node NODE KIND
+upgrade_apply_node() {
+    local node="$1" kind="$2" proto new_sni
+    CURRENT_NODE_NAME="$node"
+    load_node_for_edit || return 1
+    # 很旧的节点文件没有 PROTOCOL_TYPE。save_env 会把缺失值写成 vision，那样一个靠
+    # 端口推断出来的 both / xhttp 节点会在重存时被改成 vision，所以先把类型定下来。
+    proto=$(upgrade_node_protocol "$(get_node_file "$node")")
+    PROTOCOL_TYPE="$proto"
+
+    case "$kind" in
+        sni)
+            new_sni=$(upgrade_pick_sni) || return 1
+            reality_target_discouraged "$new_sni" && return 1
+            SNI="$new_sni"
+            ;;
+        port443)
+            is_port_free 443 tcp && ! node_tcp_port_claimed 443 || return 1
+            if [[ "$proto" == "xhttp" ]]; then XHTTP_PORT=443; else PORT=443; fi
+            ;;
+        split)
+            [[ "$proto" == "both" ]] || return 1
+            gen_xhttp_credentials >/dev/null 2>&1 || return 1
+            ;;
+        vlessenc)
+            xray_supports vlessenc || return 1
+            gen_vlessenc_keys x25519 || return 1
+            ;;
+        hy2obfs)
+            HY2_OBFS_PASSWORD=$(openssl rand -hex 16) || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    save_env
+}
+
+upgrade_mark_done() { UPG_DONE+=("$1"); }
+upgrade_mark_failed() { UPG_FAILED+=("$1"); }
+
+# 执行选中的升级项。结果写入 UPG_DONE / UPG_FAILED / UPG_RELINK_NODES；有任何一项
+# 失败时返回非零，但一项失败不会中断其余无关的项。
+#
+# 顺序固定为：内核 → 节点与配置 → 系统项。先更新内核，后面的配置才能用上新字段；
+# 所有节点改动合并成一次配置重建，重建或重启失败时用快照整体恢复节点文件并再次
+# 重建，保证不会留下"节点文件是新的、运行中的配置是旧的"这种半完成状态。
+# Usage: upgrade_apply ID...
+upgrade_apply() {
+    local id node kind snapshot="" need_regen=0 regen_requested=0 svc rc
+    local -a node_ids=() applied_ids=()
+    UPG_DONE=() UPG_FAILED=() UPG_RELINK_NODES=()
+    (( $# > 0 )) || return 0
+
+    # ---- 1. 内核 ----
+    for id in "$@"; do
+        case "$id" in
+            core.xray)
+                log_info "$(t2 "正在更新 Xray..." "Updating Xray...")"
+                if XRAY_CHANNEL=stable cmd_xray_update; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                XRAY_CAPS=""
+                ;;
+            core.singbox)
+                log_info "$(t2 "正在更新 sing-box..." "Updating sing-box...")"
+                if singbox_install_release update; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+            node.*) node_ids+=("$id") ;;
+            cfg.reality-fields) regen_requested=1 ;;
+        esac
+    done
+
+    # ---- 2. 节点与配置 ----
+    if (( ${#node_ids[@]} > 0 || regen_requested == 1 )); then
+        if ! snapshot=$(upgrade_snapshot); then
+            log_error "$(t2 "无法创建升级前快照，已跳过所有节点改动" "Could not snapshot the nodes; node changes were skipped")"
+            for id in ${node_ids[@]+"${node_ids[@]}"}; do upgrade_mark_failed "$id"; done
+            (( regen_requested == 1 )) && upgrade_mark_failed cfg.reality-fields
+        else
+            log_info "$(t2 "升级前快照" "Pre-upgrade snapshot"): $snapshot"
+            need_regen=$regen_requested
+            for id in ${node_ids[@]+"${node_ids[@]}"}; do
+                node="${id#node.}"
+                kind="${node##*.}"
+                node="${node%.*}"
+                if upgrade_apply_node "$node" "$kind"; then
+                    applied_ids+=("$id")
+                    need_regen=1
+                else
+                    upgrade_mark_failed "$id"
+                fi
+            done
+            if (( need_regen == 1 )); then
+                if cmd_regenerate; then
+                    for id in ${applied_ids[@]+"${applied_ids[@]}"}; do
+                        upgrade_mark_done "$id"
+                        node="${id#node.}"
+                        node="${node%.*}"
+                        [[ " ${UPG_RELINK_NODES[*]:-} " == *" $node "* ]] || UPG_RELINK_NODES+=("$node")
+                        if [[ "$id" == *.port443 ]]; then
+                            CURRENT_NODE_NAME="$node"
+                            load_node_for_edit && open_node_firewall_ports "$(upgrade_node_protocol "$(get_node_file "$node")")"
+                        fi
+                    done
+                    if (( regen_requested == 1 )); then
+                        if jq -e '[.inbounds[]?.streamSettings.realitySettings // empty
+                                | select(has("dest") or has("fingerprint"))] | length == 0' "$XRAY_CONF" >/dev/null 2>&1; then
+                            upgrade_mark_done cfg.reality-fields
+                        else
+                            upgrade_mark_failed cfg.reality-fields
+                        fi
+                    fi
+                else
+                    log_error "$(t2 "新配置未能生效，正在恢复升级前的节点" "The new configuration did not come up; restoring the nodes as they were")"
+                    if upgrade_restore "$snapshot" && cmd_regenerate; then
+                        log_warn "$(t2 "已恢复到升级前状态，节点与分享链接均未改变" "Restored: nodes and share links are unchanged")"
+                    else
+                        log_error "$(t2 "自动恢复失败，请从快照手工恢复" "Automatic restore failed; recover manually from the snapshot"): $snapshot"
+                    fi
+                    for id in ${applied_ids[@]+"${applied_ids[@]}"}; do upgrade_mark_failed "$id"; done
+                    (( regen_requested == 1 )) && upgrade_mark_failed cfg.reality-fields
+                fi
+            fi
+        fi
+    fi
+
+    # ---- 3. 系统项 ----
+    for id in "$@"; do
+        case "$id" in
+            svc.hardening)
+                local hardened=0 reverted=0
+                for svc in xray "$SINGBOX_SERVICE"; do
+                    rc=0
+                    service_hardening_ensure "$svc" force || rc=$?
+                    (( rc == 0 )) && hardened=1
+                    (( rc == 2 )) && reverted=1
+                done
+                if (( hardened == 1 && reverted == 0 )); then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+            geodata.cron)
+                if install_geodata_helper && setup_geodata_cron && ! geodata_cron_is_legacy; then
+                    upgrade_mark_done "$id"
+                else
+                    upgrade_mark_failed "$id"
+                fi
+                ;;
+            sysctl.template)
+                if sysctl_tuning_apply; then upgrade_mark_done "$id"; else upgrade_mark_failed "$id"; fi
+                ;;
+        esac
+    done
+
+    (( ${#UPG_FAILED[@]} == 0 ))
+}
+
+# 某个 ID 在最近一次扫描里的标题（找不到时回退为 ID 本身）。
+upgrade_title_of() {
+    local index
+    for index in "${!UPG_IDS[@]}"; do
+        if [[ "${UPG_IDS[$index]}" == "$1" ]]; then
+            printf '%s' "${UPG_TITLE[$index]}"
+            return 0
+        fi
+    done
+    printf '%s' "$1"
+}
+
+# 打印执行结果；改过链接的节点逐个给出新的节点信息与分享链接。
+upgrade_print_result() {
+    local id node
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "升级结果" "Upgrade result")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    for id in ${UPG_DONE[@]+"${UPG_DONE[@]}"}; do
+        echo -e "  ${GREEN}✓${NC} $(upgrade_title_of "$id")"
+    done
+    for id in ${UPG_FAILED[@]+"${UPG_FAILED[@]}"}; do
+        echo -e "  ${RED}✗${NC} $(upgrade_title_of "$id")  ${GRAY}($(t2 "未生效，原状态已保留" "not applied; the previous state was kept"))${NC}"
+    done
+    if (( ${#UPG_RELINK_NODES[@]} > 0 )); then
+        echo ""
+        echo -e "  ${YELLOW}$(t2 "以下节点的分享链接已改变，请在客户端删除旧节点并重新导入：" \
+            "The share links of these nodes changed. Remove the old entry in your client and import again:")${NC}"
+        for node in "${UPG_RELINK_NODES[@]}"; do
+            CURRENT_NODE_NAME="$node"
+            show_info
+        done
+    fi
+    echo ""
+}
+
+# 非交互执行（CLI: upgrade apply recommended|all|ID,ID...）。
+cmd_upgrade_apply() {
+    local spec="${1:-recommended}" index id found rc=0
+    local -a wanted=() selected=()
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    upgrade_scan
+    case "$spec" in
+        recommended|safe)
+            for index in "${!UPG_IDS[@]}"; do
+                [[ "${UPG_CLASS[$index]}" == "safe" ]] && selected+=("${UPG_IDS[$index]}")
+            done
+            ;;
+        all)
+            for index in "${!UPG_IDS[@]}"; do
+                [[ "${UPG_CLASS[$index]}" != "info" ]] && selected+=("${UPG_IDS[$index]}")
+            done
+            ;;
+        *)
+            IFS=',' read -r -a wanted <<<"$spec"
+            for id in "${wanted[@]}"; do
+                found=0
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_IDS[$index]}" == "$id" && "${UPG_CLASS[$index]}" != "info" ]]; then
+                        selected+=("$id")
+                        found=1
+                    fi
+                done
+                if (( found == 0 )); then
+                    log_error "$(t2 "不是当前可执行的升级项" "Not an applicable upgrade item"): $id"
+                    return 1
+                fi
+            done
+            ;;
+    esac
+    if (( ${#selected[@]} == 0 )); then
+        log_info "$(t2 "没有需要执行的升级项" "Nothing to apply")"
+        return 0
+    fi
+    upgrade_apply "${selected[@]}" || rc=$?
+    upgrade_print_result
+    upgrade_ack_save
+    return "$rc"
+}
+
+# CLI 入口。Usage: cmd_upgrade [check | apply recommended|all|ID,ID...]
 cmd_upgrade() {
     case "${1:-}" in
         check|--check) cmd_upgrade_check ;;
+        apply|--apply) cmd_upgrade_apply "${2:-recommended}" ;;
         *) cmd_upgrade_check ;;
     esac
 }
