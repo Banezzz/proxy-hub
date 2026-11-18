@@ -981,6 +981,38 @@ singbox_installed_version() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# ---- 内核安全基线 ----
+#
+# 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
+# 基线是"低于它就应该更新"的最低版本，由健康检查和升级向导共用：
+#   Xray     v26.10.31  默认关闭 MPTCP（规避 Linux 内核 IPv4 MPTCP 监听的远程漏洞）；
+#                       v26.10.21 起还移除了内置根证书中的问题证书
+#   sing-box 1.13.16    AnyTLS 默认不再上传客户端元数据
+XRAY_BASELINE_VERSION="26.10.31"
+SINGBOX_BASELINE_VERSION="1.13.16"
+
+# 已安装的 Xray 版本号（如 26.11.9）；无法读取时返回非零。
+xray_installed_version_plain() {
+    local out
+    [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]] || return 1
+    out=$(timeout 10 "$XRAY_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ [Xx]ray[[:space:]]+v?([0-9]+(\.[0-9]+){1,3}) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# 列出低于安全基线的内核，每行 "NAME INSTALLED BASELINE"。只看确实装着的内核；
+# 读不出版本的不算（那是另一类问题，由各自的 release 命令处理）。
+core_baseline_gaps() {
+    local installed
+    if installed=$(xray_installed_version_plain) && ! version_ge "$installed" "$XRAY_BASELINE_VERSION"; then
+        printf 'xray %s %s\n' "$installed" "$XRAY_BASELINE_VERSION"
+    fi
+    if installed=$(singbox_installed_version) && ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+        printf 'sing-box %s %s\n' "$installed" "$SINGBOX_BASELINE_VERSION"
+    fi
+    return 0
+}
+
 # Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
 # inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
 # 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。
@@ -8966,6 +8998,16 @@ cmd_health() {
         fi
     fi
 
+    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
+    # 节点本身是可用的，只是应该尽快更新。
+    local gap_name gap_installed gap_baseline gap_command
+    while read -r gap_name gap_installed gap_baseline; do
+        [[ -n "$gap_name" ]] || continue
+        gap_command="xray-update"
+        [[ "$gap_name" == "sing-box" ]] && gap_command="singbox-update"
+        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
+    done < <(core_baseline_gaps)
+
     # 2. 检查节点数量
     local node_count
     node_count=$(count_nodes)
@@ -9701,8 +9743,6 @@ configure_hy2_options() {
 # SINGBOX_SHA256=<hex> 明确给出期望值，脚本仍然按它校验。
 SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases"
 SINGBOX_MAX_ARCHIVE_BYTES=$((300 * 1024 * 1024))
-# 低于该版本的 sing-box 缺少 AnyTLS 默认不再上传客户端元数据的修正（1.13.16）。
-SINGBOX_BASELINE_VERSION="1.13.16"
 
 # 请求的固定版本（SINGBOX_VERSION / singbox_version，可带 v 前缀）；未指定输出空串。
 singbox_requested_version() {
@@ -12668,7 +12708,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=512819 body-sha256=851c2eb896d689864d2120aa939fd0c21cafcc0f8600663aef0957d29490f011
-# build-id=851c2eb896d689864d2120aa939fd0c21cafcc0f8600663aef0957d29490f011
+# body-bytes=514903 body-sha256=c0954702bfdf00d697ac27baf64a6647c9031dcb3fb2eb33de46c8270f50fab7
+# build-id=c0954702bfdf00d697ac27baf64a6647c9031dcb3fb2eb33de46c8270f50fab7
 # module-count=11
 # proxy-hub-bundle-end-v1

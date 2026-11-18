@@ -965,6 +965,38 @@ singbox_installed_version() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# ---- 内核安全基线 ----
+#
+# 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
+# 基线是"低于它就应该更新"的最低版本，由健康检查和升级向导共用：
+#   Xray     v26.10.31  默认关闭 MPTCP（规避 Linux 内核 IPv4 MPTCP 监听的远程漏洞）；
+#                       v26.10.21 起还移除了内置根证书中的问题证书
+#   sing-box 1.13.16    AnyTLS 默认不再上传客户端元数据
+XRAY_BASELINE_VERSION="26.10.31"
+SINGBOX_BASELINE_VERSION="1.13.16"
+
+# 已安装的 Xray 版本号（如 26.11.9）；无法读取时返回非零。
+xray_installed_version_plain() {
+    local out
+    [[ -x "$XRAY_BIN" && ! -d "$XRAY_BIN" ]] || return 1
+    out=$(timeout 10 "$XRAY_BIN" version 2>/dev/null </dev/null) || return 1
+    [[ "$out" =~ [Xx]ray[[:space:]]+v?([0-9]+(\.[0-9]+){1,3}) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# 列出低于安全基线的内核，每行 "NAME INSTALLED BASELINE"。只看确实装着的内核；
+# 读不出版本的不算（那是另一类问题，由各自的 release 命令处理）。
+core_baseline_gaps() {
+    local installed
+    if installed=$(xray_installed_version_plain) && ! version_ge "$installed" "$XRAY_BASELINE_VERSION"; then
+        printf 'xray %s %s\n' "$installed" "$XRAY_BASELINE_VERSION"
+    fi
+    if installed=$(singbox_installed_version) && ! version_ge "$installed" "$SINGBOX_BASELINE_VERSION"; then
+        printf 'sing-box %s %s\n' "$installed" "$SINGBOX_BASELINE_VERSION"
+    fi
+    return 0
+}
+
 # Hysteria2 的 ACME 证书配置。sing-box 1.14 起用顶层 certificate_providers 加
 # inbound 的 certificate_provider 引用；内联的 tls.acme 自 1.14 起弃用、1.16 移除，
 # 只保留给更早的核心。输出一个对象：{"tls": {...}, "provider": {...}|null}。

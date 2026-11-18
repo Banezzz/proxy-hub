@@ -400,8 +400,6 @@ configure_hy2_options() {
 # SINGBOX_SHA256=<hex> 明确给出期望值，脚本仍然按它校验。
 SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases"
 SINGBOX_MAX_ARCHIVE_BYTES=$((300 * 1024 * 1024))
-# 低于该版本的 sing-box 缺少 AnyTLS 默认不再上传客户端元数据的修正（1.13.16）。
-SINGBOX_BASELINE_VERSION="1.13.16"
 
 # 请求的固定版本（SINGBOX_VERSION / singbox_version，可带 v 前缀）；未指定输出空串。
 singbox_requested_version() {

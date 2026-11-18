@@ -955,6 +955,16 @@ cmd_health() {
         fi
     fi
 
+    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
+    # 节点本身是可用的，只是应该尽快更新。
+    local gap_name gap_installed gap_baseline gap_command
+    while read -r gap_name gap_installed gap_baseline; do
+        [[ -n "$gap_name" ]] || continue
+        gap_command="xray-update"
+        [[ "$gap_name" == "sing-box" ]] && gap_command="singbox-update"
+        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
+    done < <(core_baseline_gaps)
+
     # 2. 检查节点数量
     local node_count
     node_count=$(count_nodes)

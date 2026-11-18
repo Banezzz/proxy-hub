@@ -1555,4 +1555,46 @@ assert_contains "$main" "singbox-update)" "singbox-update must be dispatched"
 assert_contains "$main" "cmd_singbox_release_menu" "the tools menu must reach the sing-box release view"
 SCENARIO
 
+# Security baselines: an installed core older than its baseline is reported by
+# the health check with the command that fixes it.
+run_scenario core-security-baseline <<'SCENARIO'
+load_modules
+XRAY_BIN=/srv/bin/xray
+SINGBOX_BIN=/srv/bin/sing-box
+set_xray() { printf '#!/bin/sh\n[ "$1" = version ] && echo "Xray %s (Xray, Penetrates Everything.) abc (go1.27 linux/amd64)"\nexit 0\n' "$1" >"$XRAY_BIN"; chmod 755 "$XRAY_BIN"; }
+set_singbox() { printf '#!/bin/sh\n[ "$1" = version ] && echo "sing-box version %s"\nexit 0\n' "$1" >"$SINGBOX_BIN"; chmod 755 "$SINGBOX_BIN"; }
+
+assert_eq "" "$(core_baseline_gaps)" "no installed core, no gap"
+set_xray 26.11.9
+set_singbox 1.14.4
+assert_eq "26.11.9" "$(xray_installed_version_plain)" "the Xray version is parsed"
+assert_eq "" "$(core_baseline_gaps)" "current cores have no gap"
+
+set_xray 26.10.21
+assert_eq "xray 26.10.21 26.10.31" "$(core_baseline_gaps)" "an Xray below the baseline is reported"
+set_xray 26.10.31
+assert_eq "" "$(core_baseline_gaps)" "the baseline itself is acceptable"
+set_xray 25.9.11
+set_singbox 1.13.15
+assert_eq "xray 25.9.11 26.10.31
+sing-box 1.13.15 1.13.16" "$(core_baseline_gaps)" "both cores can be below their baselines"
+
+# A core whose version cannot be read is not reported as outdated.
+printf '#!/bin/sh\nexit 1\n' >"$XRAY_BIN"
+assert_eq "sing-box 1.13.15 1.13.16" "$(core_baseline_gaps)" "an unreadable version is not a baseline gap"
+
+# Health check output.
+set_xray 25.9.11
+write_node n1 vision
+service_is_active() { return 0; }
+ss() { printf 'LISTEN 0 128 0.0.0.0:1443 0.0.0.0:*\n'; }
+timeout() { shift; [[ "$1" == openssl ]] && return 0; "$@"; }
+health=$(cmd_health | sed 's/\x1b\[[0-9;]*m//g')
+assert_contains "$health" "xray v25.9.11 is below the security baseline v26.10.31" "the health check names the Xray gap"
+assert_contains "$health" "xray-update" "the health check names the fix for Xray"
+assert_contains "$health" "sing-box v1.13.15 is below the security baseline v1.13.16" "the health check names the sing-box gap"
+assert_contains "$health" "singbox-update" "the health check names the fix for sing-box"
+assert_contains "$health" "All checks passed" "an outdated core is a warning, not a failed check"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
