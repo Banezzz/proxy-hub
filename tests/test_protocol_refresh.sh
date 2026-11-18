@@ -407,4 +407,63 @@ if use_real_singbox; then
 fi
 SCENARIO
 
+# REALITY nodes default to 443 when it is free; everything else keeps a random
+# high port, and explicit ports are never overridden.
+run_scenario reality-default-port <<'SCENARIO'
+load_modules
+LISTENING=""
+ss() {
+    printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+    local port
+    for port in $LISTENING; do
+        printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "$port"
+    done
+}
+gen_random_free_port() { printf '%s\n' 30001; }
+
+assert_eq "443" "$(default_reality_port 2>/dev/null)" "a free 443 is the REALITY default"
+
+LISTENING="443"
+assert_eq "30001" "$(default_reality_port 2>/dev/null)" "a listening 443 must not be offered"
+assert_contains "$(default_reality_port 2>&1 >/dev/null)" "443/tcp is taken" \
+    "falling back from 443 must be explained"
+LISTENING=""
+
+# A stopped node that owns 443 on disk still blocks it.
+write_node holder vision
+sed -i 's/^PORT=1443$/PORT=443/' "$NODES_DIR/holder.env"
+node_tcp_port_claimed 443 || fail_case "a node file holding 443 must claim it"
+assert_eq "30001" "$(default_reality_port 2>/dev/null)" "443 claimed by a stopped node must not be offered"
+sed -i 's/^PORT=443$/PORT=1443/; s/^XHTTP_PORT=2443$/XHTTP_PORT=443/' "$NODES_DIR/holder.env"
+node_tcp_port_claimed 443 || fail_case "an XHTTP port of 443 must claim it"
+rm -f -- "$NODES_DIR/holder.env"
+
+# A Hysteria2 node on UDP 443 does not claim TCP 443.
+write_node quic hysteria2
+sed -i 's/^PORT=1443$/PORT=443/; /^XHTTP_PORT=/d' "$NODES_DIR/quic.env"
+assert_fails "UDP 443 must not claim TCP 443" node_tcp_port_claimed 443
+assert_eq "443" "$(default_reality_port 2>/dev/null)" "a UDP listener leaves TCP 443 available"
+rm -f -- "$NODES_DIR/quic.env"
+
+# The second inbound of a `both` node silently takes a random port.
+assert_eq "" "$(default_reality_port 443 2>&1 >/dev/null)" "the sibling inbound must not warn about 443"
+assert_eq "30001" "$(default_reality_port 443 2>/dev/null)" "the sibling inbound must avoid 443"
+
+# choose_ports wiring.  The function draws its banner on /dev/tty, so this part
+# only runs where the harness has a controlling terminal.
+if ( : >/dev/tty ) 2>/dev/null; then
+    prompt_port() { printf '%s\n' "$2"; }
+    pick() {
+        ( PROTOCOL_TYPE="$1"
+          choose_ports >/dev/null 2>&1
+          printf '%s/%s\n' "${PORT:-}" "${XHTTP_PORT:-}" )
+    }
+    assert_eq "443/" "$(pick vision)" "Vision defaults to 443"
+    assert_eq "443/" "$(pick anytls_reality)" "AnyTLS+REALITY defaults to 443"
+    assert_eq "30001/" "$(pick anytls)" "plain AnyTLS keeps a random port"
+    assert_eq "443/30001" "$(pick both)" "both: Vision takes 443 and XHTTP a random port"
+    assert_eq "8443/" "$(vlpt=8443 pick vision)" "an explicit Vision port wins"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

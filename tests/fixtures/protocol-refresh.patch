@@ -112,12 +112,63 @@
 @@ -767 +852 @@
 -                    "short_id": [$sid]
 +                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
-@@ -5634 +5719,3 @@
+@@ -5429,0 +5515,37 @@
++# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
++# 已经分配给别的节点的端口再发一次。
++# Usage: node_tcp_port_claimed PORT
++node_tcp_port_claimed() {
++    local port="$1" f proto
++    for f in "$NODES_DIR"/*.env; do
++        [[ -f "$f" ]] || continue
++        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
++        if [[ "$proto" != "hysteria2" && "$(safe_read_config_value "$f" "PORT")" == "$port" ]]; then
++            return 0
++        fi
++        [[ "$(safe_read_config_value "$f" "XHTTP_PORT")" == "$port" ]] && return 0
++    done
++    return 1
++}
++
++# REALITY 节点的默认端口：443 空闲就用 443，否则回退到随机高位端口。
++# REALITY 伪装成对目标站点的普通 HTTPS 访问，而真实站点都在 443；Xray 自 v26.3.27
++# 起会对监听非 443 端口的 REALITY 入站打印警告。这里只改默认值，用户仍可在提示处
++# 输入任意端口，环境变量指定的端口也原样生效。
++# Usage: default_reality_port [EXCLUDE_PORT]
++default_reality_port() {
++    local exclude_port="${1:-0}"
++    if [[ "$exclude_port" == "443" ]]; then
++        # 同一个 both 节点的另一个 inbound 已经拿走 443，不是冲突，无需告警。
++        gen_random_free_port "$exclude_port"
++        return
++    fi
++    if is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
++        echo 443
++        return 0
++    fi
++    log_warn "$(t2 "443/tcp 已被占用，REALITY 默认端口回退为随机端口（非 443 端口的伪装效果较弱）" \
++        "443/tcp is taken; falling back to a random REALITY port (camouflage is weaker off 443)")"
++    gen_random_free_port "$exclude_port"
++}
++
+@@ -5522 +5644,5 @@
+-            default_at_port=$(gen_random_free_port)
++            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
++                default_at_port=$(default_reality_port)
++            else
++                default_at_port=$(gen_random_free_port)
++            fi
+@@ -5559 +5685 @@
+-            default_vision_port=$(gen_random_free_port)
++            default_vision_port=$(default_reality_port)
+@@ -5575 +5701 @@
+-            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
++            default_xhttp_port=$(default_reality_port "${PORT:-0}")
+@@ -5634 +5760,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +5739,16 @@
+@@ -5651,0 +5780,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -134,34 +185,34 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +5813,3 @@
+@@ -5709,0 +5854,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -6478,0 +6585,4 @@
+@@ -6478,0 +6626,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +6594 @@
+@@ -6484 +6635 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +6606,2 @@
+@@ -6495,0 +6647,2 @@
 +        n_sid_list=$(reality_short_id_list "$n_short_id" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6563 +6675 @@
+@@ -6563 +6716 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
-@@ -6591 +6703 @@
+@@ -6591 +6744 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
 +            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
-@@ -6709 +6821,2 @@
+@@ -6709 +6862,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6891,0 +7005 @@
+@@ -6891,0 +7046 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6989,0 +7104,31 @@
+@@ -6989,0 +7145,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -193,15 +244,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7136,5 @@
+@@ -6990,0 +7177,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7145 @@
+@@ -6994,0 +7186 @@
 +    local pin="" query
-@@ -7000 +7151,19 @@
+@@ -7000 +7192,19 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    query="sni=${SNI:-www.bing.com}&insecure=1"
 +    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
@@ -222,22 +273,22 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7092,0 +7262,6 @@
+@@ -7092,0 +7303,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7179,0 +7355 @@
+@@ -7179,0 +7396 @@
 +        show_selfsigned_cert_pins
-@@ -7207,0 +7384 @@
+@@ -7207,0 +7425 @@
 +            show_extra_short_ids
-@@ -7212,0 +7390 @@
+@@ -7212,0 +7431 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +7440 @@
+@@ -7261,0 +7481 @@
 +        show_extra_short_ids
-@@ -7572,0 +7752 @@
+@@ -7572,0 +7793 @@
 +            apply_extra_short_ids || return 1
-@@ -7595,0 +7776 @@
+@@ -7595,0 +7817 @@
 +        apply_extra_short_ids || return 1

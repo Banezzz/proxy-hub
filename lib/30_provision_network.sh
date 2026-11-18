@@ -145,6 +145,43 @@ gen_random_free_port() {
     done
 }
 
+# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
+# 已经分配给别的节点的端口再发一次。
+# Usage: node_tcp_port_claimed PORT
+node_tcp_port_claimed() {
+    local port="$1" f proto
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        if [[ "$proto" != "hysteria2" && "$(safe_read_config_value "$f" "PORT")" == "$port" ]]; then
+            return 0
+        fi
+        [[ "$(safe_read_config_value "$f" "XHTTP_PORT")" == "$port" ]] && return 0
+    done
+    return 1
+}
+
+# REALITY 节点的默认端口：443 空闲就用 443，否则回退到随机高位端口。
+# REALITY 伪装成对目标站点的普通 HTTPS 访问，而真实站点都在 443；Xray 自 v26.3.27
+# 起会对监听非 443 端口的 REALITY 入站打印警告。这里只改默认值，用户仍可在提示处
+# 输入任意端口，环境变量指定的端口也原样生效。
+# Usage: default_reality_port [EXCLUDE_PORT]
+default_reality_port() {
+    local exclude_port="${1:-0}"
+    if [[ "$exclude_port" == "443" ]]; then
+        # 同一个 both 节点的另一个 inbound 已经拿走 443，不是冲突，无需告警。
+        gen_random_free_port "$exclude_port"
+        return
+    fi
+    if is_port_free 443 tcp && ! node_tcp_port_claimed 443; then
+        echo 443
+        return 0
+    fi
+    log_warn "$(t2 "443/tcp 已被占用，REALITY 默认端口回退为随机端口（非 443 端口的伪装效果较弱）" \
+        "443/tcp is taken; falling back to a random REALITY port (camouflage is weaker off 443)")"
+    gen_random_free_port "$exclude_port"
+}
+
 # 交互式选择端口
 # Usage: prompt_port "提示信息" "默认端口" "排除端口(可选)"
 prompt_port() {
@@ -237,7 +274,11 @@ choose_ports() {
             PORT="$vlpt"
         else
             local default_at_port
-            default_at_port=$(gen_random_free_port)
+            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
+                default_at_port=$(default_reality_port)
+            else
+                default_at_port=$(gen_random_free_port)
+            fi
             PORT=$(prompt_port "AnyTLS 端口" "$default_at_port")
         fi
         log_info "AnyTLS 端口: $PORT"
@@ -274,7 +315,7 @@ choose_ports() {
         else
             # 交互式选择
             local default_vision_port
-            default_vision_port=$(gen_random_free_port)
+            default_vision_port=$(default_reality_port)
             PORT=$(prompt_port "Vision 端口" "$default_vision_port")
         fi
         log_info "Vision 端口: $PORT"
@@ -290,7 +331,7 @@ choose_ports() {
         else
             # 交互式选择（排除 Vision 端口）
             local default_xhttp_port
-            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
+            default_xhttp_port=$(default_reality_port "${PORT:-0}")
             XHTTP_PORT=$(prompt_port "XHTTP 端口" "$default_xhttp_port" "${PORT:-0}")
         fi
         XHTTP_PATH="/$(openssl rand -hex 4)"
