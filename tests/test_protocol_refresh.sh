@@ -466,4 +466,28 @@ if ( : >/dev/tty ) 2>/dev/null; then
 fi
 SCENARIO
 
+# The built-in candidate list no longer offers Apple / iCloud targets, and a
+# manually chosen one is flagged instead of silently accepted.
+run_scenario reality-target-candidates <<'SCENARIO'
+load_modules
+for domain in "${SNI_LIST[@]}"; do
+    assert_fails "built-in candidate $domain is a discouraged REALITY target" \
+        reality_target_discouraged "$domain"
+done
+(( ${#SNI_LIST[@]} >= 100 )) || fail_case "the candidate list shrank unexpectedly: ${#SNI_LIST[@]}"
+unique=$(printf '%s\n' "${SNI_LIST[@]}" | sort -u | wc -l)
+assert_eq "${#SNI_LIST[@]}" "$unique" "the candidate list must not contain duplicates"
+
+for domain in apple.com www.apple.com WWW.ICLOUD.COM gsp-ssl.ls.apple.com is1-ssl.mzstatic.com; do
+    reality_target_discouraged "$domain" || fail_case "$domain must be flagged"
+done
+for domain in www.tesla.com pineapple.com.example notapple.com icloud.com.example.org ""; do
+    assert_fails "$domain must not be flagged" reality_target_discouraged "$domain"
+done
+
+assert_contains "$(warn_discouraged_reality_target www.icloud.com 2>&1)" "discouraged as a REALITY target" \
+    "a discouraged target must produce a warning"
+assert_eq "" "$(warn_discouraged_reality_target www.tesla.com 2>&1)" "an ordinary target stays quiet"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

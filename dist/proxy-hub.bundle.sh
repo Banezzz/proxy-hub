@@ -1042,7 +1042,18 @@ CURRENT_LANG="${CURRENT_LANG:-}"
 # Spinner 动画帧
 SPINNER_FRAMES=('|' '/' '-' '\')
 
-# SNI 域名列表（完整列表，用于延迟测试）
+# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
+# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
+# Usage: reality_target_discouraged DOMAIN
+reality_target_discouraged() {
+    local domain="${1,,}"
+    case "$domain" in
+        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 0 ;;
+    esac
+    return 1
+}
+
+# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
 SNI_LIST=(
     "amd.com"
     "aws.com"
@@ -1059,15 +1070,11 @@ SNI_LIST=(
     "www.sony.com"
     "rum.hlx.page"
     "www.bing.com"
-    "xp.apple.com"
     "www.wowt.com"
-    "www.apple.com"
     "www.intel.com"
     "www.tesla.com"
     "www.xilinx.com"
     "www.oracle.com"
-    "www.icloud.com"
-    "apps.apple.com"
     "c.marsflag.com"
     "www.nvidia.com"
     "snap.licdn.com"
@@ -1077,7 +1084,6 @@ SNI_LIST=(
     "s.go-mpulse.net"
     "tags.tiqcdn.com"
     "cdn.bizible.com"
-    "ocsp2.apple.com"
     "cdn.userway.org"
     "download.amd.com"
     "d1.awsstatic.com"
@@ -1085,14 +1091,12 @@ SNI_LIST=(
     "mscom.demdex.net"
     "a0.awsstatic.com"
     "go.microsoft.com"
-    "apps.mzstatic.com"
     "sisu.xboxlive.com"
     "www.microsoft.com"
     "s.mp.marsflag.com"
     "images.nvidia.com"
     "vs.aws.amazon.com"
     "c.s-microsoft.com"
-    "statici.icloud.com"
     "beacon.gtv-pub.com"
     "ts4.tc.mm.bing.net"
     "ts3.tc.mm.bing.net"
@@ -1111,14 +1115,12 @@ SNI_LIST=(
     "assets.adobedtm.com"
     "lpcdn.lpsnmedia.net"
     "res-1.cdn.office.net"
-    "is1-ssl.mzstatic.com"
     "electronics.sony.com"
     "intelcorp.scene7.com"
     "acctcdn.msftauth.net"
     "cdnssl.clicktale.net"
     "catalog.gamepass.com"
     "consent.trustarc.com"
-    "gsp-ssl.ls.apple.com"
     "munchkin.marketo.net"
     "s.company-target.com"
     "cdn77.api.userway.org"
@@ -1129,20 +1131,15 @@ SNI_LIST=(
     "api.company-target.com"
     "devblogs.microsoft.com"
     "s7mbrstream.scene7.com"
-    "fpinit.itunes.apple.com"
     "digitalassets.tesla.com"
     "d.impactradius-event.com"
     "downloadmirror.intel.com"
-    "iosapps.itunes.apple.com"
-    "se-edge.itunes.apple.com"
     "publisher.liveperson.net"
     "tag-logger.demandbase.com"
     "services.digitaleast.mobi"
-    "configuration.ls.apple.com"
     "gray-wowt-prod.gtv-cdn.com"
     "visualstudio.microsoft.com"
     "prod.log.shortbread.aws.dev"
-    "amp-api-edge.apps.apple.com"
     "store-images.s-microsoft.com"
     "cdn-dynmedia-1.microsoft.com"
     "github.gallerycdn.vsassets.io"
@@ -1155,7 +1152,6 @@ SNI_LIST=(
     "ms-python.gallerycdn.vsassets.io"
     "gray-config-prod.api.arc-cdn.net"
     "i7158c100-ds-aksb-a.akamaihd.net"
-    "downloaddispatch.itunes.apple.com"
     "res.public.onecdn.static.microsoft"
     "gray.video-player.arcpublishing.com"
     "gray-config-prod.api.cdn.arcpublishing.com"
@@ -6522,6 +6518,15 @@ prompt_sni_choice() {
     done
 }
 
+# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
+# 自己的理由（例如目标与服务器同 ASN）。
+# Usage: warn_discouraged_reality_target DOMAIN
+warn_discouraged_reality_target() {
+    reality_target_discouraged "${1:-}" || return 0
+    log_warn "$(t2 "不建议用 Apple / iCloud 系域名作 REALITY 目标（Xray 自 v26.3.27 起对此告警），建议改选其他域名" \
+        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
+}
+
 # 提示用户输入自定义 SNI
 prompt_custom_sni() {
     {
@@ -6543,6 +6548,7 @@ prompt_custom_sni() {
         if [[ "$custom_sni" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
+            warn_discouraged_reality_target "$SNI"
 
             # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
             local custom_family_flag
@@ -7770,6 +7776,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             rm -f "$CACHE_FILE" 2>/dev/null
             [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
@@ -7807,6 +7814,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             select_best_sni
         fi
@@ -11450,7 +11458,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=446401 body-sha256=6bae68fc6272dfa8cc9ed8c45015517d4988e5974a100a6394de52f1bdc74ecc
-# build-id=6bae68fc6272dfa8cc9ed8c45015517d4988e5974a100a6394de52f1bdc74ecc
+# body-bytes=447314 body-sha256=be6e78e399ba598c854a96a2d5fd23b159b1825aa9e6b795f678e87847ebc2f3
+# build-id=be6e78e399ba598c854a96a2d5fd23b159b1825aa9e6b795f678e87847ebc2f3
 # module-count=11
 # proxy-hub-bundle-end-v1

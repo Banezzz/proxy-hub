@@ -233,6 +233,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             rm -f "$CACHE_FILE" 2>/dev/null
             [[ "$PROTOCOL_TYPE" == "anytls" ]] && log_info "$(msg anytls_sni_note)"
@@ -270,6 +271,7 @@ cmd_install() {
         if [[ -n "${reym:-}" ]]; then
             SNI="$reym"
             log_info "$(msg using_sni): $SNI"
+            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
         else
             select_best_sni
         fi

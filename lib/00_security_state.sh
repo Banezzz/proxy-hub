@@ -1026,7 +1026,18 @@ CURRENT_LANG="${CURRENT_LANG:-}"
 # Spinner 动画帧
 SPINNER_FRAMES=('|' '/' '-' '\')
 
-# SNI 域名列表（完整列表，用于延迟测试）
+# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
+# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
+# Usage: reality_target_discouraged DOMAIN
+reality_target_discouraged() {
+    local domain="${1,,}"
+    case "$domain" in
+        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 0 ;;
+    esac
+    return 1
+}
+
+# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
 SNI_LIST=(
     "amd.com"
     "aws.com"
@@ -1043,15 +1054,11 @@ SNI_LIST=(
     "www.sony.com"
     "rum.hlx.page"
     "www.bing.com"
-    "xp.apple.com"
     "www.wowt.com"
-    "www.apple.com"
     "www.intel.com"
     "www.tesla.com"
     "www.xilinx.com"
     "www.oracle.com"
-    "www.icloud.com"
-    "apps.apple.com"
     "c.marsflag.com"
     "www.nvidia.com"
     "snap.licdn.com"
@@ -1061,7 +1068,6 @@ SNI_LIST=(
     "s.go-mpulse.net"
     "tags.tiqcdn.com"
     "cdn.bizible.com"
-    "ocsp2.apple.com"
     "cdn.userway.org"
     "download.amd.com"
     "d1.awsstatic.com"
@@ -1069,14 +1075,12 @@ SNI_LIST=(
     "mscom.demdex.net"
     "a0.awsstatic.com"
     "go.microsoft.com"
-    "apps.mzstatic.com"
     "sisu.xboxlive.com"
     "www.microsoft.com"
     "s.mp.marsflag.com"
     "images.nvidia.com"
     "vs.aws.amazon.com"
     "c.s-microsoft.com"
-    "statici.icloud.com"
     "beacon.gtv-pub.com"
     "ts4.tc.mm.bing.net"
     "ts3.tc.mm.bing.net"
@@ -1095,14 +1099,12 @@ SNI_LIST=(
     "assets.adobedtm.com"
     "lpcdn.lpsnmedia.net"
     "res-1.cdn.office.net"
-    "is1-ssl.mzstatic.com"
     "electronics.sony.com"
     "intelcorp.scene7.com"
     "acctcdn.msftauth.net"
     "cdnssl.clicktale.net"
     "catalog.gamepass.com"
     "consent.trustarc.com"
-    "gsp-ssl.ls.apple.com"
     "munchkin.marketo.net"
     "s.company-target.com"
     "cdn77.api.userway.org"
@@ -1113,20 +1115,15 @@ SNI_LIST=(
     "api.company-target.com"
     "devblogs.microsoft.com"
     "s7mbrstream.scene7.com"
-    "fpinit.itunes.apple.com"
     "digitalassets.tesla.com"
     "d.impactradius-event.com"
     "downloadmirror.intel.com"
-    "iosapps.itunes.apple.com"
-    "se-edge.itunes.apple.com"
     "publisher.liveperson.net"
     "tag-logger.demandbase.com"
     "services.digitaleast.mobi"
-    "configuration.ls.apple.com"
     "gray-wowt-prod.gtv-cdn.com"
     "visualstudio.microsoft.com"
     "prod.log.shortbread.aws.dev"
-    "amp-api-edge.apps.apple.com"
     "store-images.s-microsoft.com"
     "cdn-dynmedia-1.microsoft.com"
     "github.gallerycdn.vsassets.io"
@@ -1139,7 +1136,6 @@ SNI_LIST=(
     "ms-python.gallerycdn.vsassets.io"
     "gray-config-prod.api.arc-cdn.net"
     "i7158c100-ds-aksb-a.akamaihd.net"
-    "downloaddispatch.itunes.apple.com"
     "res.public.onecdn.static.microsoft"
     "gray.video-player.arcpublishing.com"
     "gray-config-prod.api.cdn.arcpublishing.com"

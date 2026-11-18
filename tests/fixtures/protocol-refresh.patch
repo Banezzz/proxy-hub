@@ -112,7 +112,49 @@
 @@ -767 +852 @@
 -                    "short_id": [$sid]
 +                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
-@@ -5429,0 +5515,37 @@
+@@ -960 +1045,12 @@
+-# SNI 域名列表（完整列表，用于延迟测试）
++# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
++# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
++# Usage: reality_target_discouraged DOMAIN
++reality_target_discouraged() {
++    local domain="${1,,}"
++    case "$domain" in
++        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 0 ;;
++    esac
++    return 1
++}
++
++# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
+@@ -977 +1072,0 @@
+-    "xp.apple.com"
+@@ -979 +1073,0 @@
+-    "www.apple.com"
+@@ -984,2 +1077,0 @@
+-    "www.icloud.com"
+-    "apps.apple.com"
+@@ -995 +1086,0 @@
+-    "ocsp2.apple.com"
+@@ -1003 +1093,0 @@
+-    "apps.mzstatic.com"
+@@ -1010 +1099,0 @@
+-    "statici.icloud.com"
+@@ -1029 +1117,0 @@
+-    "is1-ssl.mzstatic.com"
+@@ -1036 +1123,0 @@
+-    "gsp-ssl.ls.apple.com"
+@@ -1047 +1133,0 @@
+-    "fpinit.itunes.apple.com"
+@@ -1051,2 +1136,0 @@
+-    "iosapps.itunes.apple.com"
+-    "se-edge.itunes.apple.com"
+@@ -1056 +1139,0 @@
+-    "configuration.ls.apple.com"
+@@ -1060 +1142,0 @@
+-    "amp-api-edge.apps.apple.com"
+@@ -1073 +1154,0 @@
+-    "downloaddispatch.itunes.apple.com"
+@@ -5429,0 +5511,37 @@
 +# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
 +# 已经分配给别的节点的端口再发一次。
 +# Usage: node_tcp_port_claimed PORT
@@ -150,25 +192,25 @@
 +    gen_random_free_port "$exclude_port"
 +}
 +
-@@ -5522 +5644,5 @@
+@@ -5522 +5640,5 @@
 -            default_at_port=$(gen_random_free_port)
 +            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 +                default_at_port=$(default_reality_port)
 +            else
 +                default_at_port=$(gen_random_free_port)
 +            fi
-@@ -5559 +5685 @@
+@@ -5559 +5681 @@
 -            default_vision_port=$(gen_random_free_port)
 +            default_vision_port=$(default_reality_port)
-@@ -5575 +5701 @@
+@@ -5575 +5697 @@
 -            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
 +            default_xhttp_port=$(default_reality_port "${PORT:-0}")
-@@ -5634 +5760,3 @@
+@@ -5634 +5756,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +5780,16 @@
+@@ -5651,0 +5776,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -185,34 +227,46 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +5854,3 @@
+@@ -5709,0 +5850,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -6478,0 +6626,4 @@
+@@ -6377,0 +6521,9 @@
++# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
++# 自己的理由（例如目标与服务器同 ASN）。
++# Usage: warn_discouraged_reality_target DOMAIN
++warn_discouraged_reality_target() {
++    reality_target_discouraged "${1:-}" || return 0
++    log_warn "$(t2 "不建议用 Apple / iCloud 系域名作 REALITY 目标（Xray 自 v26.3.27 起对此告警），建议改选其他域名" \
++        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
++}
++
+@@ -6398,0 +6551 @@
++            warn_discouraged_reality_target "$SNI"
+@@ -6478,0 +6632,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +6635 @@
+@@ -6484 +6641 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +6647,2 @@
+@@ -6495,0 +6653,2 @@
 +        n_sid_list=$(reality_short_id_list "$n_short_id" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6563 +6716 @@
+@@ -6563 +6722 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
-@@ -6591 +6744 @@
+@@ -6591 +6750 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
 +            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
-@@ -6709 +6862,2 @@
+@@ -6709 +6868,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6891,0 +7046 @@
+@@ -6891,0 +7052 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6989,0 +7145,31 @@
+@@ -6989,0 +7151,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -244,15 +298,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7177,5 @@
+@@ -6990,0 +7183,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7186 @@
+@@ -6994,0 +7192 @@
 +    local pin="" query
-@@ -7000 +7192,19 @@
+@@ -7000 +7198,19 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    query="sni=${SNI:-www.bing.com}&insecure=1"
 +    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
@@ -273,22 +327,26 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7092,0 +7303,6 @@
+@@ -7092,0 +7309,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7179,0 +7396 @@
+@@ -7179,0 +7402 @@
 +        show_selfsigned_cert_pins
-@@ -7207,0 +7425 @@
+@@ -7207,0 +7431 @@
 +            show_extra_short_ids
-@@ -7212,0 +7431 @@
+@@ -7212,0 +7437 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +7481 @@
+@@ -7261,0 +7487 @@
 +        show_extra_short_ids
-@@ -7572,0 +7793 @@
+@@ -7552,0 +7779 @@
++            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
+@@ -7572,0 +7800 @@
 +            apply_extra_short_ids || return 1
-@@ -7595,0 +7817 @@
+@@ -7588,0 +7817 @@
++            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
+@@ -7595,0 +7825 @@
 +        apply_extra_short_ids || return 1

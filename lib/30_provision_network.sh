@@ -1155,6 +1155,15 @@ prompt_sni_choice() {
     done
 }
 
+# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
+# 自己的理由（例如目标与服务器同 ASN）。
+# Usage: warn_discouraged_reality_target DOMAIN
+warn_discouraged_reality_target() {
+    reality_target_discouraged "${1:-}" || return 0
+    log_warn "$(t2 "不建议用 Apple / iCloud 系域名作 REALITY 目标（Xray 自 v26.3.27 起对此告警），建议改选其他域名" \
+        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
+}
+
 # 提示用户输入自定义 SNI
 prompt_custom_sni() {
     {
@@ -1176,6 +1185,7 @@ prompt_custom_sni() {
         if [[ "$custom_sni" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
             SNI="$custom_sni"
             log_info "$(msg sni_custom_set): ${SNI}"
+            warn_discouraged_reality_target "$SNI"
 
             # 可选：测试自定义域名连通性（同样按所选网络栈限定协议族）
             local custom_family_flag
