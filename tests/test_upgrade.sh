@@ -662,4 +662,177 @@ cmd_upgrade apply all >/dev/null 2>&1 || fail_case "an empty selection must succ
 assert_eq "" "$(cat /srv/apply.args)" "nothing is applied on a current host"
 SCENARIO
 
+# The wizard: explains every item, applies the recommended set on Enter, and
+# asks again before anything that invalidates a share link.
+run_scenario upgrade-wizard <<'SCENARIO'
+load_modules
+is_root() { return 0; }
+log_info() { printf 'info: %s\n' "$*" >>/srv/wizard.log; }
+: >/srv/wizard.log
+write_legacy_node hk vision
+write_legacy_node hy hysteria2
+set_node_field hy HY2_PASSWORD SafeHy2Password
+write_legacy_node ss shadowsocks
+printf '%s\n' 'net.ipv4.tcp_low_latency = 1' >"$SYSCTL_TUNING_FILE"
+ACTIVE_SERVICES="xray"
+# 443 is in use by something else, so no node is offered a move to it here.
+LISTENING="443"
+upgrade_apply() { printf '%s\n' "$*" >>/srv/apply.args; UPG_DONE=("$@"); UPG_FAILED=(); UPG_RELINK_NODES=(); }
+upgrade_print_result() { printf 'RESULT\n'; }
+PROXY_HUB_TTY_OUT=/srv/tty.out
+answer_with() {
+    printf '%s\n' "$@" >/srv/tty.answers
+    exec 7</srv/tty.answers
+    PROXY_HUB_TTY_FD=7
+    : >/srv/tty.out; : >/srv/apply.args
+    unlink "$UPGRADE_STATE_FILE" 2>/dev/null || true
+}
+done_answering() { exec 7<&-; unset PROXY_HUB_TTY_FD; }
+screen() { strip_colors </srv/tty.out; }
+
+# Enter: the recommended set, with no further question.
+answer_with ""
+cmd_upgrade >/dev/null || fail_case "the wizard failed on Enter"
+done_answering
+assert_eq "svc.hardening sysctl.template" "$(cat /srv/apply.args)" "Enter applies exactly the recommended items"
+assert_not_contains "$(screen)" "Go ahead?" "client-neutral items need no second confirmation"
+[[ -s "$UPGRADE_STATE_FILE" ]] || fail_case "a completed run must be acknowledged"
+
+# The screen explains itself.
+view=$(screen)
+assert_contains "$view" "Protocol / core upgrade wizard" "the wizard has a title"
+assert_contains "$view" "nothing changes until you confirm" "the wizard promises not to act before confirmation"
+assert_contains "$view" "Recommended · nothing changes for clients" "recommended items are grouped"
+assert_contains "$view" "Optional · clients must re-import the link" "link-changing items are grouped"
+assert_contains "$view" "[x] 1. Enable sandbox hardening for: xray" "recommended items start selected"
+assert_contains "$view" "[ ] 3. Node hk: enable VLESS Encryption" "link-changing items start unselected"
+assert_contains "$view" "limits what a compromised core could do" "each item says why it matters"
+assert_contains "$view" "older clients stop connecting" "each item states its cost"
+assert_contains "$view" "· Node ss uses Shadowsocks" "notes are listed without a number"
+assert_contains "$view" "apply the 2 selected item(s)" "the footer counts the current selection"
+assert_contains "$view" "quit without changing anything" "the way out is always shown"
+
+# Toggling a link-changing item asks for confirmation; 'n' goes back, 'q' leaves.
+answer_with "4" "" "n" "q"
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "" "$(cat /srv/apply.args)" "declining the confirmation must apply nothing"
+assert_contains "$(screen)" "invalidate the old share links" "the confirmation says what breaks"
+assert_contains "$(screen)" "Node hy: enable Salamander obfuscation" "the confirmation lists the affected node"
+assert_contains "$(cat /srv/wizard.log)" "nothing was changed" "quitting is acknowledged"
+[[ ! -e "$UPGRADE_STATE_FILE" ]] || fail_case "quitting must not silence future reminders"
+
+# Confirming applies the recommended items plus the toggled one.
+answer_with "4" "" "y"
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "svc.hardening sysctl.template node.hy.hy2obfs" "$(cat /srv/apply.args)" "confirmed selection is applied"
+
+# Several numbers at once, and toggling twice restores the default.
+answer_with "1 3,4" "3 4" "1" ""
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "svc.hardening sysctl.template" "$(cat /srv/apply.args)" "toggles are reversible"
+
+# 'a' selects everything actionable, 'r' returns to the recommended set.
+answer_with "a" "" "y"
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "svc.hardening sysctl.template node.hk.vlessenc node.hy.hy2obfs" "$(cat /srv/apply.args)" \
+    "'a' selects every actionable item and never a note"
+answer_with "a" "r" ""
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "svc.hardening sysctl.template" "$(cat /srv/apply.args)" "'r' restores the recommended selection"
+
+# 'n' clears the selection; Enter then offers to stop the reminders.
+answer_with "n" "" "y"
+cmd_upgrade >/dev/null
+done_answering
+assert_eq "" "$(cat /srv/apply.args)" "an empty selection applies nothing"
+assert_contains "$(screen)" "Stop reminding about these items?" "an empty selection offers to silence the reminder"
+[[ -s "$UPGRADE_STATE_FILE" ]] || fail_case "answering y must silence the reminder"
+answer_with "n" "" ""
+cmd_upgrade >/dev/null
+done_answering
+[[ ! -e "$UPGRADE_STATE_FILE" ]] || fail_case "the default answer must keep reminding"
+
+# Unrecognised input is reported and changes nothing.
+answer_with "99" "x7" "q"
+cmd_upgrade >/dev/null
+done_answering
+assert_contains "$(screen)" "Unrecognised input: 99" "an out-of-range number is reported"
+assert_contains "$(screen)" "Unrecognised input: x7" "garbage is reported"
+assert_eq "" "$(cat /srv/apply.args)" "unrecognised input applies nothing"
+
+# Without a terminal the wizard degrades to the read-only report.
+: >/srv/apply.args
+if ! ( : >/dev/tty ) 2>/dev/null; then
+    report=$(cmd_upgrade | strip_colors)
+    assert_contains "$report" "upgrade apply recommended" "no terminal: the unattended command is suggested"
+    assert_eq "" "$(cat /srv/apply.args)" "no terminal: nothing is applied"
+fi
+
+# Unprivileged users cannot enter the wizard.
+is_root() { return 1; }
+assert_fails "the wizard needs root" cmd_upgrade
+is_root() { return 0; }
+
+# ---- startup prompt ----
+cmd_upgrade_wizard() { printf 'wizard\n' >>/srv/startup.calls; }
+: >/srv/startup.calls
+answer_with ""
+upgrade_startup_prompt
+done_answering
+assert_eq "wizard" "$(cat /srv/startup.calls)" "Enter opens the wizard"
+view=$(screen)
+assert_contains "$view" "set up by an older script" "the prompt says why it appears"
+assert_contains "$view" "2 recommended (nothing changes for clients)" "the prompt counts recommended items"
+assert_contains "$view" "2 optional (clients must re-import the link)" "the prompt counts optional items"
+assert_contains "$view" "2 note(s)" "the prompt counts notes"
+assert_contains "$view" "still reachable from the main menu, P" "the prompt says where to find the wizard later"
+
+: >/srv/startup.calls
+answer_with "n"
+upgrade_startup_prompt
+done_answering
+assert_eq "" "$(cat /srv/startup.calls)" "'n' skips the wizard"
+upgrade_pending || fail_case "'n' must ask again next time"
+
+answer_with "s"
+upgrade_startup_prompt
+assert_eq "" "$(cat /srv/startup.calls)" "'s' skips the wizard"
+assert_fails "'s' silences this set of findings" upgrade_pending
+# Silenced: opening the menu again prints nothing at all.
+: >/srv/tty.out
+upgrade_startup_prompt
+assert_eq "" "$(cat /srv/tty.out)" "acknowledged findings must not prompt again"
+# A new finding brings the prompt back.
+write_legacy_node later hysteria2
+set_node_field later HY2_PASSWORD SafeHy2Password
+printf 'n\n' >/srv/tty.answers; exec 7</srv/tty.answers
+upgrade_startup_prompt
+assert_contains "$(screen)" "upgrades are available" "a new finding prompts again"
+done_answering
+
+# Never in the way: not root, or nothing to upgrade.
+PROXY_HUB_TTY_FD=7; exec 7</dev/null; : >/srv/tty.out
+is_root() { return 1; }
+upgrade_startup_prompt
+assert_eq "" "$(cat /srv/tty.out)" "unprivileged users are not prompted"
+is_root() { return 0; }
+remove_all_nodes
+ACTIVE_SERVICES=""
+: >"$SYSCTL_TUNING_FILE"
+upgrade_startup_prompt
+assert_eq "" "$(cat /srv/tty.out)" "a current host is not prompted"
+done_answering
+
+# Wiring into the main menu.
+main=$(cat /mnt/lib/90_main.sh)
+assert_contains "$main" "upgrade_startup_prompt" "the menu must check for upgrades before it starts"
+assert_contains "$main" "[Pp])" "the menu must offer the wizard"
+assert_contains "$main" "upgrade|migrate)" "the CLI must dispatch upgrade"
+SCENARIO
+
 printf '%s\n' "All upgrade contract tests passed."

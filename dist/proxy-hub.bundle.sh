@@ -12561,8 +12561,8 @@ upgrade_scan() {
             sing-box)
                 upgrade_add core.singbox safe \
                     "$(t2 "更新 sing-box：v$installed → 最新稳定版" "Update sing-box: v$installed → latest stable")" \
-                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本里 AnyTLS 默认不再上传客户端信息，Hysteria2 也有多项改进。" \
-                        "Below the security baseline v$baseline: later releases stop AnyTLS from uploading client metadata and improve Hysteria2.")" \
+                    "$(t2 "当前版本低于安全基线 v$baseline：之后的版本里 AnyTLS 默认不再上传客户端信息。" \
+                        "Below the security baseline v$baseline: later releases stop AnyTLS from uploading client metadata by default.")" \
                     "$(t2 "自动校验官方 SHA-256，先用新版本检查现有配置，启动失败自动回滚。服务会重启一次（几秒）。" \
                         "Verifies the official SHA-256, checks the current config with the new version, and rolls back if it fails to start. One restart of a few seconds.")"
                 ;;
@@ -13077,12 +13077,189 @@ cmd_upgrade_apply() {
     return "$rc"
 }
 
+# ---- 向导界面 ----
+
+# 交互式升级向导。界面只做三件事：把每一项讲清楚、让用户勾选、确认后执行。
+# 默认状态下直接回车就是"执行全部推荐项"，这些项都不需要动客户端；会改变分享链接
+# 的项必须由用户主动勾选，并在执行前再确认一次。
+cmd_upgrade_wizard() {
+    local answer="" token index selected_count relink_selected rc=0
+    local -a selected=() relink_titles=()
+    if ! is_root; then
+        log_error "$(msg run_as_root)"
+        return 1
+    fi
+    upgrade_scan
+    if (( ${#UPG_IDS[@]} == 0 )) || ! tty_available; then
+        # 没有可升级项，或没有终端可以提问：退化为只读报告。
+        cmd_upgrade_check
+        if (( ${#UPG_IDS[@]} > 0 )); then
+            echo -e "  $(t2 "无人值守执行推荐项" "Apply the recommended items unattended"): ${YELLOW}bash $0 upgrade apply recommended${NC}"
+            echo ""
+        fi
+        return 0
+    fi
+
+    while true; do
+        selected_count=0
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_SEL[$index]}" == 1 ]] && selected_count=$((selected_count + 1))
+        done
+        {
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}        $(t2 "协议 / 内核升级向导" "Protocol / core upgrade wizard")${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        menu_note "$(t2 "这台机器上有用旧版脚本创建的节点或旧版内核。下面逐项说明可以升级什么、为什么、有什么代价。" \
+            "This server has nodes or cores created by an older script. Each item below says what can be upgraded, why, and what it costs.")" \
+            "$(t2 "[x] 表示已勾选。直接回车会执行已勾选的项；在你确认之前不会改动任何东西。" \
+            "[x] means selected. Enter applies the selected items; nothing changes until you confirm.")" \
+            "$(t2 "节点改动会先做快照，新配置起不来时自动恢复原样。" \
+            "Node changes are snapshotted first and restored automatically if the new configuration fails to start.")"
+        upgrade_print_findings with_selection
+        echo ""
+        echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}$(t2 "回车" "Enter")${NC}  $(t2 "执行已勾选的 $selected_count 项" "apply the $selected_count selected item(s)")"
+        echo -e "  ${GREEN}$(t2 "数字" "number")${NC}  $(t2 "切换勾选，可一次输入多个，如 2 5" "toggle an item; several at once, e.g. 2 5")"
+        echo -e "  ${GREEN}r${NC}     $(t2 "只勾选推荐项（默认）" "select only the recommended items (default)")"
+        echo -e "  ${GREEN}a${NC}     $(t2 "全部勾选（含需要重新导入链接的项）" "select everything, including items that change links")"
+        echo -e "  ${GREEN}n${NC}     $(t2 "全部取消" "clear the selection")"
+        echo -e "  ${GREEN}q${NC}     $(t2 "退出，不做任何改动" "quit without changing anything")"
+        echo ""
+        echo -n "  > "
+        } | tty_print
+        tty_read answer
+
+        case "$answer" in
+            q|Q|0)
+                log_info "$(t2 "已退出，未做任何改动" "Left the wizard; nothing was changed")"
+                return 0
+                ;;
+            r|R)
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_CLASS[$index]}" == "safe" ]]; then UPG_SEL[$index]=1; else UPG_SEL[$index]=0; fi
+                done
+                continue
+                ;;
+            a|A)
+                for index in "${!UPG_IDS[@]}"; do
+                    if [[ "${UPG_CLASS[$index]}" != "info" ]]; then UPG_SEL[$index]=1; fi
+                done
+                continue
+                ;;
+            n|N)
+                for index in "${!UPG_IDS[@]}"; do UPG_SEL[$index]=0; done
+                continue
+                ;;
+            "") ;;
+            *)
+                for token in ${answer//,/ }; do
+                    if [[ "$token" =~ ^[0-9]{1,3}$ ]] && index=$(upgrade_index_of_number "$((10#$token))"); then
+                        UPG_SEL[$index]=$(( 1 - UPG_SEL[index] ))
+                    else
+                        echo -e "  ${RED}$(t2 "无法识别的输入" "Unrecognised input"): $token${NC}" | tty_print
+                    fi
+                done
+                continue
+                ;;
+        esac
+
+        # ---- 回车：汇总并确认 ----
+        selected=()
+        relink_titles=()
+        for index in "${!UPG_IDS[@]}"; do
+            [[ "${UPG_SEL[$index]}" == 1 && "${UPG_CLASS[$index]}" != "info" ]] || continue
+            selected+=("${UPG_IDS[$index]}")
+            [[ "${UPG_CLASS[$index]}" == "relink" ]] && relink_titles+=("${UPG_TITLE[$index]}")
+        done
+        if (( ${#selected[@]} == 0 )); then
+            {
+            echo ""
+            echo -e "  ${YELLOW}$(t2 "没有勾选任何项。" "Nothing is selected.")${NC}"
+            echo -n "  $(t2 "以后不再提示这些项? [y/N]" "Stop reminding about these items? [y/N]"): "
+            } | tty_print
+            tty_read answer
+            if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+                upgrade_ack_save
+            fi
+            return 0
+        fi
+        if (( ${#relink_titles[@]} > 0 )); then
+            {
+            echo ""
+            echo -e "  ${YELLOW}$(t2 "注意：下面这些改动会让对应节点的旧分享链接失效，客户端必须重新导入：" \
+                "Note: these changes invalidate the old share links; clients must import the new ones:")${NC}"
+            for token in "${relink_titles[@]}"; do
+                echo -e "   ${YELLOW}·${NC} $token"
+            done
+            menu_note "$(t2 "执行完成后会直接显示新的链接与二维码所需信息。" \
+                "The new links are shown as soon as the upgrade finishes.")"
+            echo -n "  $(t2 "确认执行? [y/N]" "Go ahead? [y/N]"): "
+            } | tty_print
+            tty_read answer
+            if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+                continue
+            fi
+        fi
+        break
+    done
+
+    upgrade_apply "${selected[@]}" || rc=$?
+    upgrade_print_result
+    upgrade_ack_save
+    return "$rc"
+}
+
+# 打开交互菜单时调用：机器上有还没看过的可升级项，就先问一句。
+# 提问只出现一次——选择"不再提示"或走完向导都会记下这一批；之后只有出现新的可升级
+# 项（例如脚本更新带来新的安全基线）才会再问。任何时候都能从主菜单 P 进入向导。
+upgrade_startup_prompt() {
+    local answer="" index safe_count=0 relink_count=0 info_count=0
+    is_root || return 0
+    tty_available || return 0
+    upgrade_pending || return 0
+    for index in "${!UPG_IDS[@]}"; do
+        case "${UPG_CLASS[$index]}" in
+            safe) safe_count=$((safe_count + 1)) ;;
+            relink) relink_count=$((relink_count + 1)) ;;
+            *) info_count=$((info_count + 1)) ;;
+        esac
+    done
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "发现可以升级的协议 / 内核" "Protocol / core upgrades are available")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    menu_note "$(t2 "这台机器上的节点或内核是旧版脚本创建的，新版脚本可以帮你升级：" \
+        "The nodes or cores on this server were set up by an older script. This version can upgrade them:")"
+    (( safe_count > 0 )) && echo -e "   ${GREEN}·${NC} $(t2 "$safe_count 项推荐升级（客户端无需任何改动）" "$safe_count recommended (nothing changes for clients)")"
+    (( relink_count > 0 )) && echo -e "   ${YELLOW}·${NC} $(t2 "$relink_count 项可选升级（客户端需要重新导入链接）" "$relink_count optional (clients must re-import the link)")"
+    (( info_count > 0 )) && echo -e "   ${BLUE}·${NC} $(t2 "$info_count 条提示" "$info_count note(s)")"
+    echo ""
+    echo -e "  ${GREEN}$(t2 "回车" "Enter")${NC}  $(t2 "查看详情并选择要升级的项（推荐）" "review the details and choose what to upgrade (recommended)")"
+    echo -e "  ${GREEN}n${NC}     $(t2 "这次先不处理，下次打开再问" "not now; ask again next time")"
+    echo -e "  ${GREEN}s${NC}     $(t2 "不再提示这些项（之后仍可从主菜单 P 进入）" "do not remind me about these (still reachable from the main menu, P)")"
+    echo ""
+    echo -n "  > "
+    } | tty_print
+    tty_read answer
+    case "$answer" in
+        n|N) return 0 ;;
+        s|S) upgrade_ack_save ;;
+        *) cmd_upgrade_wizard || true ;;
+    esac
+    return 0
+}
+
 # CLI 入口。Usage: cmd_upgrade [check | apply recommended|all|ID,ID...]
+# 不带参数时进入向导。
 cmd_upgrade() {
     case "${1:-}" in
         check|--check) cmd_upgrade_check ;;
         apply|--apply) cmd_upgrade_apply "${2:-recommended}" ;;
-        *) cmd_upgrade_check ;;
+        *) cmd_upgrade_wizard ;;
     esac
 }
 
@@ -13174,6 +13351,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}N.${NC} $(msg netstack_title)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}P.${NC} $(t2 "协议 / 内核升级向导                                      " \
+        "Protocol / core upgrade wizard                           ")${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${MAGENTA}L.${NC} $(msg menu_lang)                                            ${CYAN}║${NC}"
@@ -13185,9 +13364,12 @@ show_menu() {
 }
 
 main_menu() {
+    # 旧版脚本留下的节点或内核有可升级项时，进菜单前先提示一次。
+    upgrade_startup_prompt
+
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,P,L,U]: "
         read -r choice
         echo ""
 
@@ -13255,6 +13437,11 @@ main_menu() {
             [Tt])
                 cmd_tools
                 ;;
+            [Pp])
+                cmd_upgrade || true
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Ll])
                 select_language
                 ;;
@@ -13295,8 +13482,10 @@ show_help() {
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
     echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
-    echo "  upgrade     Review and apply protocol / core upgrades for existing nodes"
-    echo "              (upgrade check lists them without changing anything)"
+    echo "  upgrade     Upgrade wizard for nodes and cores set up by an older script"
+    echo "              upgrade check                 list what can be upgraded (read-only)"
+    echo "              upgrade apply recommended     apply items that change nothing for clients"
+    echo "              upgrade apply all|ID,ID       apply everything, or the listed items"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
@@ -13582,7 +13771,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=559266 body-sha256=92f9a12203e68142fa82a292e5021767a7f47604ea388ed07d1d7c15865eb38c
-# build-id=92f9a12203e68142fa82a292e5021767a7f47604ea388ed07d1d7c15865eb38c
+# body-bytes=569528 body-sha256=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
+# build-id=e55949952d9a334b6a20546a4b3cc09ca07b119ffd926d6aae58df73eb6e619b
 # module-count=11
 # proxy-hub-bundle-end-v1

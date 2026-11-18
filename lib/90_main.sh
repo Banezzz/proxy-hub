@@ -86,6 +86,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}   ${BLUE}I.${NC} $(msg update_ip) / 更新节点 IP                                ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}N.${NC} $(msg netstack_title)                                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${BLUE}T.${NC} $(msg menu_tools) (WARP/BBR/Swap/Fail2ban/TimeSync)          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BLUE}P.${NC} $(t2 "协议 / 内核升级向导                                      " \
+        "Protocol / core upgrade wizard                           ")${CYAN}║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}                                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   ${MAGENTA}L.${NC} $(msg menu_lang)                                            ${CYAN}║${NC}"
@@ -97,9 +99,12 @@ show_menu() {
 }
 
 main_menu() {
+    # 旧版脚本留下的节点或内核有可升级项时，进菜单前先提示一次。
+    upgrade_startup_prompt
+
     while true; do
         show_menu
-        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,L,U]: "
+        echo -n "   $(msg menu_choice) [0-9,E,I,N,T,P,L,U]: "
         read -r choice
         echo ""
 
@@ -167,6 +172,11 @@ main_menu() {
             [Tt])
                 cmd_tools
                 ;;
+            [Pp])
+                cmd_upgrade || true
+                echo ""
+                read -rp "$(msg menu_press_enter)"
+                ;;
             [Ll])
                 select_language
                 ;;
@@ -207,8 +217,10 @@ show_help() {
     echo "  regenerate  Regenerate config from node files (fix config issues)"
     echo "  update-ip   Detect IP change and update all node configs"
     echo "  netstack    Select the IPv4/IPv6 network stack (listen, outbound, SNI, links)"
-    echo "  upgrade     Review and apply protocol / core upgrades for existing nodes"
-    echo "              (upgrade check lists them without changing anything)"
+    echo "  upgrade     Upgrade wizard for nodes and cores set up by an older script"
+    echo "              upgrade check                 list what can be upgraded (read-only)"
+    echo "              upgrade apply recommended     apply items that change nothing for clients"
+    echo "              upgrade apply all|ID,ID       apply everything, or the listed items"
     echo "  uninstall   Uninstall all nodes and Xray"
     echo "  test-sni    Test all SNI latency"
     echo ""
