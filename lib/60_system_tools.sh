@@ -713,22 +713,59 @@ cmd_warp() {
     done
 }
 
+# WARP 由第三方脚本（fscarmen/warp）安装，它以 root 运行并会自行下载二进制。
+# 我们无法替它做完整性背书，能做的是让这次执行可审计、可固定：
+#   - 下载到 mktemp 创建的私有文件，而不是可预测的 /tmp 路径；
+#   - 执行前显示脚本的 SHA-256，并说明即将发生什么；
+#   - WARP_SCRIPT_REF 可把来源固定到某个 commit / tag（默认 main）；
+#   - 设置了 WARP_SCRIPT_SHA256 时强制比对，不一致即拒绝执行，且不再询问。
+# Usage: warp_run_script ARG   （ARG 透传给脚本：c 安装 / u 卸载）
+warp_run_script() {
+    local action="$1" ref="${WARP_SCRIPT_REF:-main}" expected="${WARP_SCRIPT_SHA256:-}" tmp actual answer="" rc=0
+    if [[ ! "$ref" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+        log_error "Invalid WARP_SCRIPT_REF: $ref"
+        return 1
+    fi
+    tmp=$(mktemp) || return 1
+    if ! secure_curl "https://gitlab.com/fscarmen/warp/-/raw/${ref}/menu.sh" -o "$tmp" 2>/dev/null; then
+        log_error "Failed to download WARP installer"
+        rm -f -- "$tmp"
+        return 1
+    fi
+    actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$expected" ]]; then
+        if [[ "${expected,,}" != "$actual" ]]; then
+            log_error "$(t2 "WARP 脚本的 SHA-256 与 WARP_SCRIPT_SHA256 不一致，已拒绝执行" \
+                "The WARP script does not match WARP_SCRIPT_SHA256; refusing to run it") ($actual)"
+            rm -f -- "$tmp"
+            return 1
+        fi
+    else
+        echo -e "  ${YELLOW}$(t2 "即将以 root 执行第三方脚本 fscarmen/warp（来源 ref: $ref）" \
+            "About to run the third-party script fscarmen/warp as root (ref: $ref)")${NC}"
+        echo -e "  SHA-256: $actual"
+        menu_note "$(t2 "该脚本不由本项目维护。需要固定版本时，可设置 WARP_SCRIPT_REF 与 WARP_SCRIPT_SHA256。" \
+            "This script is not maintained by this project. Set WARP_SCRIPT_REF and WARP_SCRIPT_SHA256 to pin it.")"
+        echo -n "  $(t2 "继续?" "Continue?") [Y/n]: "
+        read -r answer || answer="n"
+        if [[ "$answer" == "n" || "$answer" == "N" ]]; then
+            log_info "Cancelled"
+            rm -f -- "$tmp"
+            return 1
+        fi
+    fi
+    bash "$tmp" "$action" || rc=$?
+    rm -f -- "$tmp"
+    return "$rc"
+}
+
 warp_install() {
     echo ""
     log_info "Installing WARP (Socks5 mode)..."
-    # Security: Download to temp file with secure options
-    local tmp_warp="/tmp/warp-menu-$$.sh"
-    if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
-        bash "$tmp_warp" c
-        rm -f "$tmp_warp"
-        if check_warp_running; then
-            log_info "WARP installed successfully"
-            write_config
-            service_restart xray
-        fi
-    else
-        log_error "Failed to download WARP installer"
-        rm -f "$tmp_warp"
+    if warp_run_script c && check_warp_running; then
+        log_info "WARP installed successfully"
+        write_config
+        service_restart xray
     fi
     echo ""
     read -rp "$(msg menu_press_enter)"
@@ -739,15 +776,9 @@ warp_uninstall() {
     log_info "Uninstalling WARP..."
     if command -v warp &>/dev/null; then
         warp u
-    elif [[ -f menu.sh ]]; then
-        bash menu.sh u
     else
-        # Security: Download to temp file with secure options
-        local tmp_warp="/tmp/warp-menu-$$.sh"
-        if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
-            bash "$tmp_warp" u
-            rm -f "$tmp_warp"
-        fi
+        # 不再执行当前目录下碰巧存在的 menu.sh：工作目录里的文件不是可信来源。
+        warp_run_script u || true
     fi
     rm -f /root/.warp_netflix /root/.warp_ai
     write_config

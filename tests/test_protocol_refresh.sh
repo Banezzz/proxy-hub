@@ -1597,4 +1597,70 @@ assert_contains "$health" "singbox-update" "the health check names the fix for s
 assert_contains "$health" "All checks passed" "an outdated core is a warning, not a failed check"
 SCENARIO
 
+# The third-party WARP script: private download path, visible digest, optional
+# pinning, and no execution of whatever menu.sh sits in the working directory.
+run_scenario warp-script-guard <<'SCENARIO'
+load_modules
+cat >/srv/warp-menu.sh <<'REMOTE'
+#!/bin/bash
+printf 'ran:%s\n' "$1" >>/srv/warp.ran
+REMOTE
+SCRIPT_SHA=$(sha256sum /srv/warp-menu.sh | awk '{print $1}')
+secure_curl() {
+    local arg dest="" want_dest=0
+    for arg in "$@"; do
+        if ((want_dest)); then dest="$arg"; want_dest=0; continue; fi
+        case "$arg" in -o) want_dest=1 ;; https://*) printf '%s\n' "$arg" >>/srv/warp.urls ;; esac
+    done
+    printf '%s\n' "$dest" >>/srv/warp.dest
+    cp /srv/warp-menu.sh "$dest"
+}
+reset_case() { rm -f /srv/warp.ran /srv/warp.urls /srv/warp.dest; : >/srv/warp.ran; }
+
+# A matching pinned digest runs without a question.
+reset_case
+WARP_SCRIPT_SHA256="$SCRIPT_SHA" warp_run_script c </dev/null >/srv/warp.out 2>&1 || fail_case "a matching digest must run"
+assert_eq "ran:c" "$(cat /srv/warp.ran)" "the action is passed through"
+assert_not_contains "$(cat /srv/warp.out)" "Continue?" "a pinned digest needs no confirmation"
+dest=$(cat /srv/warp.dest)
+[[ "$dest" != /tmp/warp-menu-* ]] || fail_case "the download path must not be predictable"
+[[ ! -e "$dest" ]] || fail_case "the downloaded script must be removed afterwards"
+assert_contains "$(cat /srv/warp.urls)" "/raw/main/menu.sh" "the default ref is main"
+
+# A mismatching pinned digest refuses to run.
+reset_case
+rc=0
+WARP_SCRIPT_SHA256=$(printf x | sha256sum | awk '{print $1}') warp_run_script c </dev/null >/srv/warp.out 2>&1 || rc=$?
+assert_eq "1" "$rc" "a mismatching digest must refuse"
+assert_eq "" "$(cat /srv/warp.ran)" "a mismatching script must not run"
+[[ ! -e "$(cat /srv/warp.dest)" ]] || fail_case "a refused script must be removed"
+
+# Unpinned: the digest is shown, Enter continues, n cancels.
+reset_case
+printf '\n' | warp_run_script c >/srv/warp.out 2>&1 || fail_case "Enter must continue"
+assert_contains "$(cat /srv/warp.out)" "SHA-256: $SCRIPT_SHA" "the digest must be shown before running"
+assert_contains "$(cat /srv/warp.out)" "third-party script" "the prompt must say what is about to run"
+assert_eq "ran:c" "$(cat /srv/warp.ran)" "Enter runs the script"
+reset_case
+rc=0
+printf 'n\n' | warp_run_script c >/srv/warp.out 2>&1 || rc=$?
+assert_eq "1" "$rc" "n must cancel"
+assert_eq "" "$(cat /srv/warp.ran)" "a cancelled script must not run"
+
+# The source can be pinned to a ref, and the ref is validated.
+reset_case
+WARP_SCRIPT_REF=0123abcd WARP_SCRIPT_SHA256="$SCRIPT_SHA" warp_run_script u </dev/null >/dev/null 2>&1
+assert_contains "$(cat /srv/warp.urls)" "/raw/0123abcd/menu.sh" "WARP_SCRIPT_REF selects the source ref"
+assert_eq "ran:u" "$(cat /srv/warp.ran)" "the uninstall action is passed through"
+reset_case
+rc=0
+WARP_SCRIPT_REF='main/../../x' warp_run_script c </dev/null >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$rc" "an unsafe ref must be rejected"
+[[ ! -e /srv/warp.urls ]] || fail_case "an unsafe ref must not be fetched"
+
+# Uninstall never runs a menu.sh found in the working directory.
+uninstall=$(declare -f warp_uninstall)
+assert_not_contains "$uninstall" "bash menu.sh" "a local menu.sh is not a trusted source"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
