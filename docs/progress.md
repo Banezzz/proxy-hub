@@ -1,5 +1,67 @@
 # 变更记录
 
+## 2026-11-18 — 协议刷新、引导菜单与升级向导
+
+对照上游截至 2026-11 的状态（Xray v26.11.9、sing-box 1.14.4）更新协议层，并为旧版
+脚本留下的节点与内核提供迁移路径。
+
+- **升级向导**：`upgrade_scan` 离线扫描内核版本、Xray 配置字段、服务加固、cron、
+  sysctl 与每个节点，产出按"对客户端的代价"分类的可升级项（safe / relink / info）。
+  打开交互菜单时若有未看过的项会提示一次；向导逐项给出"为什么 / 代价"，推荐项默认
+  勾选、回车即执行，会改链接的项需主动勾选并二次确认。执行顺序固定为内核 → 节点与
+  配置 → 系统项，节点改动先快照、失败整体恢复。新增 `upgrade`、`upgrade check`、
+  `upgrade apply recommended|all|ID`，主菜单新增 `P`。
+- **引导菜单**：协议选择、Hysteria2 加固、后量子选项、BBR 菜单都加了逐项说明；复杂
+  功能提供回车即用的推荐方案，密码、端口范围、密钥随机生成。脚本化安装不被提问。
+- **REALITY**：按内核能力写 `target`（旧内核仍写 `dest`），去掉服务端无效的
+  `fingerprint`；默认端口优先 443；shortId 加长为 16 位并支持附加 shortId；候选域名
+  移除 Apple/iCloud 系（117 → 102），测速要求 TLS 1.3 并按 ASN/CDN 重排。
+- **VLESS**：`both` 节点的 XHTTP 使用独立 UUID/密钥/shortId；可选 VLESS Encryption
+  （启用后 XHTTP 也使用 Vision 流控）与 REALITY ML-DSA-65；XHTTP 链接带 `mode=auto`。
+- **Hysteria2**：分享链接加入 `pinSHA256`；可选 Salamander 混淆、端口跳跃（专用 NAT
+  链 + 随服务启动重下发）与 ACME 证书（按 sing-box 版本选择 provider 或内联写法）。
+- **sing-box**：安装与更新强制校验 release 元数据里的 SHA-256，候选 binary 须可执行、
+  版本匹配并通过现有配置检查，rename 原子替换，启动失败回滚。新增
+  `singbox-version`、`singbox-update`。
+- **加固**：服务沙箱 drop-in（健康门之后下发，起不来自动撤销）；GeoData 对照
+  `.sha256sum` 校验后原子替换，cron 改走同一 helper；WARP 第三方脚本执行前显示摘要
+  并可固定，移除"执行当前目录 menu.sh"的回退；健康检查提示低于安全基线的内核；
+  sysctl 模板去掉失效的 `tcp_low_latency`。
+- **Shadowsocks 2022** 在菜单与文档中重新定位为中转/落地用途，功能不变。
+
+影响范围：协议选择与安装流程、节点 env schema（新增字段全部可选）、Xray/sing-box
+配置渲染、分享链接与二维码、sing-box 安装路径、GeoData 与 WARP 的下载路径、systemd
+drop-in、sysctl 调优文件、健康检查输出、主菜单与工具菜单、`help`、卸载清理。
+
+兼容性：
+
+- 既有节点文件无需迁移。缺少新字段的节点在**同一个内核**上渲染结果不变；内核支持
+  `target` 时，重建配置会把 `dest` 换成 `target` 并去掉 `fingerprint`，这两处对客户端
+  没有影响。
+- 既有分享链接继续有效，例外只有用户在向导里主动勾选的 relink 项。Hysteria2 的新
+  链接多了 `pinSHA256`，XHTTP 的新链接多了 `mode=auto`，旧链接不受影响。
+- 用 `proto=` 等变量驱动的无人值守安装不出现新提问，增强项默认关闭。**完全交互**地
+  安装 Hysteria2 时默认选择变为"Salamander 混淆"，这是有意的行为变化。
+- 新装的 REALITY 节点默认端口变为 443（空闲时）、shortId 变为 16 位；显式指定的
+  端口不受影响。
+- sing-box 的安装从"下载即用"变为"摘要缺失即拒绝"，见 `docs/audits.md` 中关于该
+  字段未对真实 API 验证的条目。
+
+验证方式：`bash tests/test_protocol_refresh.sh`（23 个场景）与
+`bash tests/test_upgrade.sh`（4 个场景）；前者在设置 `PROXY_HUB_TEST_XRAY_BIN` /
+`PROXY_HUB_TEST_SINGBOX_BIN` 时用真实的 Xray 26.11.9 与 sing-box 1.14.4 校验渲染出的
+配置（REALITY target、多 shortId、拆分凭据、ML-DSA-65、两种认证的 VLESS
+Encryption、Salamander、ACME provider）。加固指令集经 systemd 255 的
+`systemd-analyze verify`。另在 PTY 下跑过真实的零参数菜单、`help`、`upgrade check`
+与 bundle 的 `singbox-version`。随后运行 `bash scripts/build-bundle.sh`、全量语法检查、
+仓库完整测试与 `git diff --check`。
+
+未验证的部分记录在 `docs/audits.md`：真实 GitHub API 的摘要字段、ACME 实际签发、
+加固下的真实服务启动、客户端对 `mport` 的支持。实现本轮改动的环境中
+`tests/test_loader.sh` 与 `tests/test_xray_transaction.sh` 在改动前后都各有一个用例
+失败（失败点相同，分别是 `sourced loader caller-state preservation` 与
+`late stage arrival is classified as conflict`），其后的用例因此没有执行。
+
 ## 2026-07-28 — 网络栈（IPv4 / IPv6）选择
 
 - 新增实例级网络栈设置（`/root/.proxy_hub_netstack`，取值 `dual`/`v4`/`v6`，默认
