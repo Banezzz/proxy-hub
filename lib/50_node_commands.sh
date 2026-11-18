@@ -614,6 +614,7 @@ cmd_edit() {
     XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
     XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
+    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false

@@ -416,7 +416,7 @@ reset_node_state() {
     PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
     XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
-    MLDSA65_SEED="" MLDSA65_VERIFY=""
+    MLDSA65_SEED="" MLDSA65_VERIFY="" VLESS_DECRYPTION="" VLESS_ENCRYPTION=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
@@ -461,6 +461,8 @@ safe_load_node_config() {
     XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
     MLDSA65_SEED=$(safe_read_config_value "$file" "MLDSA65_SEED")
     MLDSA65_VERIFY=$(safe_read_config_value "$file" "MLDSA65_VERIFY")
+    VLESS_DECRYPTION=$(safe_read_config_value "$file" "VLESS_DECRYPTION")
+    VLESS_ENCRYPTION=$(safe_read_config_value "$file" "VLESS_ENCRYPTION")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -694,9 +696,10 @@ reality_short_id_list() {
 }
 
 # Build Vision inbound JSON using jq (prevents injection)
-# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED]
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED] [DECRYPTION]
 #   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
 #   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
+#   DECRYPTION 非空时启用 VLESS Encryption（`xray vlessenc` 生成的 decryption 串）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -705,6 +708,7 @@ build_vision_inbound() {
     local private_key="$5"
     local short_id="$6"
     local mldsa65_seed="${7:-}"
+    local decryption="${8:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -720,6 +724,7 @@ build_vision_inbound() {
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
         --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -727,7 +732,7 @@ build_vision_inbound() {
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "tcp",
@@ -745,7 +750,9 @@ build_vision_inbound() {
 }
 
 # Build XHTTP inbound JSON using jq (prevents injection)
-# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED]
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED] [DECRYPTION]
+#   启用 VLESS Encryption 后 flow 改为 xtls-rprx-vision：Vision 流控原本只能用在
+#   TCP + TLS/REALITY 上，VLESS Encryption 解除了对底层传输的限制。
 build_xhttp_inbound() {
     local name="$1"
     local port="$2"
@@ -755,6 +762,7 @@ build_xhttp_inbound() {
     local short_id="$6"
     local xhttp_path="$7"
     local mldsa65_seed="${8:-}"
+    local decryption="${9:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -771,14 +779,15 @@ build_xhttp_inbound() {
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
         --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": $uuid, "flow": ""}],
-                "decryption": "none"
+                "clients": [{"id": $uuid, "flow": (if $decryption == "" then "" else "xtls-rprx-vision" end)}],
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "xhttp",
@@ -6770,7 +6779,7 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
-        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed
+        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
         n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
         n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
 
@@ -6815,6 +6824,14 @@ write_config() {
         if [[ -n "$n_mldsa65_seed" ]] && ! xray_supports mldsa65; then
             log_error "$(t2 "节点 '$n_name' 启用了 REALITY ML-DSA-65，但当前 Xray 不支持，请先执行 xray-update" \
                 "Node '$n_name' uses REALITY ML-DSA-65, which this Xray does not support; run xray-update first")"
+            return 1
+        fi
+
+        # 可选的 VLESS Encryption，同样在核心不支持时失败而不是静默退回明文 VLESS。
+        n_decryption=$(decrypt_value "$(safe_read_config_value "$node_file" "VLESS_DECRYPTION")")
+        if [[ -n "$n_decryption" ]] && ! xray_supports vlessenc; then
+            log_error "$(t2 "节点 '$n_name' 启用了 VLESS Encryption，但当前 Xray 不支持，请先执行 xray-update" \
+                "Node '$n_name' uses VLESS Encryption, which this Xray does not support; run xray-update first")"
             return 1
         fi
 
@@ -6863,7 +6880,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -6891,7 +6908,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -7175,8 +7192,10 @@ save_env() {
     local save_xhttp_uuid="${XHTTP_UUID:-}"
     local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
     local save_mldsa65_seed="${MLDSA65_SEED:-}"
+    local save_vless_decryption="${VLESS_DECRYPTION:-}"
 
     if is_encryption_enabled; then
+        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
         save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
         save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
         save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
@@ -7209,6 +7228,8 @@ XHTTP_PRIVATE_KEY=$save_xhttp_private_key
 XHTTP_SHORT_ID=${XHTTP_SHORT_ID:-}
 MLDSA65_SEED=$save_mldsa65_seed
 MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
+VLESS_DECRYPTION=$save_vless_decryption
+VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
 SS_METHOD=${SS_METHOD:-}
 SS_PASSWORD=$save_ss_password
 ANYTLS_PASSWORD=$save_anytls_password
@@ -7241,7 +7262,7 @@ get_vision_link() {
         ip_formatted="[$ip]"
     fi
 
-    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
+    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
 }
 
 # VLESS 分享链接里的后量子参数。pqv 对应客户端的 mldsa65Verify（分享链接标准
@@ -7273,7 +7294,10 @@ get_xhttp_link() {
         link_pbk="$XHTTP_PUBLIC_KEY"
         link_sid="${XHTTP_SHORT_ID:-}"
     fi
-    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
+    # 启用 VLESS Encryption 时 XHTTP 也使用 Vision 流控，链接需带上 flow。
+    local link_flow=""
+    [[ -n "${VLESS_ENCRYPTION:-}" ]] && link_flow="&flow=xtls-rprx-vision"
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=${VLESS_ENCRYPTION:-none}${link_flow}&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}$(vless_link_pq_params)#${node_label}"
 }
 
 # ---- 后量子增强（可选） ----
@@ -7305,6 +7329,28 @@ gen_mldsa65_keys() {
     MLDSA65_VERIFY="$verify"
 }
 
+# 生成 VLESS Encryption 的 decryption/encryption 串对。`xray vlessenc` 一次给出两种
+# 认证方式，密钥交换都是后量子安全的 mlkem768x25519plus，区别只在认证密钥：
+#   x25519  认证密钥 43 字符，链接短、二维码可扫（默认）
+#   mlkem   认证也是后量子的，但客户端串约 1.6KB，链接无法生成可扫的二维码
+# Usage: gen_vlessenc_keys x25519|mlkem
+gen_vlessenc_keys() {
+    local want="${1:-x25519}" out decryption encryption
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null | tr -d '\r') || return 1
+    decryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"decryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    encryption=$(awk -v want="$want" '
+        /^Authentication: X25519/ { section = "x25519" }
+        /^Authentication: ML-KEM-768/ { section = "mlkem" }
+        section == want && /"encryption"/ { split($0, part, "\""); print part[4]; exit }' <<<"$out")
+    [[ "$decryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    [[ "$encryption" =~ ^mlkem768x25519plus\.[A-Za-z0-9._-]{20,}$ ]] || return 1
+    VLESS_DECRYPTION="$decryption"
+    VLESS_ENCRYPTION="$encryption"
+}
+
 # 布尔型环境变量：true/1/y/yes/on 视为启用。
 env_flag_enabled() {
     case "${1,,}" in
@@ -7313,15 +7359,82 @@ env_flag_enabled() {
     return 1
 }
 
+# 交互式选择后量子增强，结果写入 PQ_WANT_MLDSA65 / PQ_WANT_VLESSENC。
+# 只在完全交互的安装里出现：只要调用方用 proto= 或任一后量子环境变量驱动安装，就
+# 不再追加提问，避免让既有的无人值守脚本卡在一个它们不知道的新提示上。
+prompt_pq_options() {
+    PQ_WANT_MLDSA65=""
+    PQ_WANT_VLESSENC=""
+    [[ -z "${proto:-}" && -z "${mldsa65:-}" && -z "${vlessenc:-}" ]] || return 0
+    xray_supports vlessenc || xray_supports mldsa65 || return 0
+    # 没有控制终端时无法提问。这里与协议/端口提示不同：选项的默认值就是"关闭"，
+    # 跳过提问不会让用户得到一个自己没选过的东西，所以直接按默认处理。
+    ( : >/dev/tty ) 2>/dev/null || return 0
+
+    {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        $(t2 "后量子增强（可选）" "Post-quantum options (optional)")${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${YELLOW}$(t2 "两项都要求较新的客户端；不确定客户端是否支持时请保持关闭。" \
+        "Both need a recent client; leave them off when unsure about client support.")${NC}"
+    echo ""
+    echo -e "  ${GREEN}0.${NC} $(t2 "不启用（默认）" "Off (default)")"
+    echo -e "  ${GREEN}1.${NC} VLESS Encryption  ${GRAY}(mlkem768x25519plus)${NC}"
+    echo -e "  ${GREEN}2.${NC} REALITY ML-DSA-65  ${GRAY}($(t2 "证书后量子签名" "post-quantum certificate signature"))${NC}"
+    echo -e "  ${GREEN}3.${NC} $(t2 "两项都启用" "Both")"
+    echo ""
+    echo -n "  $(t2 "请选择" "Select") [0-3] ($(t2 "默认" "default") 0): "
+    } >/dev/tty
+
+    local choice=""
+    read -r choice </dev/tty || choice=""
+    case "$choice" in
+        1) PQ_WANT_VLESSENC="x25519" ;;
+        2) PQ_WANT_MLDSA65="true" ;;
+        3) PQ_WANT_VLESSENC="x25519"; PQ_WANT_MLDSA65="true" ;;
+    esac
+}
+
 # 为当前正在安装的 VLESS + REALITY 节点应用可选的后量子增强。
-#   mldsa65=true   REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
+#   vlessenc=x25519|mlkem|true  VLESS Encryption（true 等同 x25519）
+#   mldsa65=true                REALITY ML-DSA-65 证书签名（客户端需要 mldsa65Verify）
 # 默认全部关闭：它们都要求较新的客户端，旧客户端导入带这些参数的链接会连不上。
 # 条件不满足（核心不支持、目标证书太短）时告警并跳过，不让整次安装失败。
 configure_pq_options() {
     MLDSA65_SEED=""
     MLDSA65_VERIFY=""
-    env_flag_enabled "${mldsa65:-}" || return 0
+    VLESS_DECRYPTION=""
+    VLESS_ENCRYPTION=""
 
+    local want_mldsa65="" want_vlessenc=""
+    prompt_pq_options
+    want_mldsa65="$PQ_WANT_MLDSA65"
+    want_vlessenc="$PQ_WANT_VLESSENC"
+    env_flag_enabled "${mldsa65:-}" && want_mldsa65="true"
+    local vlessenc_request="${vlessenc:-}"
+    vlessenc_request="${vlessenc_request,,}"
+    case "$vlessenc_request" in
+        x25519|mlkem) want_vlessenc="$vlessenc_request" ;;
+        "") ;;
+        *) env_flag_enabled "$vlessenc_request" && want_vlessenc="x25519" ;;
+    esac
+
+    if [[ -n "$want_vlessenc" ]]; then
+        if ! xray_supports vlessenc; then
+            log_warn "$(t2 "当前 Xray 不支持 VLESS Encryption，已跳过（可先执行 xray-update）" \
+                "This Xray does not support VLESS Encryption; skipped (run xray-update first)")"
+        elif ! gen_vlessenc_keys "$want_vlessenc"; then
+            log_error "$(t2 "生成 VLESS Encryption 密钥失败" "Failed to generate VLESS Encryption keys")"
+            return 1
+        else
+            log_info "$(t2 "已启用 VLESS Encryption（认证方式: $want_vlessenc）" \
+                "VLESS Encryption enabled (authentication: $want_vlessenc)")"
+        fi
+    fi
+
+    [[ -n "$want_mldsa65" ]] || return 0
     if ! xray_supports mldsa65; then
         log_warn "$(t2 "当前 Xray 不支持 ML-DSA-65，已跳过（可先执行 xray-update）" \
             "This Xray does not support ML-DSA-65; skipped (run xray-update first)")"
@@ -7748,6 +7861,9 @@ show_info() {
         show_extra_short_ids
         if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
             echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
+        fi
+        if [[ -n "${VLESS_ENCRYPTION:-}" ]]; then
+            echo -e "  ${BLUE}Encryption:${NC}  ${VLESS_ENCRYPTION%.*}.<key>  ${GRAY}(VLESS Encryption)${NC}"
         fi
         if [[ "$proto_type" == "both" && -n "${XHTTP_PUBLIC_KEY:-}" ]]; then
             echo -e "  ${BLUE}XHTTP UUID:${NC}  ${XHTTP_UUID:-$UUID}  ${GRAY}($(t2 "XHTTP 使用独立凭据" "XHTTP has its own credentials"))${NC}"
@@ -8426,6 +8542,7 @@ cmd_edit() {
     XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
     XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
     MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
+    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
@@ -11742,7 +11859,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=462181 body-sha256=ac1ffe35a9e4488546d4e3137717f9db81d2804524927eaebde93cbef7ac0401
-# build-id=ac1ffe35a9e4488546d4e3137717f9db81d2804524927eaebde93cbef7ac0401
+# body-bytes=469123 body-sha256=8efbf600c990ae432b232d3bbac17af64fe8d20baf43012cf3046ee3521541e7
+# build-id=8efbf600c990ae432b232d3bbac17af64fe8d20baf43012cf3046ee3521541e7
 # module-count=11
 # proxy-hub-bundle-end-v1

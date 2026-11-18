@@ -400,7 +400,7 @@ reset_node_state() {
     PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
     XHTTP_UUID="" XHTTP_PUBLIC_KEY="" XHTTP_PRIVATE_KEY="" XHTTP_SHORT_ID=""
-    MLDSA65_SEED="" MLDSA65_VERIFY=""
+    MLDSA65_SEED="" MLDSA65_VERIFY="" VLESS_DECRYPTION="" VLESS_ENCRYPTION=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
@@ -445,6 +445,8 @@ safe_load_node_config() {
     XHTTP_SHORT_ID=$(safe_read_config_value "$file" "XHTTP_SHORT_ID")
     MLDSA65_SEED=$(safe_read_config_value "$file" "MLDSA65_SEED")
     MLDSA65_VERIFY=$(safe_read_config_value "$file" "MLDSA65_VERIFY")
+    VLESS_DECRYPTION=$(safe_read_config_value "$file" "VLESS_DECRYPTION")
+    VLESS_ENCRYPTION=$(safe_read_config_value "$file" "VLESS_ENCRYPTION")
     SERVER_IP=$(safe_read_config_value "$file" "SERVER_IP")
     SERVER_IPV4=$(safe_read_config_value "$file" "SERVER_IPV4")
     SERVER_IPV6=$(safe_read_config_value "$file" "SERVER_IPV6")
@@ -678,9 +680,10 @@ reality_short_id_list() {
 }
 
 # Build Vision inbound JSON using jq (prevents injection)
-# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED]
+# Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID [MLDSA65_SEED] [DECRYPTION]
 #   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
 #   MLDSA65_SEED 非空时为 REALITY 证书附加 ML-DSA-65 后量子签名。
+#   DECRYPTION 非空时启用 VLESS Encryption（`xray vlessenc` 生成的 decryption 串）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -689,6 +692,7 @@ build_vision_inbound() {
     local private_key="$5"
     local short_id="$6"
     local mldsa65_seed="${7:-}"
+    local decryption="${8:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -704,6 +708,7 @@ build_vision_inbound() {
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
         --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
@@ -711,7 +716,7 @@ build_vision_inbound() {
             "protocol": "vless",
             "settings": {
                 "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "tcp",
@@ -729,7 +734,9 @@ build_vision_inbound() {
 }
 
 # Build XHTTP inbound JSON using jq (prevents injection)
-# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED]
+# Usage: build_xhttp_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID PATH [MLDSA65_SEED] [DECRYPTION]
+#   启用 VLESS Encryption 后 flow 改为 xtls-rprx-vision：Vision 流控原本只能用在
+#   TCP + TLS/REALITY 上，VLESS Encryption 解除了对底层传输的限制。
 build_xhttp_inbound() {
     local name="$1"
     local port="$2"
@@ -739,6 +746,7 @@ build_xhttp_inbound() {
     local short_id="$6"
     local xhttp_path="$7"
     local mldsa65_seed="${8:-}"
+    local decryption="${9:-}"
 
     # Validate port
     port=$(get_validated_port "$port" true) || return 1
@@ -755,14 +763,15 @@ build_xhttp_inbound() {
         --argjson sockopt "$(netstack_sockopt_json)" \
         --arg target_key "$(xray_reality_target_key)" \
         --arg mldsa65_seed "$mldsa65_seed" \
+        --arg decryption "$decryption" \
         '{
             "tag": $tag,
             "listen": $listen,
             "port": $port,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": $uuid, "flow": ""}],
-                "decryption": "none"
+                "clients": [{"id": $uuid, "flow": (if $decryption == "" then "" else "xtls-rprx-vision" end)}],
+                "decryption": (if $decryption == "" then "none" else $decryption end)
             },
             "streamSettings": ({
                 "network": "xhttp",

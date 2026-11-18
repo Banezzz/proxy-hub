@@ -773,4 +773,108 @@ if use_real_xray; then
 fi
 SCENARIO
 
+# Optional VLESS Encryption: off by default; when on, both inbounds decrypt and
+# the XHTTP inbound gains the Vision flow that the encryption layer unlocks.
+run_scenario vless-encryption <<'SCENARIO'
+load_modules
+cat >/srv/bin/xray-enc <<'XRAY'
+#!/bin/sh
+case "$1" in
+  help) printf '\tmldsa65   ML-DSA-65\n\tvlessenc  VLESS Encryption\n' ;;
+  vlessenc) cat <<'OUT'
+Choose one Authentication to use, do not mix them. Ephemeral key exchange is Post-Quantum safe anyway.
+
+Authentication: X25519, not Post-Quantum
+"decryption": "mlkem768x25519plus.native.600s.EN5iuqWArcTGaz2Sgm5H7-n7TXD1am4vYKCQ9PraP3U"
+"encryption": "mlkem768x25519plus.native.0rtt.ls4tO2BFOQS9z6pMkz4ty6LRj4GpYfUfQ0o8UKxxQRo"
+
+Authentication: ML-KEM-768, Post-Quantum
+"decryption": "mlkem768x25519plus.native.600s.92MSizeJKdX-kGZU3lc1LSGA3tl7WGZmhUgy-zczYeMKLO3sUKrWYx66jmwt6B41LUbrSDvFgiJQvOmSenNtjw"
+"encryption": "mlkem768x25519plus.native.0rtt.YEaD36oML8mWHgw86qao95BwbYgzHxa6_xnLkoKR8aAFqVo6sIEnNULGCdahPnZr51XB"
+OUT
+  ;;
+esac
+XRAY
+chmod 755 /srv/bin/xray-enc
+make_fake_xray /srv/bin/xray-old
+XRAY_BIN=/srv/bin/xray-enc
+XRAY_CAPS=""
+SNI=edge.example.com
+DEC_X="mlkem768x25519plus.native.600s.EN5iuqWArcTGaz2Sgm5H7-n7TXD1am4vYKCQ9PraP3U"
+ENC_X="mlkem768x25519plus.native.0rtt.ls4tO2BFOQS9z6pMkz4ty6LRj4GpYfUfQ0o8UKxxQRo"
+
+# proto= marks a scripted install: no prompt, and nothing is enabled by default.
+export proto=vision
+configure_pq_options
+assert_eq "/" "$VLESS_DECRYPTION/$VLESS_ENCRYPTION" "VLESS Encryption must stay off unless requested"
+
+vlessenc=true configure_pq_options 2>/dev/null
+assert_eq "$DEC_X" "$VLESS_DECRYPTION" "vlessenc=true selects the X25519-authenticated pair (decryption)"
+assert_eq "$ENC_X" "$VLESS_ENCRYPTION" "vlessenc=true selects the X25519-authenticated pair (encryption)"
+vlessenc=MLKEM configure_pq_options 2>/dev/null
+assert_contains "$VLESS_DECRYPTION" "92MSizeJKdX" "vlessenc=mlkem selects the ML-KEM-authenticated pair"
+assert_contains "$VLESS_ENCRYPTION" "YEaD36oML8mW" "the client string must come from the same section"
+vlessenc=no configure_pq_options
+assert_eq "" "$VLESS_DECRYPTION" "a false value leaves VLESS Encryption off"
+
+XRAY_BIN=/srv/bin/xray-old
+XRAY_CAPS=""
+vlessenc=true configure_pq_options 2>/srv/enc.warn
+assert_eq "" "$VLESS_DECRYPTION" "an old core must not enable VLESS Encryption"
+assert_contains "$(cat /srv/enc.warn)" "does not support VLESS Encryption" "an old core must explain the skip"
+
+# Rendering.
+XRAY_BIN=/srv/bin/xray-enc
+XRAY_CAPS=""
+write_node enc both "VLESS_DECRYPTION=$DEC_X" "VLESS_ENCRYPTION=$ENC_X"
+write_node plain both
+write_config
+assert_eq "$DEC_X" "$(jq -r '.inbounds[] | select(.tag == "enc_vision") | .settings.decryption' "$XRAY_CONF")" \
+    "the Vision inbound must decrypt"
+assert_eq "$DEC_X" "$(jq -r '.inbounds[] | select(.tag == "enc_xhttp") | .settings.decryption' "$XRAY_CONF")" \
+    "the XHTTP inbound must decrypt"
+assert_eq "xtls-rprx-vision" \
+    "$(jq -r '.inbounds[] | select(.tag == "enc_xhttp") | .settings.clients[0].flow' "$XRAY_CONF")" \
+    "VLESS Encryption unlocks the Vision flow on XHTTP"
+assert_eq "none/" \
+    "$(jq -r '.inbounds[] | select(.tag == "plain_xhttp") | "\(.settings.decryption)/\(.settings.clients[0].flow)"' "$XRAY_CONF")" \
+    "a node without VLESS Encryption keeps decryption none and an empty XHTTP flow"
+
+CURRENT_NODE_NAME=enc
+safe_load_node_config "$NODES_DIR/enc.env"
+vlink=$(get_vision_link 203.0.113.10 v)
+xlink=$(get_xhttp_link 203.0.113.10 x)
+assert_contains "$vlink" "?encryption=${ENC_X}&flow=xtls-rprx-vision&" "the Vision link carries the client string"
+assert_contains "$xlink" "&encryption=${ENC_X}&flow=xtls-rprx-vision&pbk=" "the XHTTP link carries the string and the flow"
+assert_not_contains "$vlink$xlink" "EN5iuqWArcTGaz2" "the server decryption key must never enter a link"
+assert_contains "$(show_info)" "VLESS Encryption" "node info must mention VLESS Encryption"
+CURRENT_NODE_NAME=plain
+safe_load_node_config "$NODES_DIR/plain.env"
+assert_contains "$(get_vision_link 203.0.113.10 v)" "?encryption=none&" "ordinary links keep encryption=none"
+assert_not_contains "$(get_xhttp_link 203.0.113.10 x)" "flow=" "ordinary XHTTP links have no flow"
+
+XRAY_BIN=/srv/bin/xray-old
+XRAY_CAPS=""
+rc=0
+write_config 2>/srv/enc.err || rc=$?
+assert_eq "1" "$rc" "rendering a VLESS Encryption node on an unsupporting core must fail"
+assert_contains "$(cat /srv/enc.err)" "run xray-update first" "the failure must say how to fix it"
+
+if use_real_xray; then
+    for mode in x25519 mlkem; do
+        reset_node_state
+        gen_vlessenc_keys "$mode" || fail_case "the real core did not produce a $mode key pair"
+        rm -f -- "$NODES_DIR"/*.env
+        write_node "real$mode" both "VLESS_DECRYPTION=$VLESS_DECRYPTION" "VLESS_ENCRYPTION=$VLESS_ENCRYPTION"
+        write_config
+        "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+            cat /srv/xray-test.out >&2
+            fail_case "the real core rejected the VLESS Encryption config ($mode)"
+        }
+        assert_eq "$VLESS_ENCRYPTION" "$(safe_read_config_value "$NODES_DIR/real$mode.env" VLESS_ENCRYPTION)" \
+            "a real $mode client string must survive the node-file reader"
+    done
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."
