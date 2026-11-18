@@ -75,12 +75,16 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
 +                    "shortIds": [$short_id]
-@@ -6478,0 +6535,4 @@
+@@ -5709,0 +5766,3 @@
++    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
++    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
++    # 证书会直接握手失败。
+@@ -6478,0 +6538,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6989,0 +7050,31 @@
+@@ -6989,0 +7053,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -112,15 +116,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7082,5 @@
+@@ -6990,0 +7085,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7091 @@
+@@ -6994,0 +7094 @@
 +    local pin="" query
-@@ -7000 +7097,19 @@
+@@ -7000 +7100,19 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    query="sni=${SNI:-www.bing.com}&insecure=1"
 +    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
@@ -141,7 +145,7 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7179,0 +7295 @@
+@@ -7179,0 +7298 @@
 +        show_selfsigned_cert_pins
-@@ -7212,0 +7329 @@
+@@ -7212,0 +7332 @@
 +            show_selfsigned_cert_pins

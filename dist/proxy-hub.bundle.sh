@@ -5763,6 +5763,9 @@ gen_selfsigned_cert() {
     local cert_path="$SINGBOX_CERT_DIR/${name}.crt"
     local key_path="$SINGBOX_CERT_DIR/${name}.key"
 
+    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
+    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
+    # 证书会直接握手失败。
     openssl ecparam -genkey -name prime256v1 -out "$key_path" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" \
         -subj "/CN=${cn}" 2>/dev/null
@@ -11345,7 +11348,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=441110 body-sha256=6da3abc7b1c695967ca1d83dde70c64538f229c51013eeace1ca0c92f3251076
-# build-id=6da3abc7b1c695967ca1d83dde70c64538f229c51013eeace1ca0c92f3251076
+# body-bytes=441353 body-sha256=b66e470d0d23bd49a14bc5baaaeb6840158ad629670f8810e306e78bda64d668
+# build-id=b66e470d0d23bd49a14bc5baaaeb6840158ad629670f8810e306e78bda64d668
 # module-count=11
 # proxy-hub-bundle-end-v1

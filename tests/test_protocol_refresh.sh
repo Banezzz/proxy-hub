@@ -313,4 +313,18 @@ CURRENT_NODE_NAME=real
 assert_not_contains "$(show_info)" "Cert SHA-256" "REALITY nodes have no pinned certificate"
 SCENARIO
 
+# Self-signed certificates must stay ECDSA P-256.  sing-box 1.14 Hysteria2
+# clients mimic Chrome's QUIC handshake, which does not offer Ed25519, so an
+# Ed25519 server certificate fails the handshake outright.
+run_scenario selfsigned-cert-algorithm <<'SCENARIO'
+load_modules
+gen_selfsigned_cert algo edge.example.com
+cert_text=$(openssl x509 -in "$SINGBOX_CERT_DIR/algo.crt" -noout -text)
+assert_contains "$cert_text" "Public Key Algorithm: id-ecPublicKey" "the certificate key must be ECDSA"
+assert_contains "$cert_text" "prime256v1" "the certificate curve must be P-256"
+assert_not_contains "$cert_text" "ED25519" "Ed25519 certificates break Chrome-parroting Hysteria2 clients"
+assert_contains "$cert_text" "CN = edge.example.com" "the certificate CN follows the SNI"
+assert_eq "600" "$(stat -c '%a' "$SINGBOX_CERT_DIR/algo.key")" "the private key must stay private"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

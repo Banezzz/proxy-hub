@@ -425,6 +425,9 @@ gen_selfsigned_cert() {
     local cert_path="$SINGBOX_CERT_DIR/${name}.crt"
     local key_path="$SINGBOX_CERT_DIR/${name}.key"
 
+    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
+    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
+    # 证书会直接握手失败。
     openssl ecparam -genkey -name prime256v1 -out "$key_path" 2>/dev/null
     openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" \
         -subj "/CN=${cn}" 2>/dev/null
