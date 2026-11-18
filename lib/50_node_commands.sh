@@ -667,6 +667,7 @@ cmd_edit() {
                 echo -e "  ${GREEN}2.${NC} 修改 TLS SNI               ${GRAY}(${SNI})${NC}"
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
                 echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
+                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -778,6 +779,17 @@ cmd_edit() {
                 fi
                 changed=true ;;
 
+            hysteria2:5)
+                local new_hop
+                echo -n "  $(t2 "UDP 范围（如 20000-20100，留空关闭）" "UDP range (e.g. 20000-20100, empty to disable)"): " >/dev/tty
+                read -r new_hop </dev/tty
+                if [[ -z "$new_hop" ]]; then
+                    HY2_HOP_PORTS=""
+                    changed=true
+                elif apply_hy2_hop_range "$new_hop"; then
+                    changed=true
+                fi ;;
+
             # ---- AnyTLS padding ----
             anytls:4|anytls_reality:4)
                 ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
@@ -847,6 +859,9 @@ cmd_uninstall() {
             rm -f "$tmp_installer"
         fi
     fi
+
+    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
+    hy2_hop_remove
 
     # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then

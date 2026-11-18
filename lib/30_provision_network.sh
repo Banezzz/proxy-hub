@@ -132,10 +132,45 @@ gen_hy2_password() {
 # Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
 # 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
 
+# 校验并采用一个端口跳跃范围，写入 HY2_HOP_PORTS。
+# Usage: apply_hy2_hop_range RANGE
+apply_hy2_hop_range() {
+    local range request="${1:-}"
+    if [[ "${request,,}" == "auto" ]]; then
+        if ! request=$(gen_hy2_hop_range "${CURRENT_NODE_NAME:-}"); then
+            log_error "$(t2 "未能找到空闲的端口跳跃范围" "Could not find a free hop range")"
+            return 1
+        fi
+    fi
+    if ! range=$(validate_hop_range "$request"); then
+        log_error "$(t2 "端口跳跃范围无效，应为 起始-结束（1-65535，跨度不超过 20000）" \
+            "Invalid hop range; expected START-END (1-65535, at most 20000 ports wide)"): ${1:-}"
+        return 1
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "端口跳跃需要 iptables，请先安装" "Port hopping requires iptables; install it first")"
+        return 1
+    fi
+    if hy2_hop_range_conflicts "$range" "${CURRENT_NODE_NAME:-}"; then
+        log_error "$(t2 "端口跳跃范围与其他节点的 UDP 端口或跳跃范围冲突" \
+            "The hop range overlaps another node's UDP port or hop range"): $range"
+        return 1
+    fi
+    HY2_HOP_PORTS="$range"
+    log_info "$(t2 "已启用端口跳跃: UDP $range（云安全组需同步放行该范围）" \
+        "Port hopping enabled: UDP $range (allow the same range in the cloud firewall)")"
+}
+
 # 为当前正在安装的 Hysteria2 节点应用可选加固。
 #   hy2obfs=true|<password>  Salamander 混淆（true 为随机密码）
+#   hy2hop=auto|20000-20100  端口跳跃：把这段 UDP 端口重定向到监听端口（auto 随机选段）
 configure_hy2_options() {
     HY2_OBFS_PASSWORD=""
+    HY2_HOP_PORTS=""
+
+    if [[ -n "${hy2hop:-}" ]]; then
+        apply_hy2_hop_range "$hy2hop" || return 1
+    fi
 
     local obfs_request="${hy2obfs:-}"
     case "${obfs_request,,}" in

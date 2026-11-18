@@ -930,4 +930,121 @@ if use_real_singbox; then
 fi
 SCENARIO
 
+# Hysteria2 port hopping: range validation, conflict detection, an idempotent
+# dedicated NAT chain, and re-application on every service start.
+run_scenario hysteria2-port-hopping <<'SCENARIO'
+load_modules
+HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
+HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+systemctl() { printf '%s\n' "$*" >>/srv/systemctl.calls; }
+: >/srv/systemctl.calls
+
+assert_eq "20000-20100" "$(validate_hop_range 20000-20100)" "a plain range is accepted"
+assert_eq "8000-9000" "$(validate_hop_range 08000-09000)" "leading zeros are normalized, not read as octal"
+for bad in "" 20000 20100-20000 20000-20000 0-100 60000-70000 1-30000 "20000-20100;id" 'a-b' "20000 - 20100"; do
+    assert_fails "hop range '$bad' must be rejected" validate_hop_range "$bad"
+done
+
+# Conflicts with other nodes.
+write_node hy1 hysteria2 "HY2_HOP_PORTS=30000-30100"
+sed -i 's/^PORT=1443$/PORT=4443/' "$NODES_DIR/hy1.env"
+write_node ss1 shadowsocks
+sed -i 's/^PORT=1443$/PORT=25000/' "$NODES_DIR/ss1.env"
+write_node tcp1 vision
+sed -i 's/^PORT=1443$/PORT=26000/' "$NODES_DIR/tcp1.env"
+hy2_hop_range_conflicts 30050-30200 other || fail_case "overlapping hop ranges must conflict"
+hy2_hop_range_conflicts 4000-5000 other || fail_case "a range covering another Hysteria2 port must conflict"
+hy2_hop_range_conflicts 24990-25010 other || fail_case "a range covering a Shadowsocks UDP port must conflict"
+assert_fails "a TCP-only node inside the range is not a conflict" hy2_hop_range_conflicts 25990-26010 other
+assert_fails "a node does not conflict with itself" hy2_hop_range_conflicts 30000-30100 hy1
+assert_fails "a disjoint range is free" hy2_hop_range_conflicts 40000-40100 other
+
+# Random recommendation: valid, 200 wide, and conflict-free.
+for _ in 1 2 3 4 5; do
+    auto=$(gen_hy2_hop_range other)
+    validate_hop_range "$auto" >/dev/null || fail_case "generated range is invalid: $auto"
+    assert_eq "199" "$(( ${auto#*-} - ${auto%-*} ))" "the generated range spans 200 ports"
+    assert_fails "the generated range must not conflict: $auto" hy2_hop_range_conflicts "$auto" other
+done
+
+# Option handling at install time.
+cat >/srv/bin/iptables <<'FAKE'
+#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >>/srv/iptables.calls
+[ -z "${FAKE_IPTABLES_FAIL:-}" ] || case "$*" in *"$FAKE_IPTABLES_FAIL"*) exit 1 ;; esac
+exit 0
+FAKE
+chmod 755 /srv/bin/iptables
+cp /srv/bin/iptables /srv/bin/ip6tables
+PATH="/srv/bin:$PATH"
+CURRENT_NODE_NAME=fresh
+hy2hop=41000-41050 configure_hy2_options 2>/dev/null
+assert_eq "41000-41050" "$HY2_HOP_PORTS" "an explicit range is adopted"
+hy2hop=AUTO configure_hy2_options 2>/dev/null
+validate_hop_range "$HY2_HOP_PORTS" >/dev/null || fail_case "hy2hop=auto must produce a range"
+configure_hy2_options
+assert_eq "" "$HY2_HOP_PORTS" "port hopping must stay off unless requested"
+rc=0
+( hy2hop=30050-30200 configure_hy2_options 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "a conflicting range must fail the install"
+rc=0
+( hy2hop=nonsense configure_hy2_options 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "an invalid range must fail the install"
+
+# Sync: helper, rules, drop-in.
+: >/srv/iptables.calls
+hy2_hop_sync || fail_case "hop sync failed"
+[[ -x "$HY2_HOP_HELPER" ]] || fail_case "the helper was not installed"
+sh -n "$HY2_HOP_HELPER" || fail_case "the helper is not valid POSIX sh"
+calls=$(cat /srv/iptables.calls)
+assert_contains "$calls" "iptables -t nat -N PROXY_HUB_HY2_HOP" "the dedicated chain is created"
+assert_contains "$calls" "iptables -t nat -A PROXY_HUB_HY2_HOP -p udp --dport 30000:30100 -j REDIRECT --to-ports 4443" \
+    "the range is redirected to the listen port"
+assert_contains "$calls" "iptables -t nat -A PREROUTING -j PROXY_HUB_HY2_HOP" "the chain is hooked into PREROUTING"
+if [[ -f /proc/net/if_inet6 ]]; then
+    assert_contains "$calls" "ip6tables -t nat -A PROXY_HUB_HY2_HOP -p udp --dport 30000:30100" "IPv6 gets the same rule"
+fi
+assert_not_contains "$calls" "-A INPUT" "the helper must not touch filter rules"
+assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-$HY2_HOP_HELPER apply" \
+    "sing-box re-applies the rules on every start"
+assert_contains "$(cat /srv/systemctl.calls)" "daemon-reload" "systemd must reload after the drop-in changes"
+
+# Idempotent: every apply tears the chain down before rebuilding it.
+: >/srv/iptables.calls
+"$HY2_HOP_HELPER" apply
+assert_eq "1" "$(grep -c '^iptables -t nat -A PREROUTING' /srv/iptables.calls)" "one PREROUTING hook per apply"
+assert_contains "$(head -n 3 /srv/iptables.calls)" "-D PREROUTING -j PROXY_HUB_HY2_HOP" "apply starts by unhooking"
+
+# An IPv4 failure is fatal; an IPv6-only failure is tolerated.
+rc=0
+FAKE_IPTABLES_FAIL="--dport" hy2_hop_sync 2>/dev/null || rc=$?
+assert_eq "1" "$rc" "a failed IPv4 rule must fail the sync"
+cat >/srv/bin/ip6tables <<'FAKE'
+#!/bin/sh
+case "$*" in *"-N "*) exit 1 ;; esac
+exit 0
+FAKE
+hy2_hop_sync || fail_case "a missing IPv6 NAT table must not fail the sync"
+
+# Link and info.
+gen_selfsigned_cert hy1 edge.example.com
+CURRENT_NODE_NAME=hy1
+assert_contains "$(get_share_link)" "&mport=30000-30100#" "the link advertises the hop range"
+assert_contains "$(show_info)" "UDP 30000-30100 -> 4443" "node info shows the redirect"
+
+# Removing the last hop range clears rules, helper and drop-in.
+sed -i 's/^HY2_HOP_PORTS=.*/HY2_HOP_PORTS=/' "$NODES_DIR/hy1.env"
+cp /srv/bin/iptables /srv/bin/ip6tables
+: >/srv/iptables.calls
+hy2_hop_sync
+assert_contains "$(cat /srv/iptables.calls)" "iptables -t nat -X PROXY_HUB_HY2_HOP" "the chain is deleted"
+assert_not_contains "$(cat /srv/iptables.calls)" " -N " "no chain is recreated without rules"
+[[ ! -e "$HY2_HOP_HELPER" && ! -e "$HY2_HOP_DROPIN" ]] || fail_case "helper or drop-in was left behind"
+hy2_hop_sync || fail_case "syncing with nothing to do must succeed"
+
+# OpenRC wires the helper into start_pre instead of a drop-in.
+openrc_script=$(declare -f create_singbox_openrc_service)
+assert_contains "$openrc_script" "proxy-hub-hy2-hop apply" "the OpenRC service must re-apply hop rules on start"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

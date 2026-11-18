@@ -582,8 +582,158 @@ depend() {
     need net
     after firewall
 }
+
+start_pre() {
+    # Hysteria2 端口跳跃的 NAT 规则不持久，随服务启动重新下发（helper 不存在则跳过）。
+    [ -x /usr/local/libexec/proxy-hub-hy2-hop ] && /usr/local/libexec/proxy-hub-hy2-hop apply
+    return 0
+}
 OPENRC_SERVICE
     chmod 755 /etc/init.d/sing-box
+}
+
+# ============== Hysteria2 端口跳跃 ==============
+#
+# 服务端只监听一个 UDP 端口；端口跳跃靠 NAT 把一段 UDP 端口重定向到它。规则放在
+# 专用链 PROXY_HUB_HY2_HOP 里，每次同步先清空再重建，因此是幂等的，也不会碰用户
+# 自己的 NAT 规则。iptables 规则重启即丢，所以生成一个 helper，由 sing-box 服务在
+# 启动前调用（systemd drop-in 的 ExecStartPre / OpenRC 的 start_pre）。
+HY2_HOP_HELPER="/usr/local/libexec/proxy-hub-hy2-hop"
+HY2_HOP_DROPIN="/etc/systemd/system/sing-box.service.d/20-proxy-hub-hy2-hop.conf"
+HY2_HOP_CHAIN="PROXY_HUB_HY2_HOP"
+
+# 校验并规范化端口跳跃范围。Usage: validate_hop_range "20000-20100" -> "20000-20100"
+validate_hop_range() {
+    local range="${1:-}" start end
+    [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+    start=$((10#${BASH_REMATCH[1]}))
+    end=$((10#${BASH_REMATCH[2]}))
+    (( start >= 1 && end <= 65535 && start < end && end - start <= 20000 )) || return 1
+    printf '%s-%s' "$start" "$end"
+}
+
+# 范围是否与其他节点冲突：别的节点监听的 UDP 端口落在范围内会被一并重定向走，
+# 两个跳跃范围重叠则后一条规则永远不会命中。
+# Usage: hy2_hop_range_conflicts RANGE SELF_NODE_NAME
+hy2_hop_range_conflicts() {
+    local range="$1" self="${2:-}" start="${1%-*}" end="${1#*-}" f name proto port other
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .env)
+        [[ "$name" == "$self" ]] && continue
+        proto=$(safe_read_config_value "$f" "PROTOCOL_TYPE")
+        port=$(safe_read_config_value "$f" "PORT")
+        if [[ "$proto" == "hysteria2" || "$proto" == "shadowsocks" ]] && [[ "$port" =~ ^[0-9]+$ ]] \
+            && (( port >= start && port <= end )); then
+            return 0
+        fi
+        other=$(safe_read_config_value "$f" "HY2_HOP_PORTS")
+        if [[ "$other" =~ ^([0-9]+)-([0-9]+)$ ]] \
+            && (( BASH_REMATCH[1] <= end && BASH_REMATCH[2] >= start )); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 随机挑一段不与其他节点冲突的 200 端口范围，供"推荐配置"直接采用，用户无需自己
+# 想一个范围。随机化同时避免所有部署都落在同一段众所周知的端口上。
+# Usage: gen_hy2_hop_range [SELF_NODE_NAME]
+gen_hy2_hop_range() {
+    local self="${1:-}" attempt start range
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        start=$(shuf -i 20000-59000 -n 1) || return 1
+        range="${start}-$((start + 199))"
+        hy2_hop_range_conflicts "$range" "$self" && continue
+        printf '%s' "$range"
+        return 0
+    done
+    return 1
+}
+
+# 输出全部跳跃规则，每行 "START END LISTEN_PORT"。
+hy2_hop_rules() {
+    local f range port
+    for f in "$NODES_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        [[ "$(safe_read_config_value "$f" "PROTOCOL_TYPE")" == "hysteria2" ]] || continue
+        range=$(validate_hop_range "$(safe_read_config_value "$f" "HY2_HOP_PORTS")") || continue
+        port=$(get_validated_port "$(safe_read_config_value "$f" "PORT")" true) || continue
+        printf '%s %s %s\n' "${range%-*}" "${range#*-}" "$port"
+    done
+}
+
+# 清除规则并移除 helper / drop-in。
+hy2_hop_remove() {
+    [[ -x "$HY2_HOP_HELPER" ]] && "$HY2_HOP_HELPER" clear >/dev/null 2>&1
+    rm -f -- "$HY2_HOP_HELPER"
+    if [[ -e "$HY2_HOP_DROPIN" ]]; then
+        rm -f -- "$HY2_HOP_DROPIN"
+        rmdir -- "$(dirname "$HY2_HOP_DROPIN")" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 让 NAT 规则与节点文件一致。没有任何跳跃范围时清理干净；有则必须成功，否则返回
+# 非零——分享链接已经声明了跳跃范围，规则没下发会让客户端跳到无人接收的端口上。
+hy2_hop_sync() {
+    local rules tmp
+    rules=$(hy2_hop_rules)
+    if [[ -z "$rules" ]]; then
+        hy2_hop_remove
+        return 0
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_error "$(t2 "Hysteria2 端口跳跃需要 iptables，请先安装" "Hysteria2 port hopping requires iptables; install it first")"
+        return 1
+    fi
+
+    mkdir -p -- "$(dirname "$HY2_HOP_HELPER")" || return 1
+    tmp=$(mktemp "${HY2_HOP_HELPER}.XXXXXXXX") || return 1
+    cat >"$tmp" <<HELPER
+#!/bin/sh
+# proxy-hub-managed: hy2-hop-v1
+# Redirects the UDP hop ranges of Hysteria2 nodes to their listen ports.
+CHAIN=$HY2_HOP_CHAIN
+RULES='$rules'
+status=0
+for ipt in iptables ip6tables; do
+    command -v "\$ipt" >/dev/null 2>&1 || continue
+    if [ "\$ipt" = ip6tables ] && [ ! -f /proc/net/if_inet6 ]; then continue; fi
+    "\$ipt" -t nat -D PREROUTING -j "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -F "\$CHAIN" 2>/dev/null
+    "\$ipt" -t nat -X "\$CHAIN" 2>/dev/null
+    [ "\$1" = clear ] && continue
+    ok=1
+    "\$ipt" -t nat -N "\$CHAIN" || ok=0
+    if [ "\$ok" = 1 ]; then
+        printf '%s\n' "\$RULES" | while read -r start end port; do
+            [ -n "\$port" ] || continue
+            "\$ipt" -t nat -A "\$CHAIN" -p udp --dport "\$start:\$end" -j REDIRECT --to-ports "\$port" || exit 1
+        done || ok=0
+    fi
+    [ "\$ok" = 1 ] && { "\$ipt" -t nat -A PREROUTING -j "\$CHAIN" || ok=0; }
+    # IPv6 NAT 需要内核的 ip6table_nat，缺失时只影响 IPv6 的跳跃，不视为失败。
+    [ "\$ok" = 1 ] || [ "\$ipt" = ip6tables ] || status=1
+done
+exit "\$status"
+HELPER
+    chmod 755 "$tmp" && mv -f -- "$tmp" "$HY2_HOP_HELPER" || { rm -f -- "$tmp"; return 1; }
+
+    if ! "$HY2_HOP_HELPER" apply; then
+        log_error "$(t2 "下发 Hysteria2 端口跳跃的 NAT 规则失败" "Failed to apply the Hysteria2 port-hopping NAT rules")"
+        return 1
+    fi
+
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        create_singbox_openrc_service
+    else
+        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
+        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
+            "ExecStartPre=-$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 }
 
 # musl 系统（Alpine）没有 glibc 动态链接器，无法执行链接 glibc 的二进制文件。

@@ -404,7 +404,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD="" HY2_OBFS_PASSWORD=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -455,6 +455,7 @@ safe_load_node_config() {
     ANYTLS_PASSWORD=$(safe_read_config_value "$file" "ANYTLS_PASSWORD")
     HY2_PASSWORD=$(safe_read_config_value "$file" "HY2_PASSWORD")
     HY2_OBFS_PASSWORD=$(safe_read_config_value "$file" "HY2_OBFS_PASSWORD")
+    HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
 
     return 0
 }

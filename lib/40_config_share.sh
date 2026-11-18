@@ -437,6 +437,7 @@ singbox_sync() {
             service_disable "$SINGBOX_SERVICE"
         fi
         rm -f "$SINGBOX_CONF" 2>/dev/null
+        hy2_hop_sync
         return 0
     fi
 
@@ -449,6 +450,11 @@ singbox_sync() {
     fi
 
     if ! write_singbox_config; then
+        return 1
+    fi
+
+    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
+    if ! hy2_hop_sync; then
         return 1
     fi
 
@@ -541,6 +547,7 @@ ANYTLS_PASSWORD=$save_anytls_password
 ANYTLS_PADDING_B64=${ANYTLS_PADDING_B64:-}
 HY2_PASSWORD=$save_hy2_password
 HY2_OBFS_PASSWORD=$save_hy2_obfs_password
+HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 ENV
     chmod 600 "$node_file"
 
@@ -873,6 +880,7 @@ get_hy2_link() {
     pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
     [[ -n "$pin" ]] && query+="&pinSHA256=${pin}"
     [[ -n "${HY2_OBFS_PASSWORD:-}" ]] && query+="&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
+    [[ -n "${HY2_HOP_PORTS:-}" ]] && query+="&mport=${HY2_HOP_PORTS}"
 
     echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?${query}#${node_label}"
 }
@@ -1081,6 +1089,9 @@ show_info() {
         echo -e "  ${BLUE}Password:${NC}    ${HY2_PASSWORD:-N/A}"
         if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
             echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
+        fi
+        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
+            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
         fi
         echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
         echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
