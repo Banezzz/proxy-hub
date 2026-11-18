@@ -327,4 +327,84 @@ assert_contains "$cert_text" "CN = edge.example.com" "the certificate CN follows
 assert_eq "600" "$(stat -c '%a' "$SINGBOX_CERT_DIR/algo.key")" "the private key must stay private"
 SCENARIO
 
+# REALITY short IDs: new keys use the full 8 bytes, and extra IDs widen only
+# the server allow-list while share links keep the primary ID.
+run_scenario reality-short-ids <<'SCENARIO'
+load_modules
+
+validate_reality_short_ids "" || fail_case "an empty list is valid"
+validate_reality_short_ids "0123456789abcdef" || fail_case "a 16-hex ID is valid"
+validate_reality_short_ids "aa11:BB22cc33" || fail_case "a colon list of even-length IDs is valid"
+for bad in "abc" "0123456789abcdef00" "zz11" "aa11::bb22" ":aa11" "aa11:" "aa11,bb22" 'aa11;id'; do
+    assert_fails "short ID list '$bad' must be rejected" validate_reality_short_ids "$bad"
+done
+assert_eq "aa:bb" "$(reality_short_id_list aa bb)" "primary and extra IDs join with a colon"
+assert_eq "aa" "$(reality_short_id_list aa "")" "no extra IDs leaves the primary alone"
+assert_eq "" "$(reality_short_id_list "" "")" "an empty primary stays empty"
+
+# Key generation: fake core output in the current `x25519` format.
+cat >/srv/bin/xray-keys <<'XRAY'
+#!/bin/sh
+printf '%s\n' 'PrivateKey: 0L7o52zLQdOiD9cNmJwq0t9hmBupbWOBAhSmJVSXDVY' \
+    'Password (PublicKey): ui4-cJGwxFuwDxEorVUjWRt8GxpfXfLzDzsFimVabnY' 'Hash32: unused'
+XRAY
+chmod 755 /srv/bin/xray-keys
+XRAY_BIN=/srv/bin/xray-keys
+gen_reality_keys 2>/dev/null
+[[ "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]] || fail_case "new short IDs must be 16 hex characters: $SHORT_ID"
+assert_eq "ui4-cJGwxFuwDxEorVUjWRt8GxpfXfLzDzsFimVabnY" "$PUBLIC_KEY" "public key label with a parenthetical"
+
+sids="AA11, bb22cc33" apply_extra_short_ids 2>/dev/null
+assert_eq "aa11:bb22cc33" "$EXTRA_SHORT_IDS" "sids accepts commas and normalizes case"
+rc=0
+( sids="xyz" apply_extra_short_ids 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "an invalid sids value must fail the install"
+unset sids
+apply_extra_short_ids
+assert_eq "" "$EXTRA_SHORT_IDS" "no sids leaves the extra list empty"
+
+XRAY_BIN=/srv/absent-xray
+XRAY_CAPS=""
+write_node multi both "EXTRA_SHORT_IDS=aa11:bb22cc33"
+write_node solo vision
+write_node ar anytls_reality "EXTRA_SHORT_IDS=cc44"
+write_config
+assert_eq '["0123456789abcdef","aa11","bb22cc33"]' \
+    "$(jq -c '.inbounds[] | select(.tag == "multi_vision") | .streamSettings.realitySettings.shortIds' "$XRAY_CONF")" \
+    "extra IDs must extend the Vision allow-list"
+assert_eq '["0123456789abcdef","aa11","bb22cc33"]' \
+    "$(jq -c '.inbounds[] | select(.tag == "multi_xhttp") | .streamSettings.realitySettings.shortIds' "$XRAY_CONF")" \
+    "extra IDs must extend the XHTTP allow-list"
+assert_eq '["0123456789abcdef"]' \
+    "$(jq -c '.inbounds[] | select(.tag == "solo_vision") | .streamSettings.realitySettings.shortIds' "$XRAY_CONF")" \
+    "a node without extra IDs keeps a single short ID"
+write_singbox_config
+assert_eq '["0123456789abcdef","cc44"]' \
+    "$(jq -c '.inbounds[] | select(.tag == "ar_anytls") | .tls.reality.short_id' "$SINGBOX_CONF")" \
+    "extra IDs must extend the sing-box REALITY allow-list"
+
+CURRENT_NODE_NAME=multi
+link=$(get_share_link)
+assert_contains "$link" "sid=0123456789abcdef" "links use the primary short ID"
+assert_not_contains "$link" "aa11" "extra IDs never enter a share link"
+assert_contains "$(show_info)" "aa11, bb22cc33" "node info lists the extra IDs"
+
+# Round trip through save_env keeps the extra IDs.
+safe_load_node_config "$NODES_DIR/multi.env"
+save_env
+assert_eq "aa11:bb22cc33" "$(safe_read_config_value "$NODES_DIR/multi.env" EXTRA_SHORT_IDS)" \
+    "save_env must persist the extra short IDs"
+
+if use_real_xray; then
+    write_config
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+        cat /srv/xray-test.out >&2
+        fail_case "the real core rejected multiple short IDs"
+    }
+fi
+if use_real_singbox; then
+    write_singbox_config || fail_case "the real sing-box rejected multiple short IDs"
+fi
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

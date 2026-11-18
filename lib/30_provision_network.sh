@@ -349,7 +349,9 @@ gen_reality_keys() {
         }
     ')"
 
-    SHORT_ID="$(openssl rand -hex 4)"
+    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
+    # 与主 ID 等长，无法从长度区分。
+    SHORT_ID="$(openssl rand -hex 8)"
 
     # 验证密钥
     if [[ -z "$PRIVATE_KEY" ]]; then
@@ -365,6 +367,22 @@ gen_reality_keys() {
     fi
 
     log_info "Keys generated successfully"
+}
+
+# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
+# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
+apply_extra_short_ids() {
+    local raw="${sids:-}" list
+    EXTRA_SHORT_IDS=""
+    [[ -z "$raw" ]] && return 0
+    list="${raw//,/:}"
+    list="${list// /}"
+    if ! validate_reality_short_ids "$list"; then
+        log_error "$(t2 "sids 无效：每个 shortId 需为 2-16 位、偶数长度的十六进制" "Invalid sids: each short ID must be 2-16 hex characters of even length"): $raw"
+        return 1
+    fi
+    EXTRA_SHORT_IDS="${list,,}"
+    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 }
 
 # 生成 AnyTLS 密码（32 个十六进制字符 = 128-bit，URI 安全，无需百分号编码）

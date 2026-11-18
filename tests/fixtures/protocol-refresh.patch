@@ -1,6 +1,11 @@
 --- a/proxy-hub.sh
 +++ b/proxy-hub.sh
-@@ -603,0 +604,56 @@
+@@ -416 +416 @@
+-    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
++    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
+@@ -451,0 +452 @@
++    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
+@@ -603,0 +605,83 @@
 +# 中英双语内联文案：按当前语言二选一。msg() 的映射表所在模块已接近行数上限，
 +# 新增功能的文案改用本助手在调用点成对给出，保证两种语言始终同时存在。
 +# Usage: t2 "中文" "English"
@@ -57,34 +62,106 @@
 +    fi
 +}
 +
-@@ -625,0 +682 @@
++# REALITY shortId 列表以冒号连接（节点文件的安全字符集不含逗号）。每个 ID 必须是
++# 偶数个十六进制字符、最多 16 个；空串表示"客户端可以不填 shortId"，只允许单独出现。
++# Usage: validate_reality_short_ids "id1:id2"
++validate_reality_short_ids() {
++    local list="${1:-}" id
++    local -a ids=()
++    [[ -z "$list" ]] && return 0
++    [[ "$list" != :* && "$list" != *: && "$list" != *::* ]] || return 1
++    IFS=':' read -r -a ids <<<"$list"
++    for id in "${ids[@]}"; do
++        [[ "$id" =~ ^[0-9a-fA-F]{2,16}$ ]] || return 1
++        (( ${#id} % 2 == 0 )) || return 1
++    done
++}
++
++# 主 shortId 与附加 shortId 合并成 builder 接受的冒号列表。主 ID 用于分享链接，附加
++# ID 只进入服务端白名单，便于给不同客户端发放可单独吊销的 ID。
++# Usage: reality_short_id_list PRIMARY [EXTRA_LIST]
++reality_short_id_list() {
++    local primary="${1:-}" extra="${2:-}"
++    if [[ -n "$primary" && -n "$extra" ]]; then
++        printf '%s:%s' "$primary" "$extra"
++    else
++        printf '%s' "${primary}${extra}"
++    fi
++}
++
+@@ -605,0 +690 @@
++#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
+@@ -625,0 +711 @@
 +        --arg target_key "$(xray_reality_target_key)" \
-@@ -640 +697 @@
+@@ -640 +726 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -643,2 +700 @@
+@@ -643,2 +729 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
-+                    "shortIds": [$short_id]
-@@ -674,0 +731 @@
++                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
+@@ -674,0 +760 @@
 +        --arg target_key "$(xray_reality_target_key)" \
-@@ -690 +747 @@
+@@ -690 +776 @@
 -                    "dest": "\($sni):443",
 +                    ($target_key): "\($sni):443",
-@@ -693,2 +750 @@
+@@ -693,2 +779 @@
 -                    "shortIds": [$short_id],
 -                    "fingerprint": "chrome"
-+                    "shortIds": [$short_id]
-@@ -5709,0 +5766,3 @@
++                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
+@@ -767 +852 @@
+-                    "short_id": [$sid]
++                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
+@@ -5634 +5719,3 @@
+-    SHORT_ID="$(openssl rand -hex 4)"
++    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
++    # 与主 ID 等长，无法从长度区分。
++    SHORT_ID="$(openssl rand -hex 8)"
+@@ -5651,0 +5739,16 @@
++# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
++# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
++apply_extra_short_ids() {
++    local raw="${sids:-}" list
++    EXTRA_SHORT_IDS=""
++    [[ -z "$raw" ]] && return 0
++    list="${raw//,/:}"
++    list="${list// /}"
++    if ! validate_reality_short_ids "$list"; then
++        log_error "$(t2 "sids 无效：每个 shortId 需为 2-16 位、偶数长度的十六进制" "Invalid sids: each short ID must be 2-16 hex characters of even length"): $raw"
++        return 1
++    fi
++    EXTRA_SHORT_IDS="${list,,}"
++    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
++}
++
+@@ -5709,0 +5813,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -6478,0 +6538,4 @@
+@@ -6478,0 +6585,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6989,0 +7053,31 @@
+@@ -6484 +6594 @@
+-        local n_ss_method n_ss_password
++        local n_ss_method n_ss_password n_sid_list
+@@ -6495,0 +6606,2 @@
++        n_sid_list=$(reality_short_id_list "$n_short_id" \
++            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
+@@ -6563 +6675 @@
+-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
++            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
+@@ -6591 +6703 @@
+-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
++            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
+@@ -6709 +6821,2 @@
+-        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
++        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
++            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
+@@ -6891,0 +7005 @@
++EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
+@@ -6989,0 +7104,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -116,15 +193,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7085,5 @@
+@@ -6990,0 +7136,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7094 @@
+@@ -6994,0 +7145 @@
 +    local pin="" query
-@@ -7000 +7100,19 @@
+@@ -7000 +7151,19 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    query="sni=${SNI:-www.bing.com}&insecure=1"
 +    pin=$(cert_sha256_hex "$(node_selfsigned_cert_path)") || pin=""
@@ -145,7 +222,22 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7179,0 +7298 @@
+@@ -7092,0 +7262,6 @@
++# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
++show_extra_short_ids() {
++    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
++    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
++}
++
+@@ -7179,0 +7355 @@
 +        show_selfsigned_cert_pins
-@@ -7212,0 +7332 @@
+@@ -7207,0 +7384 @@
++            show_extra_short_ids
+@@ -7212,0 +7390 @@
 +            show_selfsigned_cert_pins
+@@ -7261,0 +7440 @@
++        show_extra_short_ids
+@@ -7572,0 +7752 @@
++            apply_extra_short_ids || return 1
+@@ -7595,0 +7776 @@
++        apply_extra_short_ids || return 1

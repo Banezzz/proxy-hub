@@ -253,6 +253,7 @@ cmd_install() {
         UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
             gen_reality_keys || return 1
+            apply_extra_short_ids || return 1
         else
             PUBLIC_KEY=""
             PRIVATE_KEY=""
@@ -276,6 +277,7 @@ cmd_install() {
         gen_uuid
         choose_ports
         gen_reality_keys
+        apply_extra_short_ids || return 1
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""

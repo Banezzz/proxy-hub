@@ -397,7 +397,7 @@ safe_read_config_value() {
 # save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
 reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
-    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
@@ -433,6 +433,7 @@ safe_load_node_config() {
     PUBLIC_KEY=$(safe_read_config_value "$file" "PUBLIC_KEY")
     PRIVATE_KEY=$(safe_read_config_value "$file" "PRIVATE_KEY")
     SHORT_ID=$(safe_read_config_value "$file" "SHORT_ID")
+    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
@@ -641,8 +642,36 @@ xray_reality_target_key() {
     fi
 }
 
+# REALITY shortId 列表以冒号连接（节点文件的安全字符集不含逗号）。每个 ID 必须是
+# 偶数个十六进制字符、最多 16 个；空串表示"客户端可以不填 shortId"，只允许单独出现。
+# Usage: validate_reality_short_ids "id1:id2"
+validate_reality_short_ids() {
+    local list="${1:-}" id
+    local -a ids=()
+    [[ -z "$list" ]] && return 0
+    [[ "$list" != :* && "$list" != *: && "$list" != *::* ]] || return 1
+    IFS=':' read -r -a ids <<<"$list"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9a-fA-F]{2,16}$ ]] || return 1
+        (( ${#id} % 2 == 0 )) || return 1
+    done
+}
+
+# 主 shortId 与附加 shortId 合并成 builder 接受的冒号列表。主 ID 用于分享链接，附加
+# ID 只进入服务端白名单，便于给不同客户端发放可单独吊销的 ID。
+# Usage: reality_short_id_list PRIMARY [EXTRA_LIST]
+reality_short_id_list() {
+    local primary="${1:-}" extra="${2:-}"
+    if [[ -n "$primary" && -n "$extra" ]]; then
+        printf '%s:%s' "$primary" "$extra"
+    else
+        printf '%s' "${primary}${extra}"
+    fi
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
 # Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -681,7 +710,7 @@ build_vision_inbound() {
                     ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id]
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -731,7 +760,7 @@ build_xhttp_inbound() {
                     ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id]
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -804,7 +833,7 @@ build_anytls_inbound() {
                     "enabled": true,
                     "handshake": {"server": $sni, "server_port": 443},
                     "private_key": $priv,
-                    "short_id": [$sid]
+                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
                 }
             }') || return 1
     else

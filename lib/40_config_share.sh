@@ -68,7 +68,7 @@ write_config() {
 
         # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
-        local n_ss_method n_ss_password
+        local n_ss_method n_ss_password n_sid_list
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_uuid=$(safe_read_config_value "$node_file" "UUID")
@@ -80,6 +80,8 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
+        n_sid_list=$(reality_short_id_list "$n_short_id" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
@@ -147,7 +149,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -175,7 +177,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -293,7 +295,8 @@ write_singbox_config() {
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_sni=$(safe_read_config_value "$node_file" "SNI")
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
-        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
         if [[ "$n_proto" == "hysteria2" ]]; then
             n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
         else
@@ -476,6 +479,7 @@ SNI=${SNI:-}
 PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
 SHORT_ID=${SHORT_ID:-}
+EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
@@ -732,6 +736,12 @@ show_qrcode() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
+show_extra_short_ids() {
+    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
+    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
+}
+
 # 在 63 宽的标题框内居中输出（近似处理 CJK 双宽字符：显示宽度≈(字符数+字节数)/2）
 _center_title() {
     local text="$1"
@@ -848,6 +858,7 @@ show_info() {
             echo -e "  ${BLUE}SNI:${NC}         $SNI"
             echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
             echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+            show_extra_short_ids
             echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         else
             echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
@@ -903,6 +914,7 @@ show_info() {
         echo -e "  ${BLUE}SNI:${NC}         $SNI"
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+        show_extra_short_ids
         echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 

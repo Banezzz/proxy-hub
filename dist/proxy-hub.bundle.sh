@@ -413,7 +413,7 @@ safe_read_config_value() {
 # save_env 回退到 ${CURRENT_NODE_NAME:-$PORT} 并写错文件。
 reset_node_state() {
     NODE_NAME="" PORT="" UUID="" SNI=""
-    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID=""
+    PUBLIC_KEY="" PRIVATE_KEY="" SHORT_ID="" EXTRA_SHORT_IDS=""
     XHTTP_PORT="" XHTTP_PATH=""
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
@@ -449,6 +449,7 @@ safe_load_node_config() {
     PUBLIC_KEY=$(safe_read_config_value "$file" "PUBLIC_KEY")
     PRIVATE_KEY=$(safe_read_config_value "$file" "PRIVATE_KEY")
     SHORT_ID=$(safe_read_config_value "$file" "SHORT_ID")
+    EXTRA_SHORT_IDS=$(safe_read_config_value "$file" "EXTRA_SHORT_IDS")
     PROTOCOL_TYPE=$(safe_read_config_value "$file" "PROTOCOL_TYPE")
     XHTTP_PORT=$(safe_read_config_value "$file" "XHTTP_PORT")
     XHTTP_PATH=$(safe_read_config_value "$file" "XHTTP_PATH")
@@ -657,8 +658,36 @@ xray_reality_target_key() {
     fi
 }
 
+# REALITY shortId 列表以冒号连接（节点文件的安全字符集不含逗号）。每个 ID 必须是
+# 偶数个十六进制字符、最多 16 个；空串表示"客户端可以不填 shortId"，只允许单独出现。
+# Usage: validate_reality_short_ids "id1:id2"
+validate_reality_short_ids() {
+    local list="${1:-}" id
+    local -a ids=()
+    [[ -z "$list" ]] && return 0
+    [[ "$list" != :* && "$list" != *: && "$list" != *::* ]] || return 1
+    IFS=':' read -r -a ids <<<"$list"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ ^[0-9a-fA-F]{2,16}$ ]] || return 1
+        (( ${#id} % 2 == 0 )) || return 1
+    done
+}
+
+# 主 shortId 与附加 shortId 合并成 builder 接受的冒号列表。主 ID 用于分享链接，附加
+# ID 只进入服务端白名单，便于给不同客户端发放可单独吊销的 ID。
+# Usage: reality_short_id_list PRIMARY [EXTRA_LIST]
+reality_short_id_list() {
+    local primary="${1:-}" extra="${2:-}"
+    if [[ -n "$primary" && -n "$extra" ]]; then
+        printf '%s:%s' "$primary" "$extra"
+    else
+        printf '%s' "${primary}${extra}"
+    fi
+}
+
 # Build Vision inbound JSON using jq (prevents injection)
 # Usage: build_vision_inbound NAME PORT UUID SNI PRIVATE_KEY SHORT_ID
+#   SHORT_ID 可以是冒号连接的列表（见 reality_short_id_list）。
 build_vision_inbound() {
     local name="$1"
     local port="$2"
@@ -697,7 +726,7 @@ build_vision_inbound() {
                     ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id]
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -747,7 +776,7 @@ build_xhttp_inbound() {
                     ($target_key): "\($sni):443",
                     "serverNames": [$sni],
                     "privateKey": $private_key,
-                    "shortIds": [$short_id]
+                    "shortIds": (if $short_id == "" then [""] else ($short_id | split(":") | map(select(length > 0))) end)
                 }
             } | if $sockopt then . + {"sockopt": $sockopt} else . end),
             "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
@@ -820,7 +849,7 @@ build_anytls_inbound() {
                     "enabled": true,
                     "handshake": {"server": $sni, "server_port": 443},
                     "private_key": $priv,
-                    "short_id": [$sid]
+                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
                 }
             }') || return 1
     else
@@ -5687,7 +5716,9 @@ gen_reality_keys() {
         }
     ')"
 
-    SHORT_ID="$(openssl rand -hex 4)"
+    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
+    # 与主 ID 等长，无法从长度区分。
+    SHORT_ID="$(openssl rand -hex 8)"
 
     # 验证密钥
     if [[ -z "$PRIVATE_KEY" ]]; then
@@ -5703,6 +5734,22 @@ gen_reality_keys() {
     fi
 
     log_info "Keys generated successfully"
+}
+
+# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
+# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
+apply_extra_short_ids() {
+    local raw="${sids:-}" list
+    EXTRA_SHORT_IDS=""
+    [[ -z "$raw" ]] && return 0
+    list="${raw//,/:}"
+    list="${list// /}"
+    if ! validate_reality_short_ids "$list"; then
+        log_error "$(t2 "sids 无效：每个 shortId 需为 2-16 位、偶数长度的十六进制" "Invalid sids: each short ID must be 2-16 hex characters of even length"): $raw"
+        return 1
+    fi
+    EXTRA_SHORT_IDS="${list,,}"
+    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 }
 
 # 生成 AnyTLS 密码（32 个十六进制字符 = 128-bit，URI 安全，无需百分号编码）
@@ -6544,7 +6591,7 @@ write_config() {
 
         # 使用安全的配置读取方式（防止命令注入）
         local n_name n_port n_uuid n_sni n_private_key n_short_id n_xhttp_port n_xhttp_path n_protocol_type
-        local n_ss_method n_ss_password
+        local n_ss_method n_ss_password n_sid_list
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_uuid=$(safe_read_config_value "$node_file" "UUID")
@@ -6556,6 +6603,8 @@ write_config() {
         n_protocol_type=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
         n_ss_method=$(safe_read_config_value "$node_file" "SS_METHOD")
         n_ss_password=$(safe_read_config_value "$node_file" "SS_PASSWORD")
+        n_sid_list=$(reality_short_id_list "$n_short_id" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
 
         # 处理可能加密的敏感值
         n_private_key=$(decrypt_value "$n_private_key")
@@ -6623,7 +6672,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local vision_inbound
-            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
+            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list")
             if [[ -z "$vision_inbound" ]]; then
                 log_error "Failed to build Vision inbound for node '$n_name'"
                 return 1
@@ -6651,7 +6700,7 @@ write_config() {
 
             # 使用安全的 JSON 构建器（防止注入）
             local xhttp_inbound
-            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
+            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_xhttp_path")
             if [[ -z "$xhttp_inbound" ]]; then
                 log_error "Failed to build XHTTP inbound for node '$n_name'"
                 return 1
@@ -6769,7 +6818,8 @@ write_singbox_config() {
         n_port=$(safe_read_config_value "$node_file" "PORT")
         n_sni=$(safe_read_config_value "$node_file" "SNI")
         n_priv=$(safe_read_config_value "$node_file" "PRIVATE_KEY")
-        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
+        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
+            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
         if [[ "$n_proto" == "hysteria2" ]]; then
             n_pw=$(safe_read_config_value "$node_file" "HY2_PASSWORD")
         else
@@ -6952,6 +7002,7 @@ SNI=${SNI:-}
 PUBLIC_KEY=${PUBLIC_KEY:-}
 PRIVATE_KEY=$save_private_key
 SHORT_ID=${SHORT_ID:-}
+EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
 PROTOCOL_TYPE=${PROTOCOL_TYPE:-vision}
 XHTTP_PORT=${XHTTP_PORT:-}
 XHTTP_PATH=${XHTTP_PATH:-}
@@ -7208,6 +7259,12 @@ show_qrcode() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
+show_extra_short_ids() {
+    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
+    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
+}
+
 # 在 63 宽的标题框内居中输出（近似处理 CJK 双宽字符：显示宽度≈(字符数+字节数)/2）
 _center_title() {
     local text="$1"
@@ -7324,6 +7381,7 @@ show_info() {
             echo -e "  ${BLUE}SNI:${NC}         $SNI"
             echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
             echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+            show_extra_short_ids
             echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         else
             echo -e "  ${BLUE}Security:${NC}    tls (self-signed)"
@@ -7379,6 +7437,7 @@ show_info() {
         echo -e "  ${BLUE}SNI:${NC}         $SNI"
         echo -e "  ${BLUE}PublicKey:${NC}   $PUBLIC_KEY"
         echo -e "  ${BLUE}ShortID:${NC}     $SHORT_ID"
+        show_extra_short_ids
         echo -e "  ${BLUE}Fingerprint:${NC} chrome"
         echo ""
 
@@ -7690,6 +7749,7 @@ cmd_install() {
         UUID=""
         if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
             gen_reality_keys || return 1
+            apply_extra_short_ids || return 1
         else
             PUBLIC_KEY=""
             PRIVATE_KEY=""
@@ -7713,6 +7773,7 @@ cmd_install() {
         gen_uuid
         choose_ports
         gen_reality_keys
+        apply_extra_short_ids || return 1
         ANYTLS_PASSWORD=""
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
@@ -11348,7 +11409,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=441353 body-sha256=b66e470d0d23bd49a14bc5baaaeb6840158ad629670f8810e306e78bda64d668
-# build-id=b66e470d0d23bd49a14bc5baaaeb6840158ad629670f8810e306e78bda64d668
+# body-bytes=444542 body-sha256=5987f649dcd11defaacf892ced4cb966e847b23a979eb5059dc3e71c83bb566a
+# build-id=5987f649dcd11defaacf892ced4cb966e847b23a979eb5059dc3e71c83bb566a
 # module-count=11
 # proxy-hub-bundle-end-v1
