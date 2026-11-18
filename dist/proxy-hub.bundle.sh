@@ -7234,7 +7234,9 @@ get_xhttp_link() {
         ip_formatted="[$ip]"
     fi
 
-    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
+    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
+    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
+    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
     local encoded_path
     encoded_path=$(echo -n "$XHTTP_PATH" | sed 's|/|%2F|g')
     # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
@@ -7243,7 +7245,7 @@ get_xhttp_link() {
         link_pbk="$XHTTP_PUBLIC_KEY"
         link_sid="${XHTTP_SHORT_ID:-}"
     fi
-    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${link_sid}#${node_label}"
+    echo "vless://${link_uuid}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${link_pbk}&headerType=none&fp=chrome&type=xhttp&mode=auto&path=${encoded_path}&sni=${SNI}&sid=${link_sid}#${node_label}"
 }
 
 # 为 both 节点的 XHTTP inbound 生成独立凭据（UUID + REALITY 密钥对 + shortId）。
@@ -11635,7 +11637,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=456285 body-sha256=57be6fc7c33a3f3c6d8ca6a0ae626be69f729e81d0a036859231c91fbb8fd9db
-# build-id=57be6fc7c33a3f3c6d8ca6a0ae626be69f729e81d0a036859231c91fbb8fd9db
+# body-bytes=456492 body-sha256=cf26b410422dd4c2d99c3bb900c6fc1a89a3df6a379f552db0066b66d71a526f
+# build-id=cf26b410422dd4c2d99c3bb900c6fc1a89a3df6a379f552db0066b66d71a526f
 # module-count=11
 # proxy-hub-bundle-end-v1

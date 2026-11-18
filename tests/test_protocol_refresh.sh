@@ -620,6 +620,8 @@ vlink=$(get_vision_link 203.0.113.10 v)
 assert_contains "$xlink" "vless://22222222-2222-4222-8222-222222222222@203.0.113.10:2443" "XHTTP link UUID and port"
 assert_contains "$xlink" "pbk=SplitPublicKey_abc&" "XHTTP link public key"
 assert_contains "$xlink" "sid=fedcba9876543210" "XHTTP link short ID"
+assert_contains "$xlink" "&type=xhttp&mode=auto&path=%2Frefresh-test&" "XHTTP link states the transport mode"
+assert_not_contains "$vlink" "mode=" "a raw TCP link has no XHTTP mode"
 assert_contains "$vlink" "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:1443" "Vision link is unchanged"
 assert_not_contains "$vlink" "SplitPublicKey" "Vision link must not carry the XHTTP key"
 info=$(show_info)
