@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+fake_version=v1.2.3
+config_ok=1
+case "${1:-}" in
+    version|-version)
+        printf 'Xray %s (transaction test fixture)\n' "$fake_version"
+        ;;
+    run)
+        [[ "${2:-}" == -test && "$config_ok" == 1 ]]
+        ;;
+    -test)
+        [[ "$config_ok" == 1 ]]
+        ;;
+    *)
+        exit 64
+        ;;
+esac
