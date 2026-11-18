@@ -729,9 +729,15 @@ HELPER
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
         create_singbox_openrc_service
     else
+        # "+" 让 helper 以完整权限运行，不受服务沙箱加固限制：加载 NAT 内核模块需要
+        # 的能力不在加固后的 capability 集合里。该前缀自 systemd 231 起可用，更早的
+        # 版本不认识它，也没有加固 drop-in，保持旧写法。
+        local hop_prefix="-" hop_systemd
+        hop_systemd=$(systemd_version) || hop_systemd=0
+        (( hop_systemd >= 231 )) && hop_prefix="-+"
         mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
         printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
-            "ExecStartPre=-$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
         systemctl daemon-reload 2>/dev/null || true
     fi
 }

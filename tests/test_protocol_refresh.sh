@@ -1760,4 +1760,128 @@ install_geodata >/dev/null 2>&1 || fail_case "install_geodata failed with valid 
 assert_eq "final-geoip" "$(cat /srv/geo/geoip.dat)" "install_geodata installs verified data"
 SCENARIO
 
+# Service sandbox hardening: a drop-in that is only kept when the service still
+# starts under it, with a reduced directive set inside containers.
+run_scenario service-hardening <<'SCENARIO'
+load_modules
+SYSTEMD_DROPIN_ROOT=/srv/state/systemd
+SERVICE_HARDENING_STATE_DIR=/srv/state/proxy-hub
+SYSTEMD_VERSION=252
+IN_CONTAINER=no
+systemctl() {
+    case "$1" in
+        --version) printf 'systemd %s (%s-1)\n+PAM +AUDIT\n' "$SYSTEMD_VERSION" "$SYSTEMD_VERSION" ;;
+        *) printf '%s\n' "$*" >>/srv/systemctl.calls ;;
+    esac
+}
+systemd-detect-virt() { [[ "$IN_CONTAINER" == yes ]]; }
+sleep() { :; }
+log_info() { printf 'info: %s\n' "$*" >>/srv/hard.log; }
+log_warn() { printf 'warn: %s\n' "$*" >>/srv/hard.log; }
+: >/srv/hard.log; : >/srv/systemctl.calls
+ACTIVE=yes
+STARTS_HARDENED=yes
+service_is_active() { [[ "$ACTIVE" == yes ]]; }
+service_restart() {
+    printf 'restart:%s:%s\n' "$1" "$([[ -f "$(service_hardening_dropin "$1")" ]] && echo hardened || echo plain)" >>/srv/restart.calls
+    if [[ -f "$(service_hardening_dropin "$1")" && "$STARTS_HARDENED" != yes ]]; then ACTIVE=no; return 1; fi
+    ACTIVE=yes
+}
+: >/srv/restart.calls
+
+assert_eq "252" "$(systemd_version)" "the systemd version is parsed"
+service_hardening_applicable || fail_case "systemd 252 must be eligible"
+
+# Bare metal / VM: the full set, with the ACME directory writable for sing-box.
+rendered=$(service_hardening_render xray)
+assert_contains "$rendered" "# proxy-hub-managed: hardening-v1" "the drop-in is marked as managed"
+assert_contains "$rendered" "NoNewPrivileges=true" "core directive"
+assert_contains "$rendered" "CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW" "capabilities are bounded"
+assert_contains "$rendered" "ProtectSystem=full" "a non-container host gets the namespaced set"
+assert_not_contains "$rendered" "ReadWritePaths" "Xray needs no writable path under /usr"
+assert_contains "$(service_hardening_render "$SINGBOX_SERVICE")" "ReadWritePaths=-$SINGBOX_DIR" \
+    "sing-box must keep its ACME directory writable"
+
+# Container: only directives that need no mount namespace.
+IN_CONTAINER=yes
+rendered=$(service_hardening_render xray)
+assert_contains "$rendered" "NoNewPrivileges=true" "containers keep the core set"
+for directive in ProtectSystem ProtectHome PrivateTmp ProtectKernelModules ProtectKernelTunables ProtectControlGroups; do
+    assert_not_contains "$rendered" "$directive" "containers must not get $directive"
+done
+unset -f systemd-detect-virt
+if ! command -v systemd-detect-virt >/dev/null 2>&1; then
+    assert_not_contains "$(service_hardening_render xray)" "ProtectSystem" "an unknown environment is treated as a container"
+fi
+systemd-detect-virt() { [[ "$IN_CONTAINER" == yes ]]; }
+IN_CONTAINER=no
+
+# Applying to a running service that survives the restart.
+service_hardening_ensure xray || fail_case "hardening a healthy service must succeed"
+dropin=$(service_hardening_dropin xray)
+assert_eq "/srv/state/systemd/xray.service.d/10-proxy-hub-hardening.conf" "$dropin" "drop-in location"
+[[ -f "$dropin" ]] || fail_case "the drop-in was not written"
+assert_eq "restart:xray:hardened" "$(cat /srv/restart.calls)" "the service is restarted under the drop-in"
+assert_contains "$(cat /srv/systemctl.calls)" "daemon-reload" "systemd is reloaded"
+service_hardening_is_applied xray || fail_case "the applied state must be detectable"
+
+# Idempotent: nothing is restarted the second time.
+: >/srv/restart.calls
+service_hardening_ensure xray || fail_case "an already hardened service must report success"
+assert_eq "" "$(cat /srv/restart.calls)" "an already hardened service is not restarted again"
+
+# A service that cannot start hardened is reverted, restored and remembered.
+STARTS_HARDENED=no
+: >/srv/restart.calls
+rc=0
+service_hardening_ensure sing-box || rc=$?
+assert_eq "2" "$rc" "a failed hardened start must report the revert"
+[[ ! -e "$(service_hardening_dropin sing-box)" ]] || fail_case "the failing drop-in must be removed"
+assert_eq "restart:sing-box:hardened
+restart:sing-box:plain" "$(cat /srv/restart.calls)" "the service is restarted again without the drop-in"
+assert_eq "yes" "$ACTIVE" "the service must be running again after the revert"
+assert_contains "$(cat /srv/hard.log)" "reverted and the service restored" "the revert must be reported"
+[[ -e "$(service_hardening_skip_marker sing-box)" ]] || fail_case "the failure must be remembered"
+
+# The remembered failure is not retried implicitly, but can be forced.
+: >/srv/restart.calls
+rc=0
+service_hardening_ensure sing-box || rc=$?
+assert_eq "1" "$rc" "a remembered failure must be skipped"
+assert_eq "" "$(cat /srv/restart.calls)" "a skipped service is not restarted"
+STARTS_HARDENED=yes
+service_hardening_ensure sing-box force || fail_case "a forced retry must be attempted"
+[[ ! -e "$(service_hardening_skip_marker sing-box)" ]] || fail_case "a successful retry must clear the marker"
+
+# Not applicable: stopped services, old systemd, OpenRC.
+service_hardening_remove xray
+[[ ! -e "$dropin" && ! -d "$(dirname "$dropin")" ]] || fail_case "removal must delete the drop-in and its directory"
+ACTIVE=no
+rc=0; service_hardening_ensure xray || rc=$?
+assert_eq "1" "$rc" "a stopped service is not hardened (nothing could be verified)"
+ACTIVE=yes
+SYSTEMD_VERSION=219
+rc=0; service_hardening_ensure xray || rc=$?
+assert_eq "1" "$rc" "an old systemd is not hardened"
+SYSTEMD_VERSION=252
+INIT_SYSTEM=openrc
+assert_fails "OpenRC has no drop-ins" service_hardening_applicable
+INIT_SYSTEM=systemd
+[[ ! -e "$dropin" ]] || fail_case "inapplicable cases must not write a drop-in"
+
+# The port-hopping helper escapes the sandbox so it can still load NAT modules.
+HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
+HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+printf '#!/bin/sh\nexit 0\n' >/srv/bin/iptables; chmod 755 /srv/bin/iptables
+PATH="/srv/bin:$PATH"
+write_node hy hysteria2 "HY2_HOP_PORTS=30000-30100"
+hy2_hop_sync || fail_case "hop sync failed"
+assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-+$HY2_HOP_HELPER apply" \
+    "on a current systemd the helper runs with full privileges"
+SYSTEMD_VERSION=219
+hy2_hop_sync
+assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-$HY2_HOP_HELPER apply" \
+    "an old systemd keeps the prefix it understands"
+SCENARIO
+
 printf '%s\n' "All protocol-refresh contract tests passed."

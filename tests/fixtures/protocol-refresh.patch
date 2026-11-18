@@ -200,7 +200,7 @@
 @@ -767 +913 @@
 -                    "short_id": [$sid]
 +                    "short_id": (if $sid == "" then [""] else ($sid | split(":") | map(select(length > 0))) end)
-@@ -823,0 +970,77 @@
+@@ -823,0 +970,85 @@
 +# 版本比较：A >= B。Usage: version_ge 1.14.4 1.14.0
 +version_ge() {
 +    [[ "$(printf '%s\n%s\n' "${1#v}" "${2#v}" | LC_ALL=C sort -V | head -n 1)" == "${2#v}" ]]
@@ -212,6 +212,14 @@
 +    [[ -x "$SINGBOX_BIN" ]] || return 1
 +    out=$(timeout 10 "$SINGBOX_BIN" version 2>/dev/null </dev/null) || return 1
 +    [[ "$out" =~ sing-box[[:space:]]+version[[:space:]]+([0-9]+(\.[0-9]+){1,3}([.-][A-Za-z0-9._-]+)?) ]] || return 1
++    printf '%s' "${BASH_REMATCH[1]}"
++}
++
++# systemd 主版本号（如 252）；不是 systemd 或读不出时返回非零。
++systemd_version() {
++    local line
++    line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
++    [[ "$line" =~ ^systemd[[:space:]]+([0-9]+) ]] || return 1
 +    printf '%s' "${BASH_REMATCH[1]}"
 +}
 +
@@ -278,35 +286,35 @@
 +          end'
 +}
 +
-@@ -825 +1048,4 @@
+@@ -825 +1056,4 @@
 -# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY
 +# Usage: build_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD] [TLS_JSON]
 +#   OBFS_PASSWORD 非空时启用 Salamander 混淆。混淆后的流量不再是合法 QUIC，HTTP/3
 +#   伪装站点随之失去意义，因此同时去掉 masquerade。
 +#   TLS_JSON 非空时整体替换 tls 块（ACME 证书），此时 CERT/KEY 可以为空。
-@@ -832,0 +1059,2 @@
+@@ -832,0 +1067,2 @@
 +    local obfs_password="${7:-}"
 +    local tls_json="${8:-}"
-@@ -838 +1066,3 @@
+@@ -838 +1074,3 @@
 -    [[ -n "$cert" && -n "$key" ]] || return 1
 +    [[ -n "$tls_json" || ( -n "$cert" && -n "$key" ) ]] || return 1
 +    [[ -n "$tls_json" ]] || tls_json=null
 +    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
-@@ -848,0 +1079,2 @@
+@@ -848,0 +1087,2 @@
 +        --arg obfs_password "$obfs_password" \
 +        --argjson tls_override "$tls_json" \
-@@ -855 +1087 @@
+@@ -855 +1095 @@
 -            "tls": {
 +            "tls": ($tls_override // {
-@@ -860 +1092 @@
+@@ -860 +1100 @@
 -            },
 +            }),
-@@ -866 +1098,3 @@
+@@ -866 +1106,3 @@
 -        }'
 +        } | if $obfs_password != "" then
 +                del(.masquerade) + {"obfs": {"type": "salamander", "password": $obfs_password}}
 +            else . end'
-@@ -960 +1194,12 @@
+@@ -960 +1202,12 @@
 -# SNI 域名列表（完整列表，用于延迟测试）
 +# REALITY 不建议借用的伪装目标。Xray 自 v26.3.27 起对 apple/icloud 目标打印警告：
 +# 这些域名长期被大量节点借用，在部分网络里已经是被重点关照的 SNI。
@@ -320,42 +328,42 @@
 +}
 +
 +# SNI 域名列表（完整列表，用于延迟测试）。不含 Apple / iCloud 系域名，原因见上。
-@@ -977 +1221,0 @@
+@@ -977 +1229,0 @@
 -    "xp.apple.com"
-@@ -979 +1222,0 @@
+@@ -979 +1230,0 @@
 -    "www.apple.com"
-@@ -984,2 +1226,0 @@
+@@ -984,2 +1234,0 @@
 -    "www.icloud.com"
 -    "apps.apple.com"
-@@ -995 +1235,0 @@
+@@ -995 +1243,0 @@
 -    "ocsp2.apple.com"
-@@ -1003 +1242,0 @@
+@@ -1003 +1250,0 @@
 -    "apps.mzstatic.com"
-@@ -1010 +1248,0 @@
+@@ -1010 +1256,0 @@
 -    "statici.icloud.com"
-@@ -1029 +1266,0 @@
+@@ -1029 +1274,0 @@
 -    "is1-ssl.mzstatic.com"
-@@ -1036 +1272,0 @@
+@@ -1036 +1280,0 @@
 -    "gsp-ssl.ls.apple.com"
-@@ -1047 +1282,0 @@
+@@ -1047 +1290,0 @@
 -    "fpinit.itunes.apple.com"
-@@ -1051,2 +1285,0 @@
+@@ -1051,2 +1293,0 @@
 -    "iosapps.itunes.apple.com"
 -    "se-edge.itunes.apple.com"
-@@ -1056 +1288,0 @@
+@@ -1056 +1296,0 @@
 -    "configuration.ls.apple.com"
-@@ -1060 +1291,0 @@
+@@ -1060 +1299,0 @@
 -    "amp-api-edge.apps.apple.com"
-@@ -1073 +1303,0 @@
+@@ -1073 +1311,0 @@
 -    "downloaddispatch.itunes.apple.com"
-@@ -4664,0 +4895,6 @@
+@@ -4664,0 +4903,6 @@
 +
 +start_pre() {
 +    # Hysteria2 端口跳跃的 NAT 规则不持久，随服务启动重新下发（helper 不存在则跳过）。
 +    [ -x /usr/local/libexec/proxy-hub-hy2-hop ] && /usr/local/libexec/proxy-hub-hy2-hop apply
 +    return 0
 +}
-@@ -4668,0 +4905,144 @@
+@@ -4668,0 +4913,150 @@
 +# ============== Hysteria2 端口跳跃 ==============
 +#
 +# 服务端只监听一个 UDP 端口；端口跳跃靠 NAT 把一段 UDP 端口重定向到它。规则放在
@@ -493,19 +501,25 @@
 +    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
 +        create_singbox_openrc_service
 +    else
++        # "+" 让 helper 以完整权限运行，不受服务沙箱加固限制：加载 NAT 内核模块需要
++        # 的能力不在加固后的 capability 集合里。该前缀自 systemd 231 起可用，更早的
++        # 版本不认识它，也没有加固 drop-in，保持旧写法。
++        local hop_prefix="-" hop_systemd
++        hop_systemd=$(systemd_version) || hop_systemd=0
++        (( hop_systemd >= 231 )) && hop_prefix="-+"
 +        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
 +        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
-+            "ExecStartPre=-$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
++            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
 +        systemctl daemon-reload 2>/dev/null || true
 +    fi
 +}
 +
-@@ -4688,0 +5069,4 @@
+@@ -4688,0 +5083,4 @@
 +#
 +# 已有可运行的 binary 时只报告、不改动，与 Xray 的普通安装语义一致：创建节点不应
 +# 悄悄升级内核。下载、SHA-256 校验、候选 binary 验证与原子替换都在
 +# singbox_install_release 里，全新安装与显式的 singbox-update 走同一条路径。
-@@ -4696,82 +5080 @@
+@@ -4696,82 +5094 @@
 -
 -    local arch sb_arch
 -    arch=$(uname -m)
@@ -589,10 +603,10 @@
 -        return 1
 -    fi
 +    singbox_install_release fresh || return 1
-@@ -4785,2 +5087,0 @@
+@@ -4785,2 +5101,0 @@
 -
 -    log_info "sing-box ${tag} installed successfully"
-@@ -4800,0 +5102,42 @@
+@@ -4800,0 +5116,42 @@
 +# GeoIP/GeoSite 以 root 身份被 Xray 加载并决定路由，却是从第三方 release 的 latest
 +# 链接取的。这里把"下载 → 校验 → 替换"收进一个独立 helper，安装时与每周 cron 共用：
 +#   - 两个文件各自对照同一 release 发布的 .sha256sum，任何一个不一致就整体放弃；
@@ -635,34 +649,34 @@
 +    chmod 755 "$tmp" && mv -f -- "$tmp" "$GEODATA_HELPER" || { rm -f -- "$tmp"; return 1; }
 +}
 +
-@@ -4804,0 +5148,4 @@
+@@ -4804,0 +5162,4 @@
 +    if ! install_geodata_helper; then
 +        log_error "Failed to install the GeoData update helper"
 +        return 1
 +    fi
-@@ -4806,5 +5153 @@
+@@ -4806,5 +5167 @@
 -    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 -    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 -
 -    # 下载 geoip.dat（使用安全的 curl 选项，内联因为 execute_task 在子 shell 运行）
 -    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geoip_url' -o '$XRAY_GEODATA_DIR/geoip.dat'" "Downloading geoip.dat"; then
 +    if execute_task "'$GEODATA_HELPER'" "Downloading and verifying geoip.dat / geosite.dat"; then
-@@ -4813,4 +5155,0 @@
+@@ -4813,4 +5169,0 @@
 -    fi
 -
 -    # 下载 geosite.dat
 -    if execute_task "curl --proto '=https' --tlsv1.2 -fsSL '$geosite_url' -o '$XRAY_GEODATA_DIR/geosite.dat'" "Downloading geosite.dat"; then
-@@ -4817,0 +5157,4 @@
+@@ -4817,0 +5171,4 @@
 +    else
 +        log_error "$(t2 "GeoData 下载或 SHA-256 校验失败，未改动现有数据" \
 +            "GeoData download or SHA-256 verification failed; existing data is untouched")"
 +        return 1
-@@ -4827,3 +5170 @@
+@@ -4827,3 +5184 @@
 -    # Use secure curl options in cron job (--proto, --tlsv1.2)
 -    local cron_cmd="curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o $XRAY_GEODATA_DIR/geoip.dat && curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o $XRAY_GEODATA_DIR/geosite.dat"
 -    local cron_job="0 4 * * 0 $cron_cmd >/dev/null 2>&1"
 +    local cron_job="0 4 * * 0 $GEODATA_HELPER >/dev/null 2>&1 $GEODATA_CRON_MARKER"
-@@ -4836,2 +5177,10 @@
+@@ -4836,2 +5191,10 @@
 -    # 添加定时任务（先删除旧的）
 -    (crontab -l 2>/dev/null | grep -v 'geoip.dat' | grep -v 'geosite.dat'; echo "$cron_job") | crontab - 2>/dev/null || true
 +    # 添加定时任务。先删除旧条目：既包括带标记的新形式，也包括升级前那条直接把
@@ -675,14 +689,14 @@
 +geodata_cron_is_legacy() {
 +    command -v crontab >/dev/null 2>&1 || return 1
 +    crontab -l 2>/dev/null | grep -F 'v2ray-rules-dat' | grep -qvF "$GEODATA_CRON_MARKER"
-@@ -5283 +5632,2 @@
+@@ -5283 +5646,2 @@
 -# 选择协议类型
 +# 选择协议类型。每个选项下面用一两行说明它适合谁、需要什么，让不熟悉协议的用户
 +# 也能直接选；回车采用推荐项。
-@@ -5288 +5638 @@
+@@ -5288 +5652 @@
 -    echo -e "${GREEN}                     选择节点协议类型${NC}"
 +    echo -e "${GREEN}        $(t2 "选择节点协议类型（回车采用推荐）" "Choose a protocol (Enter for the recommended one)")${NC}"
-@@ -5291,7 +5641,21 @@
+@@ -5291,7 +5655,21 @@
 -    echo -e "  ${GREEN}1.${NC} VLESS + Vision + REALITY  ${GRAY}(TCP 传输, 推荐)${NC}"
 -    echo -e "  ${GREEN}2.${NC} VLESS + XHTTP + REALITY   ${GRAY}(XHTTP 传输)${NC}"
 -    echo -e "  ${GREEN}3.${NC} 两个都安装               ${GRAY}(生成两个端口)${NC}"
@@ -711,16 +725,16 @@
 +    echo -e "  ${GREEN}7.${NC} Hysteria2"
 +    menu_note "$(t2 "基于 UDP/QUIC，丢包或高延迟线路上明显更快；需放行 UDP，部分网络会限速 UDP。" \
 +        "UDP/QUIC based, clearly faster on lossy or high-latency links; needs UDP allowed, and some networks throttle UDP.")"
-@@ -5299 +5663 @@
+@@ -5299 +5677 @@
 -    echo -n "  请选择 [1-7] (默认 1): "
 +    echo -n "  $(t2 "请选择" "Select") [1-7] ($(t2 "默认" "default") 1): "
-@@ -5411,0 +5776,5 @@
+@@ -5411,0 +5790,5 @@
 +# ============== Hysteria2 加固选项 ==============
 +#
 +# Hysteria2 的默认形态（密码 + 自签名证书 + HTTP/3 伪装）在主动探测面前特征明显。
 +# 这里集中处理可选的加固项；它们默认关闭，因为每一项都对客户端或网络环境有要求。
 +
-@@ -5429,0 +5799,37 @@
+@@ -5429,0 +5813,37 @@
 +# 是否已有节点文件登记了该 TCP 端口。服务停止时 `ss` 看不到监听，只查 socket 会把
 +# 已经分配给别的节点的端口再发一次。
 +# Usage: node_tcp_port_claimed PORT
@@ -758,25 +772,25 @@
 +    gen_random_free_port "$exclude_port"
 +}
 +
-@@ -5522 +5928,5 @@
+@@ -5522 +5942,5 @@
 -            default_at_port=$(gen_random_free_port)
 +            if [[ "$PROTOCOL_TYPE" == "anytls_reality" ]]; then
 +                default_at_port=$(default_reality_port)
 +            else
 +                default_at_port=$(gen_random_free_port)
 +            fi
-@@ -5559 +5969 @@
+@@ -5559 +5983 @@
 -            default_vision_port=$(gen_random_free_port)
 +            default_vision_port=$(default_reality_port)
-@@ -5575 +5985 @@
+@@ -5575 +5999 @@
 -            default_xhttp_port=$(gen_random_free_port "${PORT:-0}")
 +            default_xhttp_port=$(default_reality_port "${PORT:-0}")
-@@ -5634 +6044,3 @@
+@@ -5634 +6058,3 @@
 -    SHORT_ID="$(openssl rand -hex 4)"
 +    # shortId 取满 8 字节（16 个十六进制字符）：这是协议允许的上限，也让附加 shortId
 +    # 与主 ID 等长，无法从长度区分。
 +    SHORT_ID="$(openssl rand -hex 8)"
-@@ -5651,0 +6064,16 @@
+@@ -5651,0 +6078,16 @@
 +# 解析可选的附加 REALITY shortId（环境变量 sids=aa11,bb22，逗号或冒号分隔）。
 +# 附加 ID 只进入服务端白名单，分享链接始终使用主 SHORT_ID。
 +apply_extra_short_ids() {
@@ -793,11 +807,11 @@
 +    log_info "$(t2 "附加 shortId" "Extra short IDs"): ${EXTRA_SHORT_IDS//:/, }"
 +}
 +
-@@ -5709,0 +6138,3 @@
+@@ -5709,0 +6152,3 @@
 +    # 密钥算法固定为 ECDSA P-256，不要换成 Ed25519：sing-box 1.14 起 Hysteria2 客户端
 +    # 默认模仿 Chrome 的 QUIC 握手，而 Chrome 不声明 Ed25519 支持，服务端用 Ed25519
 +    # 证书会直接握手失败。
-@@ -5951,0 +6383,104 @@
+@@ -5951,0 +6397,104 @@
 +# 本机 openssl 是否认识 -tls1_3（OpenSSL 1.1.1 起）。不认识时不加该参数，否则旧系统
 +# 上所有域名都会因为"未知选项"被测成超时。结果按进程缓存；并行测速前由父 shell
 +# 预热一次，后台子 shell 直接继承。
@@ -902,21 +916,21 @@
 +    done
 +}
 +
-@@ -5959 +6494 @@
+@@ -5959 +6508 @@
 -    local t1 t2 family_flag
 +    local t1 t2 family_flag tls13_flag
-@@ -5962,0 +6498,3 @@
+@@ -5962,0 +6512,3 @@
 +    # REALITY 要求目标站点支持 TLS 1.3；只握到 TLS 1.2 的域名测出来再快也不能用。
 +    tls13_flag=$(sni_tls13_flag)
 +    [[ -n "$tls13_flag" ]] && family+=("$tls13_flag")
-@@ -5987,0 +6526 @@
+@@ -5987,0 +6540 @@
 +    sni_tls13_flag >/dev/null
-@@ -6082,0 +6622 @@
+@@ -6082,0 +6636 @@
 +    sni_tls13_flag >/dev/null
-@@ -6201 +6741 @@
+@@ -6201 +6755 @@
 -    # 获取排序后的 Top 5 域名
 +    # 取 Top 5：先按延迟取一批候选，再按 ASN / CDN 评分重排。
-@@ -6204,6 +6744 @@
+@@ -6204,6 +6758 @@
 -    while IFS=' ' read -r lat dom; do
 -        top_domains+=("$dom")
 -        top_latencies+=("$lat")
@@ -924,13 +938,13 @@
 -        echo "${latency_map[$domain]} $domain"
 -    done | sort -n | head -5)
 +    rank_sni_candidates latency_map top_domains top_latencies
-@@ -6303 +6838,4 @@
+@@ -6303 +6852,4 @@
 -                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}\n" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                printf "    ${GREEN}%d.${NC} %-40s ${YELLOW}%dms${NC}" "$i" "${td[$idx]}" "${tl[$idx]}"
 +                [[ -n "${SNI_CANDIDATE_TAG[${td[$idx]}]:-}" ]] && \
 +                    printf "  ${GRAY}[%s]${NC}" "${SNI_CANDIDATE_TAG[${td[$idx]}]}"
 +                printf "\n"
-@@ -6377,0 +6916,9 @@
+@@ -6377,0 +6930,9 @@
 +# 对不建议借用的 REALITY 目标给出告警。只告警不拦截：这是经验性建议，用户可能有
 +# 自己的理由（例如目标与服务器同 ASN）。
 +# Usage: warn_discouraged_reality_target DOMAIN
@@ -940,21 +954,21 @@
 +        "Apple / iCloud domains are discouraged as a REALITY target (Xray warns about them since v26.3.27); consider another domain"): $1"
 +}
 +
-@@ -6398,0 +6946 @@
+@@ -6398,0 +6960 @@
 +            warn_discouraged_reality_target "$SNI"
-@@ -6478,0 +7027,4 @@
+@@ -6478,0 +7041,4 @@
 +    # 在父 shell 里探测一次 Xray 能力并缓存；下面的 builder 都跑在命令替换的子 shell
 +    # 中，不预热的话每个 inbound 都会各自重新执行一次 `xray help`。
 +    xray_probe_capabilities
 +
-@@ -6484 +7036 @@
+@@ -6484 +7050 @@
 -        local n_ss_method n_ss_password
 +        local n_ss_method n_ss_password n_sid_list
-@@ -6495,0 +7048,3 @@
+@@ -6495,0 +7062,3 @@
 +        local n_extra_sids n_xhttp_uuid n_xhttp_private_key n_xhttp_sid_list n_mldsa65_seed n_decryption
 +        n_extra_sids=$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")
 +        n_sid_list=$(reality_short_id_list "$n_short_id" "$n_extra_sids")
-@@ -6501,0 +7057,14 @@
+@@ -6501,0 +7071,14 @@
 +        # both 节点的 XHTTP inbound 可以有独立的 UUID / REALITY 密钥 / shortId：两个
 +        # inbound 共用一套凭据时，其中一个被识别或泄露，另一个随之暴露。字段缺失
 +        # （升级前创建的节点）时回退到共用值，行为与之前完全一致。
@@ -969,7 +983,7 @@
 +            n_xhttp_sid_list=$(reality_short_id_list "$n_xhttp_sid_list" "$n_extra_sids")
 +        fi
 +
-@@ -6517,0 +7087,17 @@
+@@ -6517,0 +7101,17 @@
 +        # 可选的 REALITY ML-DSA-65 签名。节点启用了它而当前 binary 不认识该字段时
 +        # 必须失败：静默丢掉 seed 会让带 pqv 的客户端全部验签失败，且服务端毫无提示。
 +        n_mldsa65_seed=$(decrypt_value "$(safe_read_config_value "$node_file" "MLDSA65_SEED")")
@@ -987,20 +1001,20 @@
 +            return 1
 +        fi
 +
-@@ -6563 +7149 @@
+@@ -6563 +7163 @@
 -            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id")
 +            vision_inbound=$(build_vision_inbound "$n_name" "$validated_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_sid_list" "$n_mldsa65_seed" "$n_decryption")
-@@ -6591 +7177 @@
+@@ -6591 +7191 @@
 -            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_uuid" "$n_sni" "$n_private_key" "$n_short_id" "$n_xhttp_path")
 +            xhttp_inbound=$(build_xhttp_inbound "$n_name" "$validated_xhttp_port" "$n_xhttp_uuid" "$n_sni" "$n_xhttp_private_key" "$n_xhttp_sid_list" "$n_xhttp_path" "$n_mldsa65_seed" "$n_decryption")
-@@ -6695 +7281 @@
+@@ -6695 +7295 @@
 -    local inbounds_json="[]"
 +    local inbounds_json="[]" providers_json="[]"
-@@ -6709 +7295,2 @@
+@@ -6709 +7309,2 @@
 -        n_sid=$(safe_read_config_value "$node_file" "SHORT_ID")
 +        n_sid=$(reality_short_id_list "$(safe_read_config_value "$node_file" "SHORT_ID")" \
 +            "$(safe_read_config_value "$node_file" "EXTRA_SHORT_IDS")")
-@@ -6734 +7321,20 @@
+@@ -6734 +7335,20 @@
 -            if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
 +            local n_obfs n_domain n_tls_json="" n_acme use_provider=0 no_alpn=0 no_http=0 sb_version
 +            n_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
@@ -1022,37 +1036,37 @@
 +                    'if $acme.provider then . + [$acme.provider] else . end' <<<"$providers_json")
 +                n_sni="$n_domain"
 +            elif [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-@@ -6738 +7344 @@
+@@ -6738 +7358 @@
 -                "${n_sni:-www.bing.com}" "$cert_path" "$key_path"); then
 +                "${n_sni:-www.bing.com}" "$cert_path" "$key_path" "$n_obfs" "$n_tls_json"); then
-@@ -6781,0 +7388 @@
+@@ -6781,0 +7402 @@
 +        --argjson providers "$providers_json" \
-@@ -6787 +7394 @@
+@@ -6787 +7408 @@
 -        }' 2>&1); then
 +        } | if ($providers | length) > 0 then . + {"certificate_providers": $providers} else . end' 2>&1); then
-@@ -6815,0 +7423 @@
+@@ -6815,0 +7437 @@
 +        hy2_hop_sync
-@@ -6830,0 +7439,5 @@
+@@ -6830,0 +7453,5 @@
 +    # 端口跳跃的 NAT 规则先于服务重启下发；失败即整体失败，由调用方回滚。
 +    if ! hy2_hop_sync; then
 +        return 1
 +    fi
 +
-@@ -6870,0 +7484,5 @@
+@@ -6870,0 +7498,5 @@
 +    local save_xhttp_uuid="${XHTTP_UUID:-}"
 +    local save_xhttp_private_key="${XHTTP_PRIVATE_KEY:-}"
 +    local save_mldsa65_seed="${MLDSA65_SEED:-}"
 +    local save_vless_decryption="${VLESS_DECRYPTION:-}"
 +    local save_hy2_obfs_password="${HY2_OBFS_PASSWORD:-}"
-@@ -6872,0 +7491,5 @@
+@@ -6872,0 +7505,5 @@
 +        save_hy2_obfs_password=$(encrypt_value "$save_hy2_obfs_password")
 +        save_vless_decryption=$(encrypt_value "$save_vless_decryption")
 +        save_mldsa65_seed=$(encrypt_value "$save_mldsa65_seed")
 +        save_xhttp_uuid=$(encrypt_value "$save_xhttp_uuid")
 +        save_xhttp_private_key=$(encrypt_value "$save_xhttp_private_key")
-@@ -6891,0 +7515 @@
+@@ -6891,0 +7529 @@
 +EXTRA_SHORT_IDS=${EXTRA_SHORT_IDS:-}
-@@ -6894,0 +7519,8 @@
+@@ -6894,0 +7533,8 @@
 +XHTTP_UUID=$save_xhttp_uuid
 +XHTTP_PUBLIC_KEY=${XHTTP_PUBLIC_KEY:-}
 +XHTTP_PRIVATE_KEY=$save_xhttp_private_key
@@ -1061,12 +1075,12 @@
 +MLDSA65_VERIFY=${MLDSA65_VERIFY:-}
 +VLESS_DECRYPTION=$save_vless_decryption
 +VLESS_ENCRYPTION=${VLESS_ENCRYPTION:-}
-@@ -6899,0 +7532,4 @@
+@@ -6899,0 +7546,4 @@
 +HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 +HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 +HY2_DOMAIN=${HY2_DOMAIN:-}
 +HY2_EMAIL=${HY2_EMAIL:-}
-@@ -6927 +7563,8 @@
+@@ -6927 +7577,8 @@
 -    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${node_label}"
 +    echo "vless://${UUID}@${ip_formatted}:${PORT}?encryption=${VLESS_ENCRYPTION:-none}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}$(vless_link_pq_params)&type=tcp#${node_label}"
 +}
@@ -1076,12 +1090,12 @@
 +vless_link_pq_params() {
 +    [[ -n "${MLDSA65_VERIFY:-}" ]] && printf '&pqv=%s' "$MLDSA65_VERIFY"
 +    return 0
-@@ -6941 +7584,3 @@
+@@ -6941 +7598,3 @@
 -    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码
 +    # 注意：XHTTP 不需要 flow 参数，path 需要 URL 编码。
 +    # mode=auto 显式写出：服务端 xhttpSettings 未限定模式（即 auto，接受全部上行
 +    # 方式），部分客户端在链接缺少 mode 时会自行猜一个固定模式。
-@@ -6944 +7589,28 @@
+@@ -6944 +7603,28 @@
 -    echo "vless://${UUID}@${ip_formatted}:${XHTTP_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=xhttp&path=${encoded_path}&sni=${SNI}&sid=${SHORT_ID}#${node_label}"
 +    # both 节点拆分凭据后，XHTTP 链接使用自己的 UUID / 公钥 / shortId。
 +    local link_uuid="${XHTTP_UUID:-$UUID}" link_pbk="$PUBLIC_KEY" link_sid="$SHORT_ID"
@@ -1111,7 +1125,7 @@
 +    PRIVATE_KEY="$keep_private"
 +    SHORT_ID="$keep_sid"
 +    return "$rc"
-@@ -6989,0 +7662,31 @@
+@@ -6989,0 +7676,31 @@
 +# 自签名证书的 SHA-256 指纹（整张 DER 证书，小写十六进制，不含冒号）。
 +# 这与 Hysteria2 官方 URI 的 pinSHA256、Xray 的 pinnedPeerCertSha256 是同一种编码。
 +# Usage: cert_sha256_hex CERT_PEM
@@ -1143,15 +1157,15 @@
 +    printf '%s' "$SINGBOX_CERT_DIR/${NODE_NAME:-$CURRENT_NODE_NAME}.crt"
 +}
 +
-@@ -6990,0 +7694,5 @@
+@@ -6990,0 +7708,5 @@
 +#
 +# 自签名证书下只给 insecure=1 已经不够：Xray 系客户端自 2026-06-01 起不再接受
 +# allowInsecure，必须改用证书指纹固定。链接因此同时携带 pinSHA256（Hysteria2 官方
 +# URI 参数）与 insecure=1：前者让支持固定的客户端真正校验这张证书，后者保留给只认
 +# insecure 的旧客户端。证书文件缺失时退回只带 insecure=1 的旧形式，不输出空指纹。
-@@ -6994,0 +7703 @@
+@@ -6994,0 +7717 @@
 +    local pin="" query
-@@ -7000 +7709,26 @@
+@@ -7000 +7723,26 @@
 -    echo "hysteria2://${HY2_PASSWORD}@${ip_formatted}:${PORT}/?sni=${SNI:-www.bing.com}&insecure=1#${node_label}"
 +    if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +        # ACME 证书由公共 CA 签发，客户端按域名正常校验，不需要 insecure 也不需要指纹。
@@ -1179,9 +1193,9 @@
 +        echo -e "  ${BLUE}PubKey SHA-256:${NC} ${pin_key}"
 +        echo -e "               ${GRAY}(sing-box certificate_public_key_sha256)${NC}"
 +    fi
-@@ -7016,0 +7751 @@
+@@ -7016,0 +7765 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7082 +7817,7 @@
+@@ -7082 +7831,7 @@
 -    qrencode -t ANSIUTF8 "$link"
 +    # 带 ML-DSA-65 公钥的链接接近 3KB：即使编码成功，二维码也大到终端里无法扫描。
 +    if (( ${#link} > 1200 )); then
@@ -1190,23 +1204,23 @@
 +    else
 +        qrencode -t ANSIUTF8 "$link"
 +    fi
-@@ -7092,0 +7834,6 @@
+@@ -7092,0 +7848,6 @@
 +# 附加 shortId 只在服务端白名单里，不进入分享链接，这里单独列出供手工发放。
 +show_extra_short_ids() {
 +    [[ -n "${EXTRA_SHORT_IDS:-}" ]] || return 0
 +    echo -e "  ${BLUE}Extra IDs:${NC}   ${EXTRA_SHORT_IDS//:/, }  ${GRAY}($(t2 "仅服务端白名单，可单独发放/吊销" "server allow-list only, hand out or revoke individually"))${NC}"
 +}
 +
-@@ -7174,0 +7922 @@
+@@ -7174,0 +7936 @@
 +        HY2_OBFS_PASSWORD=$(decrypt_value "${HY2_OBFS_PASSWORD:-}")
-@@ -7176,0 +7925,6 @@
+@@ -7176,0 +7939,6 @@
 +        if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +            echo -e "  ${BLUE}Obfs:${NC}        salamander  ${GRAY}(password: ${HY2_OBFS_PASSWORD})${NC}"
 +        fi
 +        if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
 +            echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
 +        fi
-@@ -7178,2 +7932,8 @@
+@@ -7178,2 +7946,8 @@
 -        echo -e "  ${BLUE}SNI:${NC}         ${SNI:-www.bing.com}"
 -        echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +        if [[ -n "${HY2_DOMAIN:-}" ]]; then
@@ -1217,11 +1231,11 @@
 +            echo -e "  ${BLUE}Insecure:${NC}    true  ${GRAY}(self-signed certificate)${NC}"
 +            show_selfsigned_cert_pins
 +        fi
-@@ -7207,0 +7968 @@
+@@ -7207,0 +7982 @@
 +            show_extra_short_ids
-@@ -7212,0 +7974 @@
+@@ -7212,0 +7988 @@
 +            show_selfsigned_cert_pins
-@@ -7261,0 +8024,12 @@
+@@ -7261,0 +8038,12 @@
 +        show_extra_short_ids
 +        if [[ -n "${MLDSA65_VERIFY:-}" ]]; then
 +            echo -e "  ${BLUE}ML-DSA-65:${NC}   $(t2 "已启用（客户端 mldsa65Verify 见分享链接 pqv）" "enabled (client mldsa65Verify is the pqv link parameter)")"
@@ -1234,7 +1248,7 @@
 +            echo -e "  ${BLUE}XHTTP PubKey:${NC} $XHTTP_PUBLIC_KEY"
 +            echo -e "  ${BLUE}XHTTP ShortID:${NC} ${XHTTP_SHORT_ID:-}"
 +        fi
-@@ -7378,0 +8153,9 @@
+@@ -7378,0 +8167,9 @@
 +            # ACME 挑战走 TCP：HTTP-01 用 80，TLS-ALPN-01 用 443（未被节点占用时）。
 +            if [[ -n "${HY2_DOMAIN:-}" ]]; then
 +                local acme_port
@@ -1244,55 +1258,60 @@
 +                        log_warn "Could not automatically open TCP port $acme_port for ACME"
 +                done
 +            fi
-@@ -7497,0 +8281,4 @@
+@@ -7497,0 +8295,4 @@
 +        # 明确它的定位：全加密、无伪装的流量在跨境直连时最容易被识别，Xray 自
 +        # v26.1.23 起也对 Shadowsocks 打印弃用警告。这里只提示，不阻止安装。
 +        log_warn "$(t2 "Shadowsocks 没有流量伪装，建议只用于中转或落地链路；跨境直连请优先选 REALITY 系协议" \
 +            "Shadowsocks has no traffic disguise; use it for relay or landing hops and prefer a REALITY protocol for direct cross-border use")"
-@@ -7534,0 +8322,3 @@
+@@ -7534,0 +8336,3 @@
 +        configure_hy2_options || return 1
 +        # ACME 节点的 TLS SNI 就是证书域名。
 +        [[ -n "$HY2_DOMAIN" ]] && SNI="$HY2_DOMAIN"
-@@ -7552,0 +8343 @@
+@@ -7552,0 +8357 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7572,0 +8364 @@
+@@ -7572,0 +8378 @@
 +            apply_extra_short_ids || return 1
-@@ -7588,0 +8381 @@
+@@ -7588,0 +8395 @@
 +            [[ "$PROTOCOL_TYPE" != "anytls" ]] && warn_discouraged_reality_target "$SNI"
-@@ -7595,0 +8389,6 @@
+@@ -7595,0 +8403,6 @@
 +        apply_extra_short_ids || return 1
 +        # both 节点的两个 inbound 各用一套凭据，互不牵连。
 +        if [[ "$PROTOCOL_TYPE" == "both" ]]; then
 +            gen_xhttp_credentials || return 1
 +        fi
 +        configure_pq_options || return 1
-@@ -7607,2 +8406,2 @@
+@@ -7607,2 +8420,2 @@
 -        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书。
 -        if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
 +        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
 +        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
-@@ -7921,0 +8721,5 @@
+@@ -7625,0 +8439,2 @@
++        # 服务已通过健康门后再加固：加固失败会自行撤销，不影响这次安装的结果。
++        service_hardening_ensure "$SINGBOX_SERVICE" || true
+@@ -7653,0 +8469 @@
++        service_hardening_ensure xray || true
+@@ -7921,0 +8738,5 @@
 +    XHTTP_UUID=$(decrypt_value "$XHTTP_UUID")
 +    XHTTP_PRIVATE_KEY=$(decrypt_value "$XHTTP_PRIVATE_KEY")
 +    MLDSA65_SEED=$(decrypt_value "$MLDSA65_SEED")
 +    VLESS_DECRYPTION=$(decrypt_value "$VLESS_DECRYPTION")
 +    HY2_OBFS_PASSWORD=$(decrypt_value "$HY2_OBFS_PASSWORD")
-@@ -7970,0 +8775,2 @@
+@@ -7970,0 +8792,2 @@
 +                echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
 +                echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
-@@ -8018,0 +8825,2 @@
+@@ -8018,0 +8842,2 @@
 +                    # ACME 节点的 SNI 即证书域名，两者一起改。
 +                    [[ -n "$HY2_DOMAIN" ]] && HY2_DOMAIN="${new_hy2_sni,,}"
-@@ -8028,0 +8837,2 @@
+@@ -8028,0 +8854,2 @@
 +                # 已拆分凭据的 both 节点同时轮换 XHTTP 的 UUID。
 +                [[ -n "$XHTTP_UUID" ]] && XHTTP_UUID=$(cat /proc/sys/kernel/random/uuid)
-@@ -8033,0 +8844,5 @@
+@@ -8033,0 +8861,5 @@
 +                    # 已拆分凭据的 both 节点同时轮换 XHTTP 的密钥对，保留它自己的 UUID。
 +                    if [[ -n "$XHTTP_PRIVATE_KEY" ]]; then
 +                        local keep_xhttp_uuid="$XHTTP_UUID"
 +                        gen_xhttp_credentials && XHTTP_UUID="$keep_xhttp_uuid"
 +                    fi
-@@ -8062,0 +8878,22 @@
+@@ -8062,0 +8895,22 @@
 +            hysteria2:4)
 +                if [[ -n "$HY2_OBFS_PASSWORD" ]]; then
 +                    HY2_OBFS_PASSWORD=""
@@ -1315,14 +1334,18 @@
 +                elif apply_hy2_hop_range "$new_hop"; then
 +                    changed=true
 +                fi ;;
-@@ -8087 +8924 @@
+@@ -8087 +8941 @@
 -        if [[ "$proto_type" == "anytls" || "$proto_type" == "hysteria2" ]] && $sni_changed; then
 +        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
-@@ -8133,0 +8971,3 @@
+@@ -8133,0 +8988,7 @@
 +    # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
 +    hy2_hop_remove
++    # 移除服务沙箱加固的 drop-in 与跳过标记
++    service_hardening_remove xray
++    service_hardening_remove "$SINGBOX_SERVICE"
++    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 +
-@@ -8208,0 +9049,10 @@
+@@ -8208,0 +9070,10 @@
 +    # 内核安全基线：服务在跑不代表版本安全。这里只告警，不计入"检查失败"——
 +    # 节点本身是可用的，只是应该尽快更新。
 +    local gap_name gap_installed gap_baseline gap_command
@@ -1333,7 +1356,7 @@
 +        echo -e "  ${YELLOW}!${NC} $gap_name v$gap_installed $(t2 "低于安全基线" "is below the security baseline") v$gap_baseline  ${GRAY}→ bash $0 $gap_command${NC}"
 +    done < <(core_baseline_gaps)
 +
-@@ -8541,0 +9392,662 @@
+@@ -8541,0 +9413,662 @@
 +# ============== 协议可选增强 ==============
 +#
 +# 安装节点时的可选增强项（后量子、Hysteria2 加固）集中在这里：它们默认关闭，各自对
@@ -1996,7 +2019,7 @@
 +    read -rp "$(msg menu_press_enter)"
 +}
 +
-@@ -8594,0 +10107,46 @@
+@@ -8594,0 +10128,46 @@
 +# WARP 由第三方脚本（fscarmen/warp）安装，它以 root 运行并会自行下载二进制。
 +# 我们无法替它做完整性背书，能做的是让这次执行可审计、可固定：
 +#   - 下载到 mktemp 创建的私有文件，而不是可预测的 /tmp 路径；
@@ -2043,7 +2066,7 @@
 +    return "$rc"
 +}
 +
-@@ -8598,13 +10156,4 @@
+@@ -8598,13 +10177,4 @@
 -    # Security: Download to temp file with secure options
 -    local tmp_warp="/tmp/warp-menu-$$.sh"
 -    if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
@@ -2061,10 +2084,10 @@
 +        log_info "WARP installed successfully"
 +        write_config
 +        service_restart xray
-@@ -8621,2 +10169,0 @@
+@@ -8621,2 +10190,0 @@
 -    elif [[ -f menu.sh ]]; then
 -        bash menu.sh u
-@@ -8624,6 +10171,2 @@
+@@ -8624,6 +10192,2 @@
 -        # Security: Download to temp file with secure options
 -        local tmp_warp="/tmp/warp-menu-$$.sh"
 -        if secure_curl "https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" -o "$tmp_warp" 2>/dev/null; then
@@ -2073,7 +2096,7 @@
 -        fi
 +        # 不再执行当前目录下碰巧存在的 menu.sh：工作目录里的文件不是可信来源。
 +        warp_run_script u || true
-@@ -8649,2 +10192,7 @@
+@@ -8649,2 +10213,7 @@
 -        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库
 -        ensure_geodata
 +        # 分流规则使用 geosite:netflix，需要 GeoSite 数据库。数据库没有通过校验时
@@ -2083,30 +2106,149 @@
 +            read -rp "$(msg menu_press_enter)"
 +            return
 +        fi
-@@ -8671 +10219,5 @@
+@@ -8671 +10240,5 @@
 -        ensure_geodata
 +        if ! ensure_geodata; then
 +            echo ""
 +            read -rp "$(msg menu_press_enter)"
 +            return
 +        fi
-@@ -10784,0 +12337 @@
+@@ -10277,0 +11851,118 @@
++# ============== 服务沙箱加固 ==============
++#
++# Xray 与 sing-box 以 root 运行，却只需要绑定端口和操作网络。加固通过 systemd drop-in
++# 收窄它们的权限，而不改动服务定义本身：Xray 的 unit 由带 managed marker 的原子发布
++# 逻辑管理，往里加指令会破坏那套"是否为脚本管理内容"的判定；drop-in 可以独立增删。
++#
++# 两条约束决定了实现：
++#   1. 需要挂载命名空间的指令（ProtectSystem / PrivateTmp 等）在 LXC、OpenVZ 这类
++#      容器里常常直接以 226/NAMESPACE 失败，而便宜的 VPS 很多就是容器。所以容器里
++#      只下发不依赖命名空间的核心集合。
++#   2. 即使这样也无法穷举所有宿主环境，所以加固必须可验证、可自动撤销：只对已经
++#      在运行的服务下发，重启后确认仍然 active，否则删除 drop-in、再次重启恢复原状，
++#      并记下跳过标记，不在每次装节点时重复尝试。
++SYSTEMD_DROPIN_ROOT="/etc/systemd/system"
++SERVICE_HARDENING_STATE_DIR="/etc/proxy-hub"
++SERVICE_HARDENING_MIN_SYSTEMD=235
++
++service_hardening_dropin() {
++    printf '%s/%s.service.d/10-proxy-hub-hardening.conf' "$SYSTEMD_DROPIN_ROOT" "$1"
++}
++
++service_hardening_skip_marker() {
++    printf '%s/hardening-%s.skip' "$SERVICE_HARDENING_STATE_DIR" "$1"
++}
++
++# 本机是否适用加固：仅 systemd，且版本足够新。
++service_hardening_applicable() {
++    local version
++    [[ "${INIT_SYSTEM:-}" != "openrc" ]] || return 1
++    version=$(systemd_version) || return 1
++    (( version >= SERVICE_HARDENING_MIN_SYSTEMD ))
++}
++
++# 是否运行在容器内。探测工具缺失时按"是"处理：宁可少加几条指令，也不让服务起不来。
++service_hardening_in_container() {
++    command -v systemd-detect-virt >/dev/null 2>&1 || return 0
++    systemd-detect-virt --container --quiet 2>/dev/null
++}
++
++# 输出某个服务的 drop-in 内容。
++service_hardening_render() {
++    local svc="$1"
++    cat <<'CORE'
++# proxy-hub-managed: hardening-v1
++[Service]
++NoNewPrivileges=true
++CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
++AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
++RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
++RestrictSUIDSGID=true
++RestrictRealtime=true
++LockPersonality=true
++SystemCallArchitectures=native
++CORE
++    service_hardening_in_container && return 0
++    cat <<'NAMESPACED'
++ProtectSystem=full
++ProtectHome=read-only
++PrivateTmp=true
++ProtectKernelModules=true
++ProtectKernelTunables=true
++ProtectControlGroups=true
++NAMESPACED
++    # ProtectSystem=full 把 /usr 变成只读，而 sing-box 的 ACME 数据目录在
++    # /usr/local/etc/sing-box 下，必须显式放行（"-" 表示目录不存在时忽略）。
++    [[ "$svc" == "$SINGBOX_SERVICE" ]] && printf 'ReadWritePaths=-%s\n' "$SINGBOX_DIR"
++    return 0
++}
++
++service_hardening_is_applied() {
++    [[ -f "$(service_hardening_dropin "$1")" ]]
++}
++
++service_hardening_remove() {
++    local dropin
++    dropin=$(service_hardening_dropin "$1")
++    [[ -e "$dropin" ]] || return 0
++    rm -f -- "$dropin"
++    rmdir -- "$(dirname "$dropin")" 2>/dev/null || true
++    systemctl daemon-reload 2>/dev/null || true
++}
++
++# 为一个正在运行的服务下发加固并验证。
++# Usage: service_hardening_ensure SERVICE [force]
++# 返回: 0 已加固（或本来就已加固）；1 不适用 / 服务未运行 / 曾经失败已跳过；
++#       2 下发后服务起不来，已自动撤销并恢复
++service_hardening_ensure() {
++    local svc="$1" force="${2:-}" dropin tmp marker
++    service_hardening_applicable || return 1
++    dropin=$(service_hardening_dropin "$svc")
++    marker=$(service_hardening_skip_marker "$svc")
++    [[ -f "$dropin" ]] && return 0
++    [[ -e "$marker" && "$force" != "force" ]] && return 1
++    service_is_active "$svc" || return 1
++
++    mkdir -p -- "$(dirname "$dropin")" || return 1
++    tmp=$(mktemp "${dropin}.XXXXXXXX") || return 1
++    service_hardening_render "$svc" >"$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$dropin" || {
++        rm -f -- "$tmp"
++        return 1
++    }
++    systemctl daemon-reload 2>/dev/null || true
++
++    if service_restart "$svc" >/dev/null 2>&1 && sleep 1 && service_is_active "$svc"; then
++        rm -f -- "$marker"
++        log_info "$(t2 "已为 $svc 启用服务沙箱加固" "Service sandbox hardening enabled for $svc")"
++        return 0
++    fi
++
++    # 这台机器上的 systemd/内核不接受这组指令：撤销并恢复，服务可用性优先。
++    service_hardening_remove "$svc"
++    service_restart "$svc" >/dev/null 2>&1 || true
++    mkdir -p -- "$SERVICE_HARDENING_STATE_DIR" 2>/dev/null && : >"$marker"
++    log_warn "$(t2 "$svc 在沙箱加固下无法启动，已自动撤销加固并恢复服务（常见于容器型 VPS）" \
++        "$svc could not start under sandbox hardening; it was reverted and the service restored (common on container VPSes)")"
++    return 2
++}
++
+@@ -10784,0 +12476 @@
 +        echo -e "  ${GREEN}11.${NC} sing-box $(t2 "版本 / 更新" "Version / Update")"
-@@ -10791 +12344 @@
+@@ -10791 +12483 @@
 -        echo -n "  $(msg menu_choice) [0-10]: "
 +        echo -n "  $(msg menu_choice) [0-11]: "
-@@ -10803,0 +12357 @@
+@@ -10803,0 +12496 @@
 +            11) cmd_singbox_release_menu ;;
-@@ -10982,0 +12537,2 @@
+@@ -10982,0 +12676,2 @@
 +    echo "  singbox-version  Show installed/stable sing-box versions and the security baseline"
 +    echo "  singbox-update   Update sing-box with SHA-256 verification, config check and rollback"
-@@ -11037,0 +12594,5 @@
+@@ -11037,0 +12733,5 @@
 +    echo "sing-box release management:"
 +    echo "  SINGBOX_VERSION=v1.14.4         Install an explicit sing-box version with singbox-update"
 +    echo "  SINGBOX_SHA256=<hex>            Expected archive digest when the release metadata has none"
 +    echo "  SINGBOX_BACKUP_KEEP=3           Number of script-created binary backups to keep"
 +    echo ""
-@@ -11206,0 +12768,7 @@
+@@ -11206,0 +12907,7 @@
 +        ;;
 +    singbox-version)
 +        cmd_singbox_version

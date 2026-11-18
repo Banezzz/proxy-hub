@@ -981,6 +981,14 @@ singbox_installed_version() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# systemd 主版本号（如 252）；不是 systemd 或读不出时返回非零。
+systemd_version() {
+    local line
+    line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$line" =~ ^systemd[[:space:]]+([0-9]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
 # ---- 内核安全基线 ----
 #
 # 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
@@ -5039,9 +5047,15 @@ HELPER
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
         create_singbox_openrc_service
     else
+        # "+" 让 helper 以完整权限运行，不受服务沙箱加固限制：加载 NAT 内核模块需要
+        # 的能力不在加固后的 capability 集合里。该前缀自 systemd 231 起可用，更早的
+        # 版本不认识它，也没有加固 drop-in，保持旧写法。
+        local hop_prefix="-" hop_systemd
+        hop_systemd=$(systemd_version) || hop_systemd=0
+        (( hop_systemd >= 231 )) && hop_prefix="-+"
         mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
         printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
-            "ExecStartPre=-$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
         systemctl daemon-reload 2>/dev/null || true
     fi
 }
@@ -8422,6 +8436,8 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        # 服务已通过健康门后再加固：加固失败会自行撤销，不影响这次安装的结果。
+        service_hardening_ensure "$SINGBOX_SERVICE" || true
     else
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
@@ -8450,6 +8466,7 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        service_hardening_ensure xray || true
     fi
 
     log_info "$(msg install_complete)"
@@ -8970,6 +8987,10 @@ cmd_uninstall() {
 
     # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
     hy2_hop_remove
+    # 移除服务沙箱加固的 drop-in 与跳过标记
+    service_hardening_remove xray
+    service_hardening_remove "$SINGBOX_SERVICE"
+    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 
     # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then
@@ -11827,6 +11848,124 @@ is_container_env() {
     esac
 }
 
+# ============== 服务沙箱加固 ==============
+#
+# Xray 与 sing-box 以 root 运行，却只需要绑定端口和操作网络。加固通过 systemd drop-in
+# 收窄它们的权限，而不改动服务定义本身：Xray 的 unit 由带 managed marker 的原子发布
+# 逻辑管理，往里加指令会破坏那套"是否为脚本管理内容"的判定；drop-in 可以独立增删。
+#
+# 两条约束决定了实现：
+#   1. 需要挂载命名空间的指令（ProtectSystem / PrivateTmp 等）在 LXC、OpenVZ 这类
+#      容器里常常直接以 226/NAMESPACE 失败，而便宜的 VPS 很多就是容器。所以容器里
+#      只下发不依赖命名空间的核心集合。
+#   2. 即使这样也无法穷举所有宿主环境，所以加固必须可验证、可自动撤销：只对已经
+#      在运行的服务下发，重启后确认仍然 active，否则删除 drop-in、再次重启恢复原状，
+#      并记下跳过标记，不在每次装节点时重复尝试。
+SYSTEMD_DROPIN_ROOT="/etc/systemd/system"
+SERVICE_HARDENING_STATE_DIR="/etc/proxy-hub"
+SERVICE_HARDENING_MIN_SYSTEMD=235
+
+service_hardening_dropin() {
+    printf '%s/%s.service.d/10-proxy-hub-hardening.conf' "$SYSTEMD_DROPIN_ROOT" "$1"
+}
+
+service_hardening_skip_marker() {
+    printf '%s/hardening-%s.skip' "$SERVICE_HARDENING_STATE_DIR" "$1"
+}
+
+# 本机是否适用加固：仅 systemd，且版本足够新。
+service_hardening_applicable() {
+    local version
+    [[ "${INIT_SYSTEM:-}" != "openrc" ]] || return 1
+    version=$(systemd_version) || return 1
+    (( version >= SERVICE_HARDENING_MIN_SYSTEMD ))
+}
+
+# 是否运行在容器内。探测工具缺失时按"是"处理：宁可少加几条指令，也不让服务起不来。
+service_hardening_in_container() {
+    command -v systemd-detect-virt >/dev/null 2>&1 || return 0
+    systemd-detect-virt --container --quiet 2>/dev/null
+}
+
+# 输出某个服务的 drop-in 内容。
+service_hardening_render() {
+    local svc="$1"
+    cat <<'CORE'
+# proxy-hub-managed: hardening-v1
+[Service]
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+CORE
+    service_hardening_in_container && return 0
+    cat <<'NAMESPACED'
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+NAMESPACED
+    # ProtectSystem=full 把 /usr 变成只读，而 sing-box 的 ACME 数据目录在
+    # /usr/local/etc/sing-box 下，必须显式放行（"-" 表示目录不存在时忽略）。
+    [[ "$svc" == "$SINGBOX_SERVICE" ]] && printf 'ReadWritePaths=-%s\n' "$SINGBOX_DIR"
+    return 0
+}
+
+service_hardening_is_applied() {
+    [[ -f "$(service_hardening_dropin "$1")" ]]
+}
+
+service_hardening_remove() {
+    local dropin
+    dropin=$(service_hardening_dropin "$1")
+    [[ -e "$dropin" ]] || return 0
+    rm -f -- "$dropin"
+    rmdir -- "$(dirname "$dropin")" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# 为一个正在运行的服务下发加固并验证。
+# Usage: service_hardening_ensure SERVICE [force]
+# 返回: 0 已加固（或本来就已加固）；1 不适用 / 服务未运行 / 曾经失败已跳过；
+#       2 下发后服务起不来，已自动撤销并恢复
+service_hardening_ensure() {
+    local svc="$1" force="${2:-}" dropin tmp marker
+    service_hardening_applicable || return 1
+    dropin=$(service_hardening_dropin "$svc")
+    marker=$(service_hardening_skip_marker "$svc")
+    [[ -f "$dropin" ]] && return 0
+    [[ -e "$marker" && "$force" != "force" ]] && return 1
+    service_is_active "$svc" || return 1
+
+    mkdir -p -- "$(dirname "$dropin")" || return 1
+    tmp=$(mktemp "${dropin}.XXXXXXXX") || return 1
+    service_hardening_render "$svc" >"$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$dropin" || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    systemctl daemon-reload 2>/dev/null || true
+
+    if service_restart "$svc" >/dev/null 2>&1 && sleep 1 && service_is_active "$svc"; then
+        rm -f -- "$marker"
+        log_info "$(t2 "已为 $svc 启用服务沙箱加固" "Service sandbox hardening enabled for $svc")"
+        return 0
+    fi
+
+    # 这台机器上的 systemd/内核不接受这组指令：撤销并恢复，服务可用性优先。
+    service_hardening_remove "$svc"
+    service_restart "$svc" >/dev/null 2>&1 || true
+    mkdir -p -- "$SERVICE_HARDENING_STATE_DIR" 2>/dev/null && : >"$marker"
+    log_warn "$(t2 "$svc 在沙箱加固下无法启动，已自动撤销加固并恢复服务（常见于容器型 VPS）" \
+        "$svc could not start under sandbox hardening; it was reverted and the service restored (common on container VPSes)")"
+    return 2
+}
+
 # 检查系统是否有修改时钟的权限 (CAP_SYS_TIME)
 check_time_capability() {
     # 方法1: 尝试无害的 adjtimex 查询
@@ -12796,7 +12935,7 @@ case "${1:-}" in
 esac
 # proxy-hub-bundle-manifest-v1
 # header-bytes=536 header-sha256=3df1cad78a529b3a24d9a027c1dd8ca2941af51a0933a381cc6cefb6b0453533
-# body-bytes=519034 body-sha256=926e87d078ba58661d4c579932ef8223d7c1a102e1d8db45f7ff341010c1f6b6
-# build-id=926e87d078ba58661d4c579932ef8223d7c1a102e1d8db45f7ff341010c1f6b6
+# body-bytes=525164 body-sha256=7e76fafe6c6f4e7cf15752fa97a840249c795213f1cff9d6baae45a067752e3a
+# build-id=7e76fafe6c6f4e7cf15752fa97a840249c795213f1cff9d6baae45a067752e3a
 # module-count=11
 # proxy-hub-bundle-end-v1

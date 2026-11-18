@@ -331,6 +331,8 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        # 服务已通过健康门后再加固：加固失败会自行撤销，不影响这次安装的结果。
+        service_hardening_ensure "$SINGBOX_SERVICE" || true
     else
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
@@ -359,6 +361,7 @@ cmd_install() {
         fi
 
         open_node_firewall_ports "$PROTOCOL_TYPE"
+        service_hardening_ensure xray || true
     fi
 
     log_info "$(msg install_complete)"
@@ -879,6 +882,10 @@ cmd_uninstall() {
 
     # 清除 Hysteria2 端口跳跃的 NAT 规则与 helper
     hy2_hop_remove
+    # 移除服务沙箱加固的 drop-in 与跳过标记
+    service_hardening_remove xray
+    service_hardening_remove "$SINGBOX_SERVICE"
+    rm -f -- "$(service_hardening_skip_marker xray)" "$(service_hardening_skip_marker "$SINGBOX_SERVICE")"
 
     # 卸载 sing-box（AnyTLS / Hysteria2）
     if [[ -f "$SINGBOX_BIN" ]] || [[ -f /etc/systemd/system/sing-box.service ]] || [[ -f /etc/init.d/sing-box ]]; then

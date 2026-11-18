@@ -965,6 +965,14 @@ singbox_installed_version() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# systemd 主版本号（如 252）；不是 systemd 或读不出时返回非零。
+systemd_version() {
+    local line
+    line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$line" =~ ^systemd[[:space:]]+([0-9]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
 # ---- 内核安全基线 ----
 #
 # 普通安装从不替换健康的既有内核，所以长期不动的机器会停在有已知问题的旧版本上。
