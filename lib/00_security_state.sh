@@ -404,7 +404,7 @@ reset_node_state() {
     SERVER_IP="" SERVER_IPV4="" SERVER_IPV6=""
     SS_METHOD="" SS_PASSWORD=""
     ANYTLS_PASSWORD="" ANYTLS_PADDING_B64=""
-    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL=""
+    HY2_PASSWORD="" HY2_OBFS_PASSWORD="" HY2_HOP_PORTS="" HY2_DOMAIN="" HY2_EMAIL="" HY2_CORE=""
     PROTOCOL_TYPE="vision"
 }
 
@@ -458,6 +458,7 @@ safe_load_node_config() {
     HY2_HOP_PORTS=$(safe_read_config_value "$file" "HY2_HOP_PORTS")
     HY2_DOMAIN=$(safe_read_config_value "$file" "HY2_DOMAIN")
     HY2_EMAIL=$(safe_read_config_value "$file" "HY2_EMAIL")
+    HY2_CORE=$(safe_read_config_value "$file" "HY2_CORE")
 
     return 0
 }
@@ -671,12 +672,14 @@ xray_probe_capabilities() {
         out=$(timeout 10 "$XRAY_BIN" help 2>/dev/null </dev/null) || out=""
         [[ "$out" =~ (^|[[:space:]])mldsa65([[:space:]]|$) ]] && caps+=" mldsa65 target"
         [[ "$out" =~ (^|[[:space:]])vlessenc([[:space:]]|$) ]] && caps+=" vlessenc"
+        # Hysteria2 入站没有对应的子命令可探测，只能按版本：v26.3.27 起提供。
+        out=$(xray_installed_version_plain) && version_ge "$out" 26.3.27 && caps+=" hysteria2"
     fi
     XRAY_CAPS="$caps"
     XRAY_CAPS_KEY="$key"
 }
 
-# Usage: xray_supports mldsa65|vlessenc|target
+# Usage: xray_supports mldsa65|vlessenc|target|hysteria2
 xray_supports() {
     xray_probe_capabilities
     [[ " $XRAY_CAPS " == *" $1 "* ]]
@@ -928,6 +931,78 @@ build_anytls_inbound() {
             "users": [{"name": $name, "password": $password}],
             "padding_scheme": ($padding | split("\n") | map(select(length > 0))),
             "tls": $tls
+        }'
+}
+
+# 一个节点由哪个内核承载。AnyTLS 只有 sing-box 能跑；Hysteria2 默认也在 sing-box 上，
+# HY2_CORE=xray 时改由 Xray 的原生 Hysteria2 入站承载；其余协议都属于 Xray。
+# 所有"这个节点归谁"的判断都必须经过这里，不要再按协议名各自枚举。
+# Usage: node_core_of PROTOCOL_TYPE [HY2_CORE]   -> xray | singbox
+node_core_of() {
+    case "${1:-}" in
+        anytls|anytls_reality) printf '%s' singbox ;;
+        hysteria2)
+            if [[ "${2:-}" == "xray" ]]; then printf '%s' xray; else printf '%s' singbox; fi
+            ;;
+        *) printf '%s' xray ;;
+    esac
+}
+
+# Usage: node_file_core NODE_FILE   -> xray | singbox
+node_file_core() {
+    node_core_of "$(safe_read_config_value "$1" "PROTOCOL_TYPE")" "$(safe_read_config_value "$1" "HY2_CORE")"
+}
+
+# Xray 原生的 Hysteria2 入站。与 sing-box 版本对外等价：同一个 UDP 端口、同一个密码、
+# 同一张证书、同样的 masquerade / Salamander，所以切换内核不改变分享链接。
+# 形状经真实 Xray 26.11.9 与 sing-box 1.14.4 客户端互通验证：transport 必须写
+# `network: hysteria`（文档示例里的 `method` 不生效），Salamander 走 finalmask.udp。
+# Usage: build_xray_hysteria2_inbound NAME PORT PASSWORD SNI CERT KEY [OBFS_PASSWORD]
+build_xray_hysteria2_inbound() {
+    local name="$1" port="$2" password="$3" sni="$4" cert="$5" key="$6" obfs_password="${7:-}"
+
+    port=$(get_validated_port "$port" true) || return 1
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    [[ "$password" =~ ^[a-zA-Z0-9._~-]{8,128}$ ]] || return 1
+    validate_tls_server_name "$sni" || return 1
+    [[ -n "$cert" && -n "$key" ]] || return 1
+    [[ -z "$obfs_password" || "$obfs_password" =~ ^[a-zA-Z0-9._-]{8,128}$ ]] || return 1
+
+    jq -n \
+        --arg tag "${name}_hysteria2" \
+        --argjson port "$port" \
+        --arg name "$name" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg cert "$cert" \
+        --arg key "$key" \
+        --arg obfs_password "$obfs_password" \
+        --arg listen "$(netstack_listen_addr)" \
+        --argjson sockopt "$(netstack_sockopt_json)" \
+        '{
+            "tag": $tag,
+            "listen": $listen,
+            "port": $port,
+            "protocol": "hysteria",
+            "settings": {"version": 2, "users": [{"auth": $password, "email": $name}]},
+            "streamSettings": ({
+                "network": "hysteria",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": $sni,
+                    "alpn": ["h3"],
+                    "certificates": [{"certificateFile": $cert, "keyFile": $key}]
+                },
+                "hysteriaSettings": ({"version": 2}
+                    | if $obfs_password == "" then
+                        . + {"masquerade": {"type": "proxy", "url": "https://www.bing.com", "rewriteHost": true}}
+                      else . end)
+            }
+            | if $obfs_password != "" then
+                . + {"finalmask": {"udp": [{"type": "salamander", "settings": {"password": $obfs_password}}]}}
+              else . end
+            | if $sockopt then . + {"sockopt": $sockopt} else . end),
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
         }'
 }
 

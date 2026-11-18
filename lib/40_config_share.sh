@@ -114,8 +114,33 @@ write_config() {
             fi
         fi
 
-        # AnyTLS / Hysteria2 节点由 sing-box 处理，Xray 配置中跳过
-        if [[ "$n_protocol_type" == "anytls" || "$n_protocol_type" == "anytls_reality" || "$n_protocol_type" == "hysteria2" ]]; then
+        # 由 sing-box 承载的节点（AnyTLS，以及默认情况下的 Hysteria2）在 Xray 配置中跳过
+        if [[ "$(node_core_of "$n_protocol_type" "$(safe_read_config_value "$node_file" "HY2_CORE")")" != "xray" ]]; then
+            continue
+        fi
+
+        # 选择了 Xray 后端的 Hysteria2 节点
+        if [[ "$n_protocol_type" == "hysteria2" ]]; then
+            local hy_port hy_pw hy_obfs hy_sni hy_inbound
+            local hy_cert="$SINGBOX_CERT_DIR/${n_name}.crt" hy_key="$SINGBOX_CERT_DIR/${n_name}.key"
+            if ! xray_supports hysteria2; then
+                log_error "$(t2 "节点 '$n_name' 选择了 Xray 承载 Hysteria2，但当前 Xray 低于 v26.3.27，请先执行 xray-update" \
+                    "Node '$n_name' runs Hysteria2 on Xray, which needs Xray v26.3.27 or newer; run xray-update first")"
+                return 1
+            fi
+            hy_pw=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_PASSWORD")")
+            [[ -z "$hy_pw" ]] && continue
+            hy_port=$(get_validated_port "$n_port" true) || { log_warn "Invalid Hysteria2 port for node '$n_name', skipping"; continue; }
+            hy_obfs=$(decrypt_value "$(safe_read_config_value "$node_file" "HY2_OBFS_PASSWORD")")
+            hy_sni="${n_sni:-www.bing.com}"
+            if [[ ! -f "$hy_cert" || ! -f "$hy_key" ]]; then
+                gen_selfsigned_cert "$n_name" "$hy_sni" || return 1
+            fi
+            if ! hy_inbound=$(build_xray_hysteria2_inbound "$n_name" "$hy_port" "$hy_pw" "$hy_sni" "$hy_cert" "$hy_key" "$hy_obfs"); then
+                log_error "Failed to build Hysteria2 inbound for node '$n_name'"
+                return 1
+            fi
+            inbounds_json=$(jq --argjson inbound "$hy_inbound" '. += [$inbound]' <<<"$inbounds_json") || return 1
             continue
         fi
 
@@ -320,7 +345,7 @@ write_singbox_config() {
 
         local n_proto
         n_proto=$(safe_read_config_value "$node_file" "PROTOCOL_TYPE")
-        [[ "$n_proto" == "anytls" || "$n_proto" == "anytls_reality" || "$n_proto" == "hysteria2" ]] || continue
+        [[ "$(node_file_core "$node_file")" == "singbox" ]] || continue
 
         local n_name n_port n_sni n_priv n_sid n_pw n_pad_b64 n_pad
         n_name=$(safe_read_config_value "$node_file" "NODE_NAME")
@@ -568,6 +593,7 @@ HY2_OBFS_PASSWORD=$save_hy2_obfs_password
 HY2_HOP_PORTS=${HY2_HOP_PORTS:-}
 HY2_DOMAIN=${HY2_DOMAIN:-}
 HY2_EMAIL=${HY2_EMAIL:-}
+HY2_CORE=${HY2_CORE:-}
 ENV
     chmod 600 "$node_file"
 
@@ -963,7 +989,7 @@ show_info() {
         if [[ -n "${HY2_HOP_PORTS:-}" ]]; then
             echo -e "  ${BLUE}Port hopping:${NC} UDP ${HY2_HOP_PORTS} -> ${PORT:-N/A}  ${GRAY}($(t2 "云安全组需放行该 UDP 范围" "allow this UDP range in the cloud firewall"))${NC}"
         fi
-        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 (sing-box)"
+        echo -e "  ${BLUE}Transport:${NC}   Hysteria2 ($([[ "${HY2_CORE:-}" == "xray" ]] && echo Xray || echo sing-box))"
         if [[ -n "${HY2_DOMAIN:-}" ]]; then
             echo -e "  ${BLUE}SNI:${NC}         ${HY2_DOMAIN}"
             echo -e "  ${BLUE}Certificate:${NC} ACME  ${GRAY}($(t2 "公共 CA 签发，客户端无需 insecure" "issued by a public CA, no insecure flag needed"))${NC}"

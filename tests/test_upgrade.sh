@@ -127,6 +127,7 @@ point_paths_at_scratch() {
     UPGRADE_BACKUP_ROOT=/srv/state/backups
     HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
     HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+    HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
     GEODATA_HELPER=/srv/state/libexec/proxy-hub-geodata-update
     ENABLE_CONFIG_ENCRYPTION=false
     CURRENT_LANG=en

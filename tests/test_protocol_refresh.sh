@@ -936,6 +936,7 @@ run_scenario hysteria2-port-hopping <<'SCENARIO'
 load_modules
 HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
 HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
 systemctl() { printf '%s\n' "$*" >>/srv/systemctl.calls; }
 : >/srv/systemctl.calls
 
@@ -1007,6 +1008,8 @@ fi
 assert_not_contains "$calls" "-A INPUT" "the helper must not touch filter rules"
 assert_contains "$(cat "$HY2_HOP_DROPIN")" "ExecStartPre=-$HY2_HOP_HELPER apply" \
     "sing-box re-applies the rules on every start"
+assert_eq "$(cat "$HY2_HOP_DROPIN")" "$(cat "$HY2_HOP_DROPIN_XRAY")" \
+    "the Xray service gets the same hook, since either core may host the node"
 assert_contains "$(cat /srv/systemctl.calls)" "daemon-reload" "systemd must reload after the drop-in changes"
 
 # Idempotent: every apply tears the chain down before rebuilding it.
@@ -1039,7 +1042,8 @@ cp /srv/bin/iptables /srv/bin/ip6tables
 hy2_hop_sync
 assert_contains "$(cat /srv/iptables.calls)" "iptables -t nat -X PROXY_HUB_HY2_HOP" "the chain is deleted"
 assert_not_contains "$(cat /srv/iptables.calls)" " -N " "no chain is recreated without rules"
-[[ ! -e "$HY2_HOP_HELPER" && ! -e "$HY2_HOP_DROPIN" ]] || fail_case "helper or drop-in was left behind"
+[[ ! -e "$HY2_HOP_HELPER" && ! -e "$HY2_HOP_DROPIN" && ! -e "$HY2_HOP_DROPIN_XRAY" ]] || \
+    fail_case "helper or drop-in was left behind"
 hy2_hop_sync || fail_case "syncing with nothing to do must succeed"
 
 # OpenRC wires the helper into start_pre instead of a drop-in.
@@ -1872,6 +1876,7 @@ INIT_SYSTEM=systemd
 # The port-hopping helper escapes the sandbox so it can still load NAT modules.
 HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
 HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
 printf '#!/bin/sh\nexit 0\n' >/srv/bin/iptables; chmod 755 /srv/bin/iptables
 PATH="/srv/bin:$PATH"
 write_node hy hysteria2 "HY2_HOP_PORTS=30000-30100"
@@ -1931,7 +1936,7 @@ write_node full both \
     "VLESS_DECRYPTION=mlkem768x25519plus.native.600s.DecKey_1" \
     "VLESS_ENCRYPTION=mlkem768x25519plus.native.0rtt.EncKey_1" \
     "HY2_OBFS_PASSWORD=Obfs.Pass_1" "HY2_HOP_PORTS=30000-30100" \
-    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com"
+    "HY2_DOMAIN=hy.example.com" "HY2_EMAIL=ops@example.com" "HY2_CORE=xray"
 sed -i 's/^ANYTLS_PADDING_B64=$/ANYTLS_PADDING_B64=c3RvcD04/' "$NODES_DIR/full.env"
 sort "$NODES_DIR/full.env" >/srv/before.env
 CURRENT_NODE_NAME=full
@@ -2031,6 +2036,230 @@ assert_eq "" "$(decrypt_value "$(grep '^UUID=' "$file" | cut -d= -f2-)" 2>/dev/n
 var_holder=$(grep '^UUID=' "$file" | cut -d= -f2-)
 assert_fails "decrypt_into must fail without the key" decrypt_into var_holder
 [[ "$var_holder" == U2FsdGVk* ]] || fail_case "a failed decrypt_into must leave the variable alone"
+SCENARIO
+
+# Hysteria2 can be hosted by either core.  The choice changes which config the
+# node is rendered into and nothing a client can see.
+run_scenario hysteria2-core-choice <<'SCENARIO'
+load_modules
+set_fake_xray() {
+    printf '#!/bin/sh\ncase "$1" in\n  version) echo "Xray %s (Xray, Penetrates Everything.) abc" ;;\n  help) printf "\\tmldsa65  x\\n\\tvlessenc  x\\n" ;;\nesac\nexit 0\n' "$1" >/srv/bin/xray-hy
+    chmod 755 /srv/bin/xray-hy
+    XRAY_BIN=/srv/bin/xray-hy
+    XRAY_CAPS=""
+}
+set_fake_xray 26.11.9
+
+# Which core owns a node.
+assert_eq "singbox" "$(node_core_of hysteria2 "")" "Hysteria2 defaults to sing-box"
+assert_eq "xray" "$(node_core_of hysteria2 xray)" "HY2_CORE=xray moves Hysteria2 to Xray"
+assert_eq "singbox" "$(node_core_of hysteria2 bogus)" "an unknown value keeps the default"
+assert_eq "singbox" "$(node_core_of anytls xray)" "AnyTLS can only run on sing-box"
+assert_eq "singbox" "$(node_core_of anytls_reality "")" "AnyTLS + REALITY runs on sing-box"
+for proto in vision xhttp both shadowsocks ""; do
+    assert_eq "xray" "$(node_core_of "$proto" "")" "'$proto' runs on Xray"
+done
+
+# Capability follows the installed version.
+xray_supports hysteria2 || fail_case "Xray 26.11.9 must support the Hysteria2 inbound"
+set_fake_xray 26.3.27
+xray_supports hysteria2 || fail_case "v26.3.27 is the first version with the Hysteria2 inbound"
+set_fake_xray 26.2.6
+assert_fails "v26.2.6 has no Hysteria2 inbound" xray_supports hysteria2
+set_fake_xray 26.11.9
+
+# Option handling.
+resolve_hy2_core
+assert_eq "" "$HY2_CORE" "the default backend is sing-box"
+hy2core=xray resolve_hy2_core
+assert_eq "xray" "$HY2_CORE" "hy2core=xray selects Xray"
+hy2core=sing-box resolve_hy2_core
+assert_eq "" "$HY2_CORE" "hy2core=sing-box selects the default"
+rc=0
+( hy2core=nonsense resolve_hy2_core 2>/dev/null ) || rc=$?
+assert_eq "1" "$rc" "an unknown backend must be rejected"
+
+HY2_DOMAIN="" HY2_HOP_PORTS=""
+hy2_core_allowed xray || fail_case "a plain node may run on Xray"
+hy2_core_allowed singbox || fail_case "sing-box has no restrictions"
+HY2_DOMAIN=hy.example.com
+assert_contains "$(hy2_core_allowed xray 2>&1 || true)" "ACME certificates are only available" "ACME needs sing-box"
+assert_fails "ACME on Xray must be refused" hy2_core_allowed xray
+hy2_core_allowed singbox || fail_case "ACME on sing-box stays allowed"
+HY2_DOMAIN="" HY2_HOP_PORTS=30000-30100
+hy2_core_allowed xray || fail_case "port hopping on Xray is fine under systemd"
+INIT_SYSTEM=openrc
+assert_fails "port hopping on Xray under OpenRC must be refused" hy2_core_allowed xray
+INIT_SYSTEM=systemd
+HY2_HOP_PORTS=""
+set_fake_xray 26.2.6
+assert_contains "$(hy2_core_allowed xray 2>&1 || true)" "v26.3.27 or newer" "an old Xray must be named as the reason"
+set_fake_xray 26.11.9
+
+# Rendering and counting.
+write_node onxray hysteria2 "HY2_CORE=xray"
+write_node onsb hysteria2
+sed -i 's/^PORT=1443$/PORT=5443/' "$NODES_DIR/onsb.env"
+write_node obfsx hysteria2 "HY2_CORE=xray" "HY2_OBFS_PASSWORD=Chosen.Obfs-Pass_1"
+sed -i 's/^PORT=1443$/PORT=6443/' "$NODES_DIR/obfsx.env"
+write_node at anytls
+sed -i 's/^PORT=1443$/PORT=7443/' "$NODES_DIR/at.env"
+assert_eq "2" "$(xray_node_count)" "Xray counts the two Hysteria2 nodes it hosts"
+assert_eq "2" "$(singbox_node_count)" "sing-box counts its Hysteria2 node and the AnyTLS node"
+for n in onxray onsb obfsx; do gen_selfsigned_cert "$n" edge.example.com; done
+gen_selfsigned_cert at edge.example.com
+
+write_config
+write_singbox_config
+assert_eq "onxray_hysteria2 obfsx_hysteria2" "$(jq -r '[.inbounds[].tag] | sort | reverse | join(" ")' "$XRAY_CONF")" \
+    "the Xray config holds exactly the nodes that chose Xray"
+assert_eq "at_anytls onsb_hysteria2" "$(jq -r '[.inbounds[].tag] | sort | join(" ")' "$SINGBOX_CONF")" \
+    "the sing-box config holds the rest"
+plain=$(jq -c '.inbounds[] | select(.tag == "onxray_hysteria2")' "$XRAY_CONF")
+assert_eq "hysteria/hysteria/tls" \
+    "$(jq -r '"\(.protocol)/\(.streamSettings.network)/\(.streamSettings.security)"' <<<"$plain")" "protocol and transport"
+assert_eq "null" "$(jq -r '.streamSettings.method' <<<"$plain")" "the transport is selected by network, not method"
+assert_eq '{"version":2,"users":[{"auth":"SafeHy2Password","email":"onxray"}]}' "$(jq -c '.settings' <<<"$plain")" "users"
+assert_eq '["h3"]' "$(jq -c '.streamSettings.tlsSettings.alpn' <<<"$plain")" "ALPN"
+assert_eq "/srv/sing-box/certs/onxray.crt" \
+    "$(jq -r '.streamSettings.tlsSettings.certificates[0].certificateFile' <<<"$plain")" "the per-node certificate is reused"
+assert_eq "proxy" "$(jq -r '.streamSettings.hysteriaSettings.masquerade.type' <<<"$plain")" "masquerade without obfuscation"
+assert_eq "null" "$(jq -r '.streamSettings.finalmask' <<<"$plain")" "no finalmask without obfuscation"
+assert_eq "1443" "$(jq -r '.port' <<<"$plain")" "port"
+obfs=$(jq -c '.inbounds[] | select(.tag == "obfsx_hysteria2")' "$XRAY_CONF")
+assert_eq '{"udp":[{"type":"salamander","settings":{"password":"Chosen.Obfs-Pass_1"}}]}' \
+    "$(jq -c '.streamSettings.finalmask' <<<"$obfs")" "Salamander is a UDP finalmask on Xray"
+assert_eq "null" "$(jq -r '.streamSettings.hysteriaSettings.masquerade' <<<"$obfs")" "no masquerade with obfuscation"
+
+# The share link does not depend on the core.
+CURRENT_NODE_NAME=onxray
+link_xray=$(get_share_link)
+sed -i 's/^HY2_CORE=xray$/HY2_CORE=/' "$NODES_DIR/onxray.env"
+assert_eq "$link_xray" "$(get_share_link)" "switching cores must not change the share link"
+sed -i 's/^HY2_CORE=$/HY2_CORE=xray/' "$NODES_DIR/onxray.env"
+assert_contains "$(show_info)" "Hysteria2 (Xray)" "node info names the hosting core"
+CURRENT_NODE_NAME=onsb
+assert_contains "$(show_info)" "Hysteria2 (sing-box)" "node info names the hosting core"
+
+# IPv6-only stack: the Xray inbound gets the same listen address and sockopt as the others.
+printf '%s\n' v6 >"$NETSTACK_FILE"
+write_config
+assert_eq "::/true" \
+    "$(jq -r '.inbounds[] | select(.tag == "onxray_hysteria2") | "\(.listen)/\(.streamSettings.sockopt.v6only)"' "$XRAY_CONF")" \
+    "the network stack setting applies to the Hysteria2 inbound"
+unlink "$NETSTACK_FILE"
+
+# A node that asks for Xray on a core that cannot host it fails to render.
+set_fake_xray 26.2.6
+rc=0
+write_config 2>/srv/core.err || rc=$?
+assert_eq "1" "$rc" "an Xray too old for Hysteria2 must fail the render"
+assert_contains "$(cat /srv/core.err)" "run xray-update first" "the failure must say how to fix it"
+set_fake_xray 26.11.9
+
+assert_fails "the Xray builder must reject an unsafe password" \
+    build_xray_hysteria2_inbound n 4443 'bad"pw12345' edge.example.com /c /k
+assert_fails "the Xray builder must reject an unsafe obfs password" \
+    build_xray_hysteria2_inbound n 4443 SafeHy2Password edge.example.com /c /k 'bad"pw12345'
+
+if use_real_xray; then
+    write_config
+    "$XRAY_BIN" run -test -config "$XRAY_CONF" >/srv/xray-test.out 2>&1 || {
+        cat /srv/xray-test.out >&2
+        fail_case "the real core rejected the Hysteria2 inbound"
+    }
+fi
+SCENARIO
+
+# Installing a Hysteria2 node on Xray takes the Xray path end to end: the right
+# core is installed, the node is rendered into the Xray config, and a failed
+# start rolls back through Xray without touching sing-box.
+run_scenario hysteria2-install-on-xray <<'SCENARIO'
+load_modules
+printf '#!/bin/sh\ncase "$1" in\n  version) echo "Xray 26.11.9 (Xray, Penetrates Everything.) abc" ;;\n  help) printf "\\tmldsa65  x\\n" ;;\nesac\nexit 0\n' >/srv/bin/xray-hy
+chmod 755 /srv/bin/xray-hy
+XRAY_BIN=/srv/bin/xray-hy
+XRAY_CAPS=""
+HY2_HOP_HELPER=/srv/state/libexec/proxy-hub-hy2-hop
+HY2_HOP_DROPIN=/srv/state/systemd/sing-box.service.d/20-proxy-hub-hy2-hop.conf
+HY2_HOP_DROPIN_XRAY=/srv/state/systemd/xray.service.d/20-proxy-hub-hy2-hop.conf
+record() { printf '%s\n' "$*" >>/srv/install.calls; }
+is_root() { return 0; }
+install_deps() { :; }
+install_xray() { record install-xray; }
+install_singbox() { record install-singbox; }
+detect_network_stack() { SERVER_IPV4=203.0.113.10; SERVER_IPV6=""; }
+choose_ports() { PORT=4443; XHTTP_PORT=""; XHTTP_PATH=""; }
+service_enable() { :; }
+service_stop() { record "stop:$1"; }
+service_disable() { :; }
+START_OK=yes
+service_restart() { record "restart:$1"; [[ "$START_OK" == yes ]]; }
+service_is_active() { [[ "$START_OK" == yes ]]; }
+sleep() { :; }
+open_firewall_port() { record "firewall:$1/$2"; }
+show_info() { :; }
+show_node_qrcodes() { :; }
+prompt_xray_restart_on_install() { :; }
+show_proxy_service_failure_logs() { :; }
+service_hardening_ensure() { record "harden:$1"; }
+systemctl() { :; }
+: >/srv/install.calls
+
+( name=hx proto=hysteria2 hy2core=xray hy2obfs=true cmd_install ) >/srv/install.out 2>&1 || {
+    cat /srv/install.out >&2; fail_case "installing Hysteria2 on Xray failed"; }
+calls=$(cat /srv/install.calls)
+assert_contains "$calls" "install-xray" "Xray must be installed for an Xray-hosted node"
+assert_not_contains "$calls" "install-singbox" "sing-box must not be installed for an Xray-hosted node"
+assert_contains "$calls" "restart:xray" "the Xray service is restarted"
+assert_not_contains "$calls" "restart:sing-box" "the sing-box service is not touched"
+assert_contains "$calls" "firewall:4443/udp" "the UDP port is opened"
+assert_contains "$calls" "harden:xray" "the hosting service is hardened after the health gate"
+assert_eq "xray" "$(safe_read_config_value "$NODES_DIR/hx.env" HY2_CORE)" "the node records its core"
+assert_eq "hx_hysteria2" "$(jq -r '.inbounds[0].tag' "$XRAY_CONF")" "the node is rendered into the Xray config"
+assert_eq "salamander" "$(jq -r '.inbounds[0].streamSettings.finalmask.udp[0].type' "$XRAY_CONF")" \
+    "install options reach the Xray inbound"
+[[ -s "$SINGBOX_CERT_DIR/hx.crt" ]] || fail_case "the self-signed certificate must exist for an Xray-hosted node"
+[[ ! -e "$SINGBOX_CONF" ]] || fail_case "no sing-box config may be written for an Xray-only host"
+
+# The default is still sing-box.
+: >/srv/install.calls
+singbox_sync() { record singbox-sync; }
+( name=hs proto=hysteria2 cmd_install ) >/srv/install.out 2>&1 || { cat /srv/install.out >&2; fail_case "default install failed"; }
+calls=$(cat /srv/install.calls)
+assert_contains "$calls" "install-singbox" "without hy2core the node is installed on sing-box"
+assert_contains "$calls" "singbox-sync" "without hy2core the sing-box path is taken"
+assert_eq "" "$(safe_read_config_value "$NODES_DIR/hs.env" HY2_CORE)" "the default core is stored as empty"
+
+# Combinations Xray cannot host are refused before anything is written.
+for combo in "hy2domain=hy.example.com" "hy2core=bogus"; do
+    : >/srv/install.calls
+    rc=0
+    ( getent() { printf '203.0.113.10 STREAM x\n'; }; get_ipv4() { echo 203.0.113.10; }; get_ipv6() { :; }
+      ss() { :; }
+      export "$combo"; name=bad proto=hysteria2 hy2core="${hy2core:-xray}" cmd_install ) >/srv/install.out 2>&1 || rc=$?
+    assert_eq "1" "$rc" "install with '$combo' on Xray must be refused"
+    [[ ! -e "$NODES_DIR/bad.env" ]] || fail_case "a refused install must not leave a node file ($combo)"
+done
+
+# A failed start rolls the node back through Xray, port-hopping rules included.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/srv/iptables.calls\nexit 0\n' >/srv/bin/iptables
+chmod 755 /srv/bin/iptables
+: >/srv/install.calls; : >/srv/iptables.calls
+START_OK=no
+rc=0
+( name=hf proto=hysteria2 hy2core=xray hy2hop=41000-41050 PATH="/srv/bin:$PATH" cmd_install ) >/srv/install.out 2>&1 || rc=$?
+START_OK=yes
+assert_eq "1" "$rc" "a failed start must fail the install"
+assert_contains "$(cat /srv/install.calls)" "restart:xray" "the install must have reached the service start"
+assert_contains "$(cat /srv/iptables.calls)" "--dport 41000:41050 -j REDIRECT --to-ports 4443" \
+    "the hop rules were applied for the Xray-hosted node before the start"
+[[ ! -e "$HY2_HOP_HELPER" ]] || fail_case "the rollback must clear the hop helper of the removed node"
+[[ ! -e "$NODES_DIR/hf.env" ]] || fail_case "the failed node must be removed"
+[[ ! -e "$SINGBOX_CERT_DIR/hf.crt" ]] || fail_case "the failed node's certificate must be removed"
+assert_not_contains "$(cat /srv/install.calls)" "singbox-sync" "an Xray-hosted rollback must not run the sing-box path"
+assert_eq "hx_hysteria2" "$(jq -r '[.inbounds[].tag] | join(" ")' "$XRAY_CONF")" \
+    "the Xray config is rebuilt without the failed node"
 SCENARIO
 
 printf '%s\n' "All protocol-refresh contract tests passed."

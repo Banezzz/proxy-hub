@@ -19,14 +19,19 @@ show_proxy_service_failure_logs() {
 rollback_candidate_node() {
     local protocol="$1"
     local node_name="$2"
+    # 第三个参数是承载该节点的内核；省略时按协议的默认归属判断。
+    local core="${3:-$(node_core_of "$1" "")}"
     local node_file
     node_file=$(get_node_file "$node_name")
 
     rm -f "$node_file" 2>/dev/null
     rm -f "$SINGBOX_CERT_DIR/${node_name}.crt" "$SINGBOX_CERT_DIR/${node_name}.key" 2>/dev/null
 
-    case "$protocol" in
-        anytls|anytls_reality|hysteria2)
+    # 候选节点可能带着端口跳跃范围；节点已删除，这里把 NAT 规则同步回去。
+    [[ "$protocol" == "hysteria2" && "$core" == "xray" ]] && { hy2_hop_sync || true; }
+
+    case "$core" in
+        singbox)
             if ! singbox_sync; then
                 log_error "Rollback failed while restoring sing-box state"
                 return 1
@@ -220,7 +225,13 @@ cmd_install() {
         ANYTLS_PADDING_B64=""
         HY2_PASSWORD=""
     elif [[ "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        install_singbox || { log_error "sing-box 安装失败"; return 1; }
+        # 后端先定下来，才知道该装哪个内核；默认仍是 sing-box。
+        resolve_hy2_core || return 1
+        if [[ "$HY2_CORE" == "xray" ]]; then
+            install_xray || { log_error "Xray 安装失败"; return 1; }
+        else
+            install_singbox || { log_error "sing-box 安装失败"; return 1; }
+        fi
         gen_hy2_password || return 1
         SNI="${hy2sni:-www.bing.com}"
         if ! validate_tls_server_name "$SNI"; then
@@ -311,21 +322,26 @@ cmd_install() {
 
     save_env
 
-    if [[ "$PROTOCOL_TYPE" == "anytls" || "$PROTOCOL_TYPE" == "anytls_reality" || "$PROTOCOL_TYPE" == "hysteria2" ]]; then
-        # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
-        if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
-            if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
-                log_error "Failed to generate TLS certificate, rolling back..."
-                rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
-                    log_error "Manual recovery may be required for sing-box"
-                return 1
-            fi
-        fi
+    # 承载这个节点的内核：决定走 sing-box 还是 Xray 的配置、重启与回滚路径。
+    local install_core
+    install_core=$(node_core_of "$PROTOCOL_TYPE" "$HY2_CORE")
 
+    # plain AnyTLS 与 Hysteria2 使用各节点独立的自签名证书；ACME 节点不需要。
+    # 证书与内核无关，两条路径共用。
+    if [[ "$PROTOCOL_TYPE" == "anytls" || ( "$PROTOCOL_TYPE" == "hysteria2" && -z "$HY2_DOMAIN" ) ]]; then
+        if ! gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI"; then
+            log_error "Failed to generate TLS certificate, rolling back..."
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
+                log_error "Manual recovery may be required"
+            return 1
+        fi
+    fi
+
+    if [[ "$install_core" == "singbox" ]]; then
         if ! singbox_sync; then
             log_error "Failed to configure or start sing-box, rolling back..."
             show_proxy_service_failure_logs "$SINGBOX_SERVICE" /var/log/sing-box.log
-            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
                 log_error "Manual recovery may be required for sing-box"
             return 1
         fi
@@ -337,7 +353,14 @@ cmd_install() {
         # 生成 Xray 配置文件，如果失败则回滚
         if ! write_config; then
             log_error "Failed to generate Xray config, rolling back..."
-            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
+                log_error "Manual recovery may be required for Xray"
+            return 1
+        fi
+
+        # Xray 承载的 Hysteria2 节点同样需要下发端口跳跃的 NAT 规则。
+        if [[ "$PROTOCOL_TYPE" == "hysteria2" ]] && ! hy2_hop_sync; then
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
                 log_error "Manual recovery may be required for Xray"
             return 1
         fi
@@ -346,7 +369,7 @@ cmd_install() {
         if ! service_restart xray; then
             log_error "Xray service restart failed after install"
             show_proxy_service_failure_logs xray /var/log/xray/error.log
-            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
                 log_error "Manual recovery may be required for Xray"
             return 1
         fi
@@ -355,7 +378,7 @@ cmd_install() {
         if ! service_is_active xray; then
             log_error "Xray service failed to become active after install"
             show_proxy_service_failure_logs xray /var/log/xray/error.log
-            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" || \
+            rollback_candidate_node "$PROTOCOL_TYPE" "$CURRENT_NODE_NAME" "$install_core" || \
                 log_error "Manual recovery may be required for Xray"
             return 1
         fi
@@ -646,6 +669,7 @@ cmd_edit() {
     local proto_type="${PROTOCOL_TYPE:-vision}"
     local changed=false
     local sni_changed=false
+    local core_changed=false
 
     while true; do
         {
@@ -693,6 +717,9 @@ cmd_edit() {
                 echo -e "  ${GREEN}3.${NC} 重新生成密码 / Password"
                 echo -e "  ${GREEN}4.${NC} 切换 Salamander 混淆 / Toggle obfs  ${GRAY}($([[ -n "$HY2_OBFS_PASSWORD" ]] && echo on || echo off))${NC}"
                 echo -e "  ${GREEN}5.${NC} 端口跳跃范围 / Port hopping   ${GRAY}(${HY2_HOP_PORTS:-off})${NC}"
+                echo -e "  ${GREEN}6.${NC} 切换承载内核 / Switch core    ${GRAY}($([[ "$HY2_CORE" == "xray" ]] && echo Xray || echo sing-box))${NC}"
+                menu_note "$(t2 "sing-box 与 Xray 都能承载 Hysteria2，切换不改变分享链接。机器上只有 Xray 节点时，切到 Xray 可以少维护一个内核。" \
+                    "Both sing-box and Xray can host Hysteria2 and switching keeps the share link. With only Xray nodes otherwise, Xray means one core less to maintain.")"
                 ;;
             *)
                 log_error "未知协议类型: $proto_type"
@@ -701,7 +728,7 @@ cmd_edit() {
         esac
         echo -e "  ${GREEN}0.${NC} 完成并应用 / Save & apply"
         echo ""
-        echo -n "  选择要修改的项 / Select [0-5]: "
+        echo -n "  选择要修改的项 / Select [0-6]: "
         } >/dev/tty
 
         local c
@@ -817,6 +844,16 @@ cmd_edit() {
                     changed=true
                 fi ;;
 
+            hysteria2:6)
+                local target_core="xray"
+                [[ "$HY2_CORE" == "xray" ]] && target_core="singbox"
+                if hy2_core_allowed "$target_core"; then
+                    [[ "$target_core" == "xray" ]] && HY2_CORE="xray" || HY2_CORE=""
+                    core_changed=true
+                    changed=true
+                    log_info "$(t2 "应用后将由 $target_core 承载" "Will be hosted by $target_core once applied")"
+                fi ;;
+
             # ---- AnyTLS padding ----
             anytls:4|anytls_reality:4)
                 ANYTLS_PADDING_B64="$(gen_anytls_padding | base64 -w0)"
@@ -837,13 +874,24 @@ cmd_edit() {
     # 写回 .env（save_env 会按当前全局变量重写该节点配置）
     save_env
 
+    # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。与承载内核无关。
+    if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
+        rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
+        gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
+    fi
+
     # 重新生成对应内核配置并重启
-    if [[ "$proto_type" == "anytls" || "$proto_type" == "anytls_reality" || "$proto_type" == "hysteria2" ]]; then
-        # 自签名 TLS 协议改了 SNI：重新生成证书（CN 跟随新 SNI）。
-        if [[ "$proto_type" == "anytls" || ( "$proto_type" == "hysteria2" && -z "$HY2_DOMAIN" ) ]] && $sni_changed; then
-            rm -f "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.crt" "$SINGBOX_CERT_DIR/${CURRENT_NODE_NAME}.key" 2>/dev/null
-            gen_selfsigned_cert "$CURRENT_NODE_NAME" "$SNI" || return 1
+    if $core_changed; then
+        # 节点换了内核：两个内核的配置都要重建，新内核可能还没装。
+        if [[ "$HY2_CORE" == "xray" ]]; then
+            install_xray || return 1
         fi
+        if ! cmd_regenerate; then
+            log_error "$(t2 "应用失败：切换内核后配置未能生效" "Apply failed: the configuration did not come up after switching cores")"
+            return 1
+        fi
+        open_node_firewall_ports "$proto_type"
+    elif [[ "$(node_core_of "$proto_type" "$HY2_CORE")" == "singbox" ]]; then
         if ! singbox_sync; then
             log_error "应用失败：sing-box 配置无效，请检查参数"
             return 1
@@ -853,6 +901,9 @@ cmd_edit() {
         if ! write_config; then
             log_error "应用失败：Xray 配置无效，请检查参数"
             return 1
+        fi
+        if [[ "$proto_type" == "hysteria2" ]]; then
+            hy2_hop_sync || return 1
         fi
         service_restart xray || return 1
         open_node_firewall_ports "$proto_type"

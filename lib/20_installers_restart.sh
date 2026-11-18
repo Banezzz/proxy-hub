@@ -600,6 +600,8 @@ OPENRC_SERVICE
 # 启动前调用（systemd drop-in 的 ExecStartPre / OpenRC 的 start_pre）。
 HY2_HOP_HELPER="/usr/local/libexec/proxy-hub-hy2-hop"
 HY2_HOP_DROPIN="/etc/systemd/system/sing-box.service.d/20-proxy-hub-hy2-hop.conf"
+# Hysteria2 节点也可以由 Xray 承载，那时规则要随 xray 服务启动重新下发。
+HY2_HOP_DROPIN_XRAY="/etc/systemd/system/xray.service.d/20-proxy-hub-hy2-hop.conf"
 HY2_HOP_CHAIN="PROXY_HUB_HY2_HOP"
 
 # 校验并规范化端口跳跃范围。Usage: validate_hop_range "20000-20100" -> "20000-20100"
@@ -667,11 +669,14 @@ hy2_hop_rules() {
 hy2_hop_remove() {
     [[ -x "$HY2_HOP_HELPER" ]] && "$HY2_HOP_HELPER" clear >/dev/null 2>&1
     rm -f -- "$HY2_HOP_HELPER"
-    if [[ -e "$HY2_HOP_DROPIN" ]]; then
-        rm -f -- "$HY2_HOP_DROPIN"
-        rmdir -- "$(dirname "$HY2_HOP_DROPIN")" 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-    fi
+    local dropin removed=0
+    for dropin in "$HY2_HOP_DROPIN" "$HY2_HOP_DROPIN_XRAY"; do
+        [[ -e "$dropin" ]] || continue
+        rm -f -- "$dropin"
+        rmdir -- "$(dirname "$dropin")" 2>/dev/null || true
+        removed=1
+    done
+    (( removed == 1 )) && { systemctl daemon-reload 2>/dev/null || true; }
     return 0
 }
 
@@ -735,9 +740,14 @@ HELPER
         local hop_prefix="-" hop_systemd
         hop_systemd=$(systemd_version) || hop_systemd=0
         (( hop_systemd >= 231 )) && hop_prefix="-+"
-        mkdir -p -- "$(dirname "$HY2_HOP_DROPIN")" || return 1
-        printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
-            "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$HY2_HOP_DROPIN" || return 1
+        # 两个内核的服务都挂上：helper 是幂等的，而一个带跳跃范围的 Hysteria2 节点可能
+        # 由任一内核承载，也可能在两者之间切换。
+        local hop_dropin
+        for hop_dropin in "$HY2_HOP_DROPIN" "$HY2_HOP_DROPIN_XRAY"; do
+            mkdir -p -- "$(dirname "$hop_dropin")" || return 1
+            printf '%s\n' '# proxy-hub-managed: hy2-hop-v1' '[Service]' \
+                "ExecStartPre=${hop_prefix}$HY2_HOP_HELPER apply" >"$hop_dropin" || return 1
+        done
         systemctl daemon-reload 2>/dev/null || true
     fi
 }

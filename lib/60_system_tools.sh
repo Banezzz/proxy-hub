@@ -241,6 +241,44 @@ apply_hy2_acme_domain() {
         "An ACME certificate will be requested for $domain (issued and renewed by sing-box after start)")"
 }
 
+# 某个内核能否承载"当前正在配置的" Hysteria2 节点（读取全局的 HY2_DOMAIN /
+# HY2_HOP_PORTS）。sing-box 没有限制；Xray 有三条：版本够新、不能用 ACME（Xray 不会
+# 自己签证书）、OpenRC 上不能配端口跳跃（Xray 的 OpenRC 脚本没有重下发规则的钩子）。
+# Usage: hy2_core_allowed xray|singbox
+hy2_core_allowed() {
+    [[ "${1:-}" == "xray" ]] || return 0
+    if ! xray_supports hysteria2; then
+        log_error "$(t2 "由 Xray 承载 Hysteria2 需要 Xray v26.3.27 或更新，请先执行 xray-update" \
+            "Hosting Hysteria2 on Xray needs Xray v26.3.27 or newer; run xray-update first")"
+        return 1
+    fi
+    if [[ -n "${HY2_DOMAIN:-}" ]]; then
+        log_error "$(t2 "ACME 证书只能由 sing-box 承载的 Hysteria2 使用" \
+            "ACME certificates are only available when sing-box hosts the Hysteria2 node")"
+        return 1
+    fi
+    if [[ -n "${HY2_HOP_PORTS:-}" && "${INIT_SYSTEM:-}" == "openrc" ]]; then
+        log_error "$(t2 "OpenRC 上端口跳跃只支持 sing-box 承载的 Hysteria2" \
+            "On OpenRC, port hopping is only supported when sing-box hosts the Hysteria2 node")"
+        return 1
+    fi
+    return 0
+}
+
+# 读取 hy2core=xray|singbox，写入 HY2_CORE（sing-box 以空串表示，即默认值）。
+# 只看环境变量、不提问：两个后端对客户端完全等价，这不是一个值得每次安装都问的问题。
+resolve_hy2_core() {
+    HY2_CORE=""
+    case "${hy2core:-}" in
+        ""|singbox|sing-box) ;;
+        xray|Xray) HY2_CORE="xray" ;;
+        *)
+            log_error "Invalid hy2core value: ${hy2core} (expected xray or singbox)"
+            return 1
+            ;;
+    esac
+}
+
 # 引导式选择 Hysteria2 加固方案，结果写入 HY2_REQ_OBFS / HY2_REQ_HOP /
 # HY2_REQ_DOMAIN / HY2_REQ_EMAIL（取值与同名环境变量相同）。
 #
@@ -386,6 +424,9 @@ configure_hy2_options() {
         log_info "$(t2 "已启用 Salamander 混淆（密码已写入分享链接，客户端导入即可）" \
             "Salamander obfuscation enabled (the password is in the share link; just import it)")"
     fi
+
+    # 选项定下来之后再核对后端：ACME 与（OpenRC 上的）端口跳跃只有 sing-box 支持。
+    hy2_core_allowed "${HY2_CORE:-singbox}" || return 1
 }
 
 # ============== sing-box Release 管理 ==============
